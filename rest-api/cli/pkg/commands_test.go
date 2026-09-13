@@ -1155,6 +1155,74 @@ func TestNewApp_MachineValidationReadCommandsExecuteRESTRequests(t *testing.T) {
 	}
 }
 
+// TestNewApp_VpcPeeringListTableRequestsRelations exercises the full command
+// stack against a test server to prove the actual request contract: the REST
+// handler only populates the nested vpc1/vpc2 summaries when the request
+// carries includeRelation, so default table rendering must request both
+// relations while JSON keeps the default response shape and an explicit
+// --include-relation value is kept as-is.
+func TestNewApp_VpcPeeringListTableRequestsRelations(t *testing.T) {
+	tests := []struct {
+		name          string
+		args          []string
+		wantRelations []string
+	}{
+		{
+			name:          "table output requests both VPC relations",
+			args:          []string{"vpc-peering", "list"},
+			wantRelations: []string{"Vpc1", "Vpc2"},
+		},
+		{
+			name:          "--all requests the relations on the page fetch",
+			args:          []string{"vpc-peering", "list", "--all"},
+			wantRelations: []string{"Vpc1", "Vpc2"},
+		},
+		{
+			name:          "json output keeps the default response shape",
+			args:          []string{"vpc-peering", "list", "--output", "json"},
+			wantRelations: nil,
+		},
+		{
+			name:          "explicit --include-relation is kept as-is",
+			args:          []string{"vpc-peering", "list", "--include-relation", "Vpc1"},
+			wantRelations: []string{"Vpc1"},
+		},
+		{
+			name:          "unregistered list command requests no relations",
+			args:          []string{"site", "list", "--output", "table"},
+			wantRelations: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotRelations []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				gotRelations = request.URL.Query()["includeRelation"]
+				w.Header().Set("Content-Type", "application/json")
+				_, err := w.Write([]byte(`[]`))
+				require.NoError(t, err)
+			}))
+			t.Cleanup(server.Close)
+
+			app, err := NewApp(openapi.Spec)
+			require.NoError(t, err)
+
+			args := append([]string{
+				"nicocli",
+				"--base-url", server.URL,
+				"--org", "test-org",
+				"--api-name", "nico",
+				"--token", "test-token",
+			}, tt.args...)
+			require.NoError(t, app.Run(args))
+
+			sortStrings(gotRelations)
+			assert.Equal(t, tt.wantRelations, gotRelations, "includeRelation values sent to the API must match the table-rendering contract")
+		})
+	}
+}
+
 // sortStrings is a tiny stable sort used by the order-independence test so it
 // stays self-contained and does not pull in sort.Strings (which is already
 // used elsewhere; this just keeps the test readable).

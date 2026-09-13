@@ -96,10 +96,17 @@ func validateOutputFlag(_ *cli.Context, value string) error {
 	return ValidateOutputFormat(value)
 }
 
+// FormatOutput renders the response body in the requested format. Callers
+// that know the OpenAPI operation ID should use FormatOutputWithOperation so
+// operation-specific table columns apply.
 func FormatOutput(data []byte, format string) error {
 	return FormatOutputWithOperation(data, format, "")
 }
 
+// FormatOutputWithOperation renders the response body in the requested format,
+// selecting the custom table columns registered for the operation. Unregistered
+// operations fall back to the generic table columns; JSON and YAML output are
+// unchanged by the operation ID.
 func FormatOutputWithOperation(data []byte, format, operationID string) error {
 	switch format {
 	case "", "json":
@@ -113,6 +120,8 @@ func FormatOutputWithOperation(data []byte, format, operationID string) error {
 	}
 }
 
+// formatJSON pretty-prints the response body as JSON, or writes it verbatim
+// when it is not valid JSON.
 func formatJSON(data []byte) error {
 	var v interface{}
 	if err := json.Unmarshal(data, &v); err != nil {
@@ -124,6 +133,8 @@ func formatJSON(data []byte) error {
 	return enc.Encode(v)
 }
 
+// formatYAML renders the response body as YAML, or writes it verbatim when
+// it is not valid JSON.
 func formatYAML(data []byte) error {
 	var v interface{}
 	if err := json.Unmarshal(data, &v); err != nil {
@@ -135,6 +146,10 @@ func formatYAML(data []byte) error {
 
 var tableFields = []string{"id", "name", "status", "created", "updated"}
 
+// formatTable renders the response body as a tab-separated table. Registered
+// operations use their custom columns; unregistered ones fall back to the
+// generic tableFields columns for the fields present on the response, or to
+// JSON when none of them are.
 func formatTable(data []byte, operationID string) error {
 	var raw interface{}
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -172,7 +187,10 @@ func formatTable(data []byte, operationID string) error {
 				field := f
 				cols = append(cols, tableColumnSpec{
 					Header: field,
-					Get:    func(i map[string]any) string { return nestedString(i, field) },
+					// Render with fmt.Sprint so numeric and boolean values keep
+					// the %v rendering the pre-table output path provided;
+					// nestedString is string-only and would collapse them.
+					Get: func(i map[string]any) string { return fmt.Sprint(i[field]) },
 				})
 			}
 		}

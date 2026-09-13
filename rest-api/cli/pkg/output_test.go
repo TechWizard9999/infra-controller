@@ -186,24 +186,46 @@ func splitTabLine(line string, expectedCols int) []string {
 }
 
 // TestFormatOutputWithOperation_UnknownOperationFallback tests that
-// unregistered operations fall back to generic tableFields.
+// unregistered operations fall back to generic tableFields, and that values
+// render with %v semantics so numeric and boolean fields are preserved
+// instead of collapsing to empty cells.
 func TestFormatOutputWithOperation_UnknownOperationFallback(t *testing.T) {
-	input := `[{"id":"x","name":"n","status":"ok","created":"2024-01-01","updated":"2024-01-02"}]`
-	r, w, _ := os.Pipe()
-	stdout := os.Stdout
-	os.Stdout = w
-	err := FormatOutputWithOperation([]byte(input), "table", "unknown-operation")
-	w.Close()
-	os.Stdout = stdout
+	tests := []struct {
+		name        string
+		input       string
+		wantStrings []string
+	}{
+		{
+			name:        "generic columns render string fields",
+			input:       `[{"id":"x","name":"n","status":"ok","created":"2024-01-01","updated":"2024-01-02"}]`,
+			wantStrings: []string{"id", "name", "status", "x", "n", "ok"},
+		},
+		{
+			name:        "numeric values keep %v rendering instead of collapsing to empty",
+			input:       `[{"id":12345,"name":"n","status":"ok"}]`,
+			wantStrings: []string{"id", "name", "status", "12345", "n", "ok"},
+		},
+	}
 
-	var buf bytes.Buffer
-	_, _ = io.Copy(&buf, r)
-	require.NoError(t, err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, w, _ := os.Pipe()
+			stdout := os.Stdout
+			os.Stdout = w
+			err := FormatOutputWithOperation([]byte(tt.input), "table", "unknown-operation")
+			w.Close()
+			os.Stdout = stdout
 
-	output := buf.String()
-	assert.Contains(t, output, "id")
-	assert.Contains(t, output, "name")
-	assert.Contains(t, output, "status")
+			var buf bytes.Buffer
+			_, _ = io.Copy(&buf, r)
+			require.NoError(t, err)
+
+			output := buf.String()
+			for _, want := range tt.wantStrings {
+				assert.Contains(t, output, want)
+			}
+		})
+	}
 }
 
 // TestFormatOutput_DefaultFormat_ForListActions tests that list actions
