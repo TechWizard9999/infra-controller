@@ -88,4 +88,4 @@ nico-admin-cli extension-service create --name my-service --type kubernetes-pod 
 
 ---
 
-**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../README.md)
+**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../index.md)

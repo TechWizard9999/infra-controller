@@ -54,4 +54,4 @@ nico-admin-cli logical-partition show --name my-partition
 
 ---
 
-**See also:** [Network commands](../../network.md) · [CLI reference index](../../README.md)
+**See also:** [Network commands](../../network.md) · [CLI reference index](../../index.md)

@@ -56,4 +56,4 @@ nico-admin-cli instance release --label-key role --label-value training
 
 ---
 
-**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../README.md)
+**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../index.md)

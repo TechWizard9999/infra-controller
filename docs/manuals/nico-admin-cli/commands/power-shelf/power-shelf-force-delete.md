@@ -54,4 +54,4 @@ nico-admin-cli power-shelf force-delete 12345678-1234-5678-90ab-cdef01234567 --d
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

@@ -46,4 +46,4 @@ nico-admin-cli expected-rack replace-all --filename ./racks.json
 
 ---
 
-**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../README.md)
+**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../index.md)

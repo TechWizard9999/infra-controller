@@ -54,4 +54,4 @@ nico-admin-cli extension-service get-version --service-id 12345678-1234-5678-90a
 
 ---
 
-**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../README.md)
+**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../index.md)

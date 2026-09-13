@@ -73,4 +73,4 @@ nico-admin-cli network-security-group create --tenant-organization-id fds3451123
 
 ---
 
-**See also:** [Network commands](../../network.md) · [CLI reference index](../../README.md)
+**See also:** [Network commands](../../network.md) · [CLI reference index](../../index.md)

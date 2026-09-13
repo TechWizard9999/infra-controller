@@ -52,4 +52,4 @@ nico-admin-cli logical-partition create --name my-partition --tenant-organizatio
 
 ---
 
-**See also:** [Network commands](../../network.md) · [CLI reference index](../../README.md)
+**See also:** [Network commands](../../network.md) · [CLI reference index](../../index.md)

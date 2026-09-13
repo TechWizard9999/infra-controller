@@ -50,4 +50,4 @@ nico-admin-cli sku unassign 12345678-1234-5678-90ab-cdef01234567 --force
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

@@ -81,4 +81,4 @@ nico-admin-cli component-manager component-power-control power-shelf --power-she
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

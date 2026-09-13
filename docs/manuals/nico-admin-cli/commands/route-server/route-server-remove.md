@@ -59,4 +59,4 @@ nico-admin-cli route-server remove 10.0.0.1 --source-type config_file
 
 ---
 
-**See also:** [Network commands](../../network.md) · [CLI reference index](../../README.md)
+**See also:** [Network commands](../../network.md) · [CLI reference index](../../index.md)

@@ -64,4 +64,4 @@ nico-admin-cli rms power-state rack-1 node-1
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

@@ -60,4 +60,4 @@ nico-admin-cli dev-env config apply ./devenv_config.toml --mode vpc-prefix
 
 ---
 
-**See also:** [Admin commands](../../admin.md) · [CLI reference index](../../README.md)
+**See also:** [Admin commands](../../admin.md) · [CLI reference index](../../index.md)

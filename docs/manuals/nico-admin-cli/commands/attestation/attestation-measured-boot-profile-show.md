@@ -58,4 +58,4 @@ nico-admin-cli attestation measured-boot profile show my-profile --is-name
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

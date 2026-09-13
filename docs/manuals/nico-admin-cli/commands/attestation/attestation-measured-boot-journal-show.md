@@ -51,4 +51,4 @@ nico-admin-cli attestation measured-boot journal show 12345678-1234-5678-90ab-cd
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

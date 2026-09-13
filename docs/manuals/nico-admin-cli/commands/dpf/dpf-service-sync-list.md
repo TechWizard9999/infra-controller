@@ -50,4 +50,4 @@ nico-admin-cli dpf service-sync list --machine-id fm100psbtmb15tgh6q5duqb8ke5grn
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

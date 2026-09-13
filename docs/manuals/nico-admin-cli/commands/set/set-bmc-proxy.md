@@ -59,4 +59,4 @@ nico-admin-cli set bmc-proxy --enabled false
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

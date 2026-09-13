@@ -78,4 +78,4 @@ nico-admin-cli bmc-machine create-bmc-user --machine 12345678-1234-5678-90ab-cde
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

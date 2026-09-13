@@ -186,7 +186,7 @@ fn render_command_page(
     let _ = writeln!(s, "---\n");
     let _ = writeln!(
         s,
-        "**See also:** [{} commands](../../{}.md) · [CLI reference index](../../README.md)",
+        "**See also:** [{} commands](../../{}.md) · [CLI reference index](../../index.md)",
         domain.title(),
         slug(domain),
     );
@@ -199,9 +199,9 @@ fn render_domain_index(domain: CliDomain, rows: &[&(String, String, CliDomain)])
     let _ = writeln!(s, "{}\n", intro(domain));
     let _ = writeln!(
         s,
-        "For global flags and setup, see [the overview](./README.md) and \
-         [`setup.md`](./setup.md). For task-oriented sequences see \
-         [`workflows.md`](./workflows.md).\n"
+        "For global flags and setup, see [the overview](./index.md) and \
+         [`setup.md`](../nico-admin-cli.md). For task-oriented sequences see \
+         [`workflows.md`](../nico-admin-cli.md).\n"
     );
     let _ = writeln!(s, "| Command | Description |");
     let _ = writeln!(s, "|---|---|");

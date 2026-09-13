@@ -67,4 +67,4 @@ nico-admin-cli browse nmxc --chassis-serial 1234567890 --operation gpu-info --gp
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

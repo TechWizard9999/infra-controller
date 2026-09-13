@@ -49,4 +49,4 @@ nico-admin-cli attestation measured-boot report match 0:abc123,7:def456
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

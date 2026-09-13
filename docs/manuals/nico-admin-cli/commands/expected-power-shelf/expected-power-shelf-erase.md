@@ -49,4 +49,4 @@ nico-admin-cli expected-power-shelf erase --confirm
 
 ---
 
-**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../README.md)
+**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../index.md)
