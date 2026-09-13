@@ -875,12 +875,12 @@ pub(super) async fn bmc_reset(
 
     match state
         .admin_bmc_reset(tonic::Request::new(rpc::forge::AdminBmcResetRequest {
-            machine_id: None,
             bmc_endpoint_request: Some(BmcEndpointRequest {
                 ip_address: endpoint_ip.clone(),
                 mac_address: None,
             }),
             use_ipmitool: use_ipmi,
+            ..Default::default()
         }))
         .await
         .map(|response| response.into_inner())
@@ -972,6 +972,7 @@ pub(super) async fn clear_bmc_credentials(
             credential_type: rpc::CredentialType::RootBmcByMacAddress.into(),
             username: None,
             mac_address: Some(mac_address),
+            credential_name: None,
         }))
         .await
         .map(|response| response.into_inner())

@@ -31,8 +31,9 @@ use crate::mac_address_pool::{
 };
 use crate::machine_info::DpuSettings;
 use crate::{
-    BmcState, Callbacks, DpuMachineInfo, HardwareType, HostMachineInfo, MachineInfo,
-    MachineRouterOptions, MockPowerState, SetSystemPowerError, SystemPowerControl, machine_router,
+    BmcState, Callbacks, CombinedServer, DpuMachineInfo, HardwareType, HostMachineInfo,
+    ListenerOrAddress, MachineInfo, MachineRouterOptions, MockPowerState, SetSystemPowerError,
+    SystemPowerControl, machine_router,
 };
 
 pub mod axum_http_client;
@@ -87,6 +88,21 @@ async fn test_bmc((router, state): (axum::Router, BmcState)) -> TestBmcHandle {
     }
 }
 
+/// Serve `router` over HTTPS on an ephemeral loopback port with the mock's
+/// bundled certificate. Returns the running server and its base URL. Use this
+/// where the in-process `TestBmcHandle` cannot: real TLS, HTTP/2, and SSE.
+pub fn serve_https(name: &str, router: Router) -> (CombinedServer, Url) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let server = CombinedServer::run_router(
+        name,
+        router,
+        Some(ListenerOrAddress::Listener(listener)),
+        crate::tls::server_config(None::<&str>).expect("bundled mock TLS certificate"),
+    );
+    let base = Url::parse(&format!("https://{}", server.address)).expect("valid URL");
+    (server, base)
+}
+
 pub async fn bmc_for_machine(machine_info: MachineInfo) -> TestBmcHandle {
     let machine_id = match &machine_info {
         MachineInfo::Host(_) => "test-host-id",
@@ -130,6 +146,17 @@ pub async fn wiwynn_gb200_bmc() -> TestBmcHandle {
 pub async fn lenovo_gb300_bmc() -> TestBmcHandle {
     test_bmc(machine_router(
         &host_info(HardwareType::LenovoGB300Nvl),
+        Arc::new(NoopCallbacks),
+        "test-host-id".to_string(),
+        false,
+        MachineRouterOptions::default(),
+    ))
+    .await
+}
+
+pub async fn nvidia_dgx_h100_bmc() -> TestBmcHandle {
+    test_bmc(machine_router(
+        &host_info(HardwareType::NvidiaDgxH100),
         Arc::new(NoopCallbacks),
         "test-host-id".to_string(),
         false,
@@ -626,6 +653,7 @@ mod test {
             "test-host-id".to_string(),
             false,
             injection.clone(),
+            crate::MachineRouterOptions::default(),
         );
 
         assert!(Arc::ptr_eq(&injection, &state.injection));
@@ -639,6 +667,156 @@ mod test {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// End-to-end BMC self-reset window (epic #3796 issue 4): the manager
+    /// reset is acknowledged, then EVERY request gets 503 until the window
+    /// expires, recovery is lazy, and the server's power is never touched.
+    #[tokio::test]
+    async fn manager_reset_takes_bmc_offline_then_recovers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        #[derive(Debug, Default)]
+        struct PowerCommandCounter(AtomicUsize);
+        impl Callbacks for PowerCommandCounter {
+            fn get_power_state(&self) -> MockPowerState {
+                MockPowerState::On
+            }
+            fn send_power_command(
+                &self,
+                _reset_type: SystemPowerControl,
+            ) -> Result<(), SetSystemPowerError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn state_refresh_indication(&self) {}
+        }
+
+        let callbacks = Arc::new(PowerCommandCounter::default());
+        let (router, _state) = machine_router(
+            &host_info(HardwareType::DellPowerEdgeR750),
+            callbacks.clone(),
+            "test-host-id".to_string(),
+            false,
+            MachineRouterOptions {
+                bmc_reset_duration: Some(Duration::from_millis(100)),
+                ..Default::default()
+            },
+        );
+
+        let get = |path: &str| {
+            router
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+        };
+
+        // discover the manager's reset action target
+        let response = get("/redfish/v1/Managers").await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let managers: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let manager_path = managers["Members"][0]["@odata.id"]
+            .as_str()
+            .expect("at least one manager")
+            .to_string();
+        let reset_target = format!("{manager_path}/Actions/Manager.Reset");
+
+        // trigger the self-reset: acknowledged before going dark
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&reset_target)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // inside the window: EVERYTHING answers 503
+        for path in ["/redfish/v1", &manager_path, "/redfish/v1/Systems"] {
+            let response = get(path).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path} should be offline during the reset window"
+            );
+        }
+
+        // after the window: silently back online
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let response = get("/redfish/v1").await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // a BMC reset must not touch the server's power
+        assert_eq!(callbacks.0.load(Ordering::SeqCst), 0);
+    }
+
+    /// Regression guard: a ZERO `bmc_reset_duration` (e.g. from a profile
+    /// or override with a zero timing) must behave exactly like `None` —
+    /// the pre-existing no-op reset, with no offline window at all.
+    #[tokio::test]
+    async fn zero_reset_duration_keeps_the_old_noop_behavior() {
+        use std::time::Duration;
+
+        let (router, state) = machine_router(
+            &host_info(HardwareType::DellPowerEdgeR750),
+            Arc::new(NoopCallbacks),
+            "test-host-id".to_string(),
+            false,
+            MachineRouterOptions {
+                bmc_reset_duration: Some(Duration::ZERO),
+                ..Default::default()
+            },
+        );
+        assert!(state.availability.is_none(), "zero must disable entirely");
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/redfish/v1/Managers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let managers: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let manager_path = managers["Members"][0]["@odata.id"]
+            .as_str()
+            .expect("at least one manager");
+
+        // reset is acknowledged and the BMC stays online — old behavior
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("{manager_path}/Actions/Manager.Reset"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/redfish/v1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

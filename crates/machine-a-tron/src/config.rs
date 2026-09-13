@@ -83,8 +83,6 @@ pub struct MachineConfig {
     #[serde(default = "default_hardware_type")]
     pub hw_type: HardwareType,
     pub host_count: u32,
-    pub vpc_count: u32,
-    pub subnets_per_vpc: u32,
     pub dpu_per_host_count: u32,
     /// Deprecated: superseded by platform-specific defaults in `PlatformTimingProfile`.
     /// Still parsed so existing configs remain valid; no longer used by the lifecycle FSM.
@@ -145,14 +143,6 @@ pub struct MachineConfig {
         serialize_with = "as_std_duration"
     )]
     pub network_status_run_interval: Duration,
-    /// Network virtualization type for VPCs created by this config section. Accepted values:
-    /// "etv" (EthernetVirtualizer, default), "etv_nvue" (EthernetVirtualizer with NVUE), or
-    /// "fnn" (Forge Native Networking). When set to "fnn", network segments will include both
-    /// an IPv4 and an IPv6 prefix, enabling dual-stack IP allocation for machine interfaces.
-    /// TODO(chet): Technically etv_nvue is RIP, but I'm leaving it in here for now.. but will
-    /// clean it up soon in its own PR.
-    #[serde(default)]
-    pub network_virtualization_type: Option<String>,
     /// If true, DPUs will run in "nic mode" and will not PXE boot, and their BMC JSON will reflect as such
     #[serde(default)]
     pub dpus_in_nic_mode: bool,
@@ -233,8 +223,6 @@ pub struct WiwynnGb200RackConfig {
     )]
     pub network_status_run_interval: Duration,
     #[serde(default)]
-    pub network_virtualization_type: Option<String>,
-    #[serde(default)]
     pub dpus_in_nic_mode: bool,
     #[serde(default)]
     pub dpu_firmware_versions: Option<DpuFirmwareVersions>,
@@ -255,8 +243,6 @@ impl WiwynnGb200RackConfig {
             rack_placement: Some(rack_placement),
             hw_type,
             host_count: 1,
-            vpc_count: 0,
-            subnets_per_vpc: 0,
             dpu_per_host_count,
             dpu_reboot_delay: self.dpu_reboot_delay,
             host_reboot_delay: self.host_reboot_delay,
@@ -270,7 +256,6 @@ impl WiwynnGb200RackConfig {
             run_interval_working: self.run_interval_working,
             run_interval_idle: self.run_interval_idle,
             network_status_run_interval: self.network_status_run_interval,
-            network_virtualization_type: self.network_virtualization_type.clone(),
             dpus_in_nic_mode: self.dpus_in_nic_mode,
             dpu_firmware_versions: self.dpu_firmware_versions.clone(),
             host_firmware_versions: None,
@@ -332,8 +317,6 @@ pub struct LenovoGb300RackConfig {
     )]
     pub network_status_run_interval: Duration,
     #[serde(default)]
-    pub network_virtualization_type: Option<String>,
-    #[serde(default)]
     pub dpus_in_nic_mode: bool,
     #[serde(default)]
     pub dpu_firmware_versions: Option<DpuFirmwareVersions>,
@@ -354,8 +337,6 @@ impl LenovoGb300RackConfig {
             rack_placement: Some(rack_placement),
             hw_type,
             host_count: 1,
-            vpc_count: 0,
-            subnets_per_vpc: 0,
             dpu_per_host_count,
             dpu_reboot_delay: self.dpu_reboot_delay,
             host_reboot_delay: self.host_reboot_delay,
@@ -369,7 +350,6 @@ impl LenovoGb300RackConfig {
             run_interval_working: self.run_interval_working,
             run_interval_idle: self.run_interval_idle,
             network_status_run_interval: self.network_status_run_interval,
-            network_virtualization_type: self.network_virtualization_type.clone(),
             dpus_in_nic_mode: self.dpus_in_nic_mode,
             dpu_firmware_versions: self.dpu_firmware_versions.clone(),
             host_firmware_versions: None,
@@ -437,6 +417,15 @@ pub struct DpuFirmwareVersions {
     pub cec: Option<String>,
     pub uefi: Option<String>,
     pub nic: Option<String>,
+    /// Optional opaque DPU BSP firmware version.
+    ///
+    /// Any string is accepted verbatim, including an empty string. The default,
+    /// `None`, omits `DPU_BSP` from generated firmware inventory; `Some("")`
+    /// explicitly configures that inventory entry with an empty version. This is
+    /// supported for generated BlueField-3 and BlueField-4 DPU profiles; profiles
+    /// without a generated DPU do not expose the entry.
+    #[serde(default)]
+    pub bsp: Option<String>,
 }
 
 /// BMC-mock has its own version of this data structure to avoid cyclic dependencies
@@ -447,6 +436,7 @@ impl From<DpuFirmwareVersions> for bmc_mock::DpuFirmwareVersions {
             cec: value.cec,
             uefi: value.uefi,
             nic: value.nic,
+            bsp: value.bsp,
         }
     }
 }
@@ -456,7 +446,11 @@ impl DpuFirmwareVersions {
         self,
         desired_firmware: &[DesiredFirmwareVersionEntry],
     ) -> Self {
-        // We emulate bf3 DPU's, find those from the desired firmware.
+        // TODO: Pass the emulated DPU generation into this lookup and select the
+        // matching desired-firmware model. This currently always uses BlueField-3,
+        // so missing BF4 values can be filled from the BF3 entry; explicit overrides
+        // still take precedence. BF4 BMC version strings use the `BF4-` convention:
+        // https://github.com/NVIDIA/infra-controller/pull/3477
         let Some(bf3_firmware_map) = desired_firmware
             .iter()
             .find(|entry| {
@@ -477,6 +471,7 @@ impl DpuFirmwareVersions {
             cec: self.cec.or_else(|| bf3_firmware_map.get("cec").cloned()),
             uefi: self.uefi.or_else(|| bf3_firmware_map.get("uefi").cloned()),
             nic: self.nic.or_else(|| bf3_firmware_map.get("nic").cloned()),
+            bsp: self.bsp,
         }
     }
 }
@@ -507,8 +502,6 @@ pub struct MachineATronConfig {
     /// How machine-a-tron obtains DHCP leases for BMCs and directly attached hosts.
     #[serde(default)]
     pub dhcp: DhcpType,
-    #[serde(default = "default_true")]
-    pub tui_enabled: bool,
 
     #[serde(default = "default_bmc_mock_port")]
     pub bmc_mock_port: u16,
@@ -524,13 +517,6 @@ pub struct MachineATronConfig {
     /// Opt in to an independent IPMI/SOL simulator for each IPMI-capable host BMC.
     #[serde(default = "default_false")]
     pub enable_ipmi_simulation: bool,
-
-    /// IPMI port advertised through Redfish for client connections.
-    /// - Unset/None: Use default port
-    /// - 0: Use dynamic port (same as listen port)
-    /// - 1-65535: Use this specific port
-    #[serde(default)]
-    pub ipmi_reachable_port: Option<u16>,
 
     /// Set this to a hostname or IP If you want machine-a-tron to register its BMC-mock as the
     /// bmc_proxy host (this will be combined with bmc_mock_port.)
@@ -1047,8 +1033,6 @@ mod tests {
             r#"
 carbide_api_url = "https://carbide-api.forge:443"
 log_file = "mat.log"
-interface = "br-77cbb29de011"
-tui_enabled = true
 pxe_server_host = "192.168.176.7"
 pxe_server_port = "8080"
 bmc_mock_port = 1266
@@ -1062,11 +1046,9 @@ host_count = 10
 dpu_per_host_count = 2
 dpu_reboot_delay = 1 # in units of seconds
 host_reboot_delay = 1 # in units of seconds
-vpc_count = 0
 underlay_dhcp_relay_address = "192.168.176.1"
 host_inband_dhcp_relay_address = "192.168.177.1"
 bmc_dhcp_relay_address = "192.168.192.1"
-subnets_per_vpc = 0
 run_interval_working = "100ms"
 run_interval_idle = "1s"
 network_status_run_interval = "5s"
@@ -1090,7 +1072,6 @@ scout_run_interval = "5s"
             run_interval_working: machine.run_interval_working,
             run_interval_idle: machine.run_interval_idle,
             network_status_run_interval: machine.network_status_run_interval,
-            network_virtualization_type: machine.network_virtualization_type.clone(),
             dpus_in_nic_mode: machine.dpus_in_nic_mode,
             dpu_firmware_versions: machine.dpu_firmware_versions.clone(),
             dpu_agent_version: machine.dpu_agent_version.clone(),
@@ -1111,7 +1092,6 @@ scout_run_interval = "5s"
             run_interval_working: machine.run_interval_working,
             run_interval_idle: machine.run_interval_idle,
             network_status_run_interval: machine.network_status_run_interval,
-            network_virtualization_type: machine.network_virtualization_type.clone(),
             dpus_in_nic_mode: machine.dpus_in_nic_mode,
             dpu_firmware_versions: machine.dpu_firmware_versions.clone(),
             dpu_agent_version: machine.dpu_agent_version.clone(),
@@ -1358,11 +1338,6 @@ scout_run_interval = "5s"
     #[test]
     fn ipmi_simulation_is_disabled_by_default() {
         assert!(!rack_config().enable_ipmi_simulation);
-    }
-
-    #[test]
-    fn ipmi_reachable_port_is_unset_by_default() {
-        assert!(rack_config().ipmi_reachable_port.is_none());
     }
 
     #[test]

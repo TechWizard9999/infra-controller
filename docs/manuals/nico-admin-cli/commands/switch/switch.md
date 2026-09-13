@@ -20,7 +20,7 @@ Switch management
 **--extended**  
 Extended result output.
 
-This used by measured boot, where basic output contains just what you
+This is used by measured boot, where basic output contains just what you
 probably care about, and "extended" output also dumps out all the
 internal UUIDs that are used to associate instances.
 
@@ -46,6 +46,7 @@ Print help (see a summary with -h)
 | [`force-delete`](./switch-force-delete.md) | Force delete a switch and optionally its interfaces |
 | [`metadata`](./switch-metadata.md) | Manage Switch Metadata |
 | [`health-report`](./switch-health-report.md) | Manage health report sources |
+| [`health-history`](./switch-health-history.md) | Show switch health history |
 
 ---
 

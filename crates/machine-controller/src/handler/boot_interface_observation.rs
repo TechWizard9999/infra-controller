@@ -24,7 +24,7 @@
 use carbide_redfish::boot_interface::BootInterfaceTarget;
 use chrono::{DateTime, Duration, Utc};
 use config_version::Versioned;
-use model::machine::{Machine, ManagedHostState, ManagedHostStateSnapshot};
+use model::machine::{DpuMachine, HostMachine, ManagedHostState, ManagedHostStateSnapshot};
 use model::machine_boot_interface::MachineBootInterfaceTarget;
 use state_controller::state_handler::{
     StateHandlerContext, StateHandlerError, StateHandlerOutcome,
@@ -37,7 +37,7 @@ use crate::context::MachineStateHandlerContextObjects;
 
 /// Returns the verified desired target after its observation interval elapses.
 fn periodic_observation_target(
-    host: &Machine,
+    host: &HostMachine,
     now: DateTime<Utc>,
     observation_interval: Duration,
 ) -> Option<&Versioned<MachineBootInterfaceTarget>> {
@@ -54,7 +54,7 @@ fn periodic_observation_target(
 /// host's Redfish boot view and after the host entered its current state.
 fn dpu_observation_is_current(
     managed_host_snapshot: &ManagedHostStateSnapshot,
-    dpu_snapshot: &Machine,
+    dpu_snapshot: &DpuMachine,
     now: DateTime<Utc>,
     dpu_up_threshold: Duration,
 ) -> bool {
@@ -255,7 +255,7 @@ mod tests {
                         }
                     });
 
-                periodic_observation_target(&host, now, observation_interval).is_some()
+                periodic_observation_target(&host.into(), now, observation_interval).is_some()
             };
             "eligible after the interval" {
                 PeriodicObservationInput {

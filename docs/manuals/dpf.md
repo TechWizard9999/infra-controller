@@ -74,7 +74,7 @@ The following table maps the sections on this page to what the run does:
 | §3.2–3.4 CRs  | [DPFOperatorConfig](#32-dpfoperatorconfig) (API VIP/port derived from the `kubernetes` Endpoints unless `NICO_DPF_K8S_API_VIP/PORT` are set), [DPUCluster](#33-dpucluster), and the optional [VIP LoadBalancer Service](#34-vip-loadbalancer-service-and-endpoints) are applied from `helm-prereqs/operators/dpf/`. |
 | §3.5 [Site config](#35-enable-dpf-in-the-nico-site-config) + §4 [Enablement](#4-restart-carbide-api-to-create-the-dpf-initialization-objects) | **Two-phase (phase 6b).** The site-wide BMC root password can only be set through a running carbide-api, so DPF cannot be enabled on the very first Core deploy.<br/><br/>`setup.sh` deploys Core with `[dpf]` **off**, sets the BMC root password via `nico-admin-cli` (see below), upgrades Core to `[dpf]` **on**, then **restarts carbide-api**.<br/><br/>The upgrade only rewrites the ConfigMap; `[dpf]` is read at startup only. The restart ensures that the DPF SDK initializes and creates the BFB, DPUFlavor, and DPUDeployment. |
 
-[Per-host enablement](#36-mark-hosts-as-dpf-managed-in-expected-machines) (§3.6) and the [CLI appendix](#appendix-nico-admin-cli-dpf-command-reference) still apply unchanged. The sections below remain the reference for what is being installed, for manual installs, and for environments not using `setup.sh`.
+[Per-host enablement](#37-mark-hosts-as-dpf-managed-in-expected-machines) (§3.7) and the [CLI appendix](#appendix-nico-admin-cli-dpf-command-reference) still apply unchanged. The sections below remain the reference for what is being installed, for manual installs, and for environments not using `setup.sh`.
 
 ### BMC root precondition (why the enablement is two-phase)
 
@@ -454,6 +454,9 @@ rules:
     resources: ["dpuflavors"]
     verbs: ["get", "create"]
   - apiGroups: ["provisioning.dpu.nvidia.com"]
+    resources: ["dpuflavortemplates"]
+    verbs: ["get", "create"]
+  - apiGroups: ["provisioning.dpu.nvidia.com"]
     resources: ["dpusets"]
     verbs: ["get"]
   - apiGroups: ["provisioning.dpu.nvidia.com"]
@@ -476,7 +479,7 @@ rules:
     verbs: ["get", "create", "patch"]
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["create"]
+    verbs: ["get", "create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -511,7 +514,7 @@ spec:
   dpuDetector:
     disable: true
   provisioningController:
-    osInstallTimeout: "60m"
+    osInstallTimeout: "90m"
     installInterface:
       installViaRedfish:
         skipDPUNodeDiscovery: true
@@ -535,7 +538,7 @@ Field-by-field:
 | Field | Meaning |
 | --- | --- |
 | `dpuDetector.disable: true` | DPF normally polls hosts to discover new DPUs. NICo disables auto-discovery because DPUs are fed in via `DPUSet` CRs from the orchestrator. |
-| `provisioningController.osInstallTimeout: "60m"` | Total budget for the OS install flow per DPU. |
+| `provisioningController.osInstallTimeout: "90m"` | Total budget for the OS install flow per DPU. |
 | `provisioningController.installViaRedfish` | Provision DPUs by talking Redfish to the host BMC (vs. PXE-based). |
 | `skipDPUNodeDiscovery: true` | Do not auto-detect DPUs as Kubernetes nodes — DPF is told about them explicitly by NICo. |
 | `overrides.kubernetesAPIServerVIP` | Replace `REPLACE_ME` with the host-cluster API-server VIP that DPUs should reach. |
@@ -623,7 +626,7 @@ subsets:
 What this does and why it looks unusual:
 
 - The `Service` is type `LoadBalancer` with a fixed `loadBalancerIP` (the same VIP used by the `DPUCluster` keepalived). The `metallb.io/address-pool: REPLACE_ME` annotation should be updated with a correct pool name. It tells MetalLB to pull the IP from the updated pool defined elsewhere.
-- A **manually-created `Endpoints`** object with a single dummy RFC 5737 IP (`192.0.2.10`) is created **with the same name** as the Service. This is a Kubernetes idiom: when an `Endpoints` resource has the same name as a Service that has **no selector**, the kubelet uses those Endpoints verbatim.  Putting a dummy IP here means: *"reserve the VIP via MetalLB, but route nothing — keepalived is the actual front-end."*
+- A **manually-created `Endpoints`** object with a single dummy RFC 5737 IP (`192.0.2.10`) is created **with the same name** as the Service. This is a Kubernetes idiom: when an `Endpoints` resource has the same name as a Service that has **no selector**, the kubelet uses those Endpoints verbatim. Putting a dummy IP here means: *"reserve the VIP via MetalLB, but route nothing — keepalived is the actual front-end."*
 - Net effect: MetalLB advertises the VIP to the network so external machines (DPUs, BMCs) can reach it, while keepalived handles the actual TCP termination.
 
 If your environment uses a different LoadBalancer mechanism (kube-vip, a cloud-provider LB, etc.), use it to expose the VIP and point the `DPUCluster`'s `keepalived.vip` at the same address.
@@ -735,19 +738,64 @@ The DPU agent's generated `dhcp_server.service_name`, `fmds.service_name`, and
 `hbn.nvue_https_address` are deployment-specific and take precedence over these
 template overlays.
 
+#### DPU LLDP sidecar
+
+The DPU agent chart also runs `nico-lldp-sidecar` from the resolved DPU agent
+image. The sidecar executes the DPU host's `lldpcli`, atomically publishes its
+LLDP-MED output at `/data/lldp`, and shares that directory with
+`nico-dpu-agent`. A successful snapshot is refreshed every 120 seconds and a
+failed collection is retried after 30 seconds. Snapshots are retained for ten
+minutes and the last successful file is kept after a failure, but the agent
+rejects snapshots older than five minutes.
+
+The defaults request 10 millicores of CPU and 64 MiB of memory and limit the
+container to 250 millicores and 128 MiB. Override them through the DPU agent
+chart overlay when required:
+
+```toml
+[dpf.services.dpu_agent.extra_helm_values.lldpSidecar.resources.requests]
+cpu = "20m"
+memory = "96Mi"
+
+[dpf.services.dpu_agent.extra_helm_values.lldpSidecar.resources.limits]
+cpu = "500m"
+memory = "192Mi"
+```
+
+The sidecar mounts the host `/run`, `/usr/sbin`, and `/lib` paths read-only and
+the host `/sys` path read-only at `/host-sys`. Its security context drops all
+Linux capabilities and adds only `DAC_OVERRIDE`; it permits privilege
+escalation. These mounts and permissions are part of the collection design. Do
+not broaden them as a workaround for a collection failure without first
+checking the sidecar logs and the host `lldpd` service.
+
+The OpenTelemetry configuration collects this container's pod logs with
+`systemd.unit=nico-lldp-sidecar`. Keep its image aligned with
+`nico-dpu-agent`, because the snapshot is an internal interface between those
+two containers. Refer to
+[DPU LLDP Collection](../dpu-management/dpu_configuration.md#dpu-lldp-collection)
+for the native-agent comparison and freshness behavior.
+
 #### Per-deployment configuration (`[dpf.deployments.*]`)
 
 Each DPU generation is provisioned by its own `DPUDeployment`, configured under
 `[dpf.deployments.<name>]`. **BF3** is always present with built-in defaults;
 **BF4 (generic)** and **BF4 Astra** are opt-in and are activated by
 `[dpf.deployments.bf4_generic]` and `[dpf.deployments.bf4_astra]`,
-respectively. Active deployments run side-by-side, each with its own
-`DPUFlavor` and `DPUDeployment`. BF3 uses a BFB URL (`bfb_url`), while BF4
-uses a `[bluefield_software]` block instead of a BFB.
+respectively. Active deployments run side-by-side, each with its own flavor
+resource and `DPUDeployment`: BF3 and generic BF4 use `DPUFlavor`, while Astra
+uses `DPUFlavorTemplate`. BF3 uses a BFB URL (`bfb_url`), while BF4 uses a
+`[bluefield_software]` block instead of a BFB.
 
 Every active deployment must have a **unique** `deployment_name`, `flavor_name`,
 and `node_label_key`; carbide-api validates this at startup and refuses to start
 if any deployments collide.
+
+#### BF4 Astra Spectrum-X runtime ConfigMap
+
+BF4 Astra requires a `ra2.2-runtime` ConfigMap in the DPF operator namespace
+(normally `dpf-operator-system`) containing an `RA2.2-runtime.yaml` key.
+Create it before enabling `[dpf.deployments.bf4_astra]`.
 
 ```toml
 # BF3 is present by default. Override only if any change is needed.
@@ -769,8 +817,7 @@ node_label_key  = "carbide.nvidia.com/controlled.node.bf4"
 # Shared across all PSIDs
 os_iso = "https://artifacts.example.com/bfb.3.3.x.iso"
  
-# PSID -> PLDM firmware bundle URL.
-# Currently exactly one PSID entry is supported.
+# PSID -> PLDM firmware bundle URLs. Include one entry for each DPU model.
 [dpf.deployments.bf4_generic.bluefield_software.pldm_fw_bundle]
 "MT_000000xxxx" = "https://artifacts.example.com/bf4/mt_000000xxxx.pldm"
 ```
@@ -781,12 +828,41 @@ Per-deployment field reference:
 | --- | :---: | --- | --- |
 | `bfb_url` | no | BF3 bf-bundle URL | BlueField firmware bundle (BFB) used to provision the DPU. Mutually exclusive with `bluefield_software`. |
 | `bluefield_software.os_iso` | BF4 only | — | OS ISO URL used by BF4 deployments in place of a BFB. Required when `bluefield_software` is set. |
-| `bluefield_software.pldm_fw_bundle` | BF4 only | — | Map of PSID → PLDM firmware bundle URL. Currently exactly one entry is supported. |
-| `flavor_name` | yes | `carbide-dpu-flavor` | `DPUFlavor` CR name for this deployment. |
+| `bluefield_software.pldm_fw_bundle` | BF4 only | — | Non-empty map of PSID → PLDM firmware bundle URL. Include one entry for each DPU model served by the deployment. |
+| `flavor_name` | yes | `carbide-dpu-flavor` | Base name for the generated `DPUFlavor` (BF3/generic BF4) or `DPUFlavorTemplate` (Astra) CR. |
 | `deployment_name` | yes | `nico-deployment-v2` | `DPUDeployment` CR name. |
 | `node_label_key` | yes | `carbide.nvidia.com/controlled.node.v2` | Node-selector label key applied to this deployment's DPUNodes. |
 | `services` | no | inherit `[dpf.services]` | Optional per-deployment mandatory-services override (see below). |
 | `extra_services` | no | none | Optional deployment-local field overrides for extra services. Only extras supported by this deployment type are used. |
+
+##### Service VPC and additional SF capacity
+
+Two global `[dpu_config]` fields reserve SFs for BF3 and generic BF4:
+
+- `service_vpc_slot_count` generates stable HBN interface names from
+  `iface_svc_0` through `iface_svc_{N-1}`. These interfaces are added to HBN's
+  `DPUServiceConfiguration`, startup configuration, and `nvidia.com/bf_sf`
+  request. The generated and topology-derived HBN interfaces must total no more
+  than 32.
+- `additional_managed_sf` reserves SF capacity without generating an HBN
+  interface.
+
+NICo adds both values to the managed SF count. With intercept bridging, they
+increase `PF_TOTAL_SF`, change the `DPUFlavor`, and require controlled DPU
+reprovisioning. Without intercept bridging, they consume the unchanged legacy
+`pf_total_sf_reserved` pool; carbide-api rejects an overcommit at startup. BF4
+Astra ignores both fields.
+
+NICo does not create a bridge for now, or a `DPUServiceInterface`, service
+chain, IPAM, or application-service CR for these slots. An external controller
+must coordinate which service uses each deterministic interface. The values are
+read when carbide-api starts, so restart the API after changing them.
+
+```toml
+[dpu_config]
+service_vpc_slot_count = 5
+additional_managed_sf = 2
+```
 
 **Per-deployment services override.** By default every deployment inherits the
 top-level `[dpf.services]` mandatory services. A deployment can pin its own
@@ -849,6 +925,50 @@ The proxy is part of the flavor spec — changing or adding `[dpf.proxy]` produc
 new flavor name (hash-derived) and triggers a full DPU reprovisioning. Set it before
 the first NICo startup with DPF enabled if possible.
 
+`extra_bfcfg_parameters` sets additional `bf.cfg` parameters on every DPU, most commonly
+a login password for the DPU's `ubuntu` user:
+
+```toml
+[dpf]
+extra_bfcfg_parameters = ["ubuntu_PASSWORD='$6$sa.lt$ha.sh'"]
+```
+
+Each string is appended verbatim to the `bfcfgParameters` of every deployment's
+`DPUFlavor`. NICo does not interpret or quote them, so the shell quoting `bf.cfg`
+requires is yours to supply: the BFB installer sources `bf.cfg` as a shell script, so a
+crypt(3) hash must be single-quoted or its `$` sections are expanded. Generate the hash
+with `openssl passwd -6`, never a plaintext password.
+
+The one value that cannot be passed through is the Go template opening delimiter,
+`{{`. BF4 Astra ships its flavor as a `DPUFlavorTemplate` whose body DPF renders as a
+Go template, so a `{{` there would be interpreted rather than reach `bf.cfg`. A
+parameter containing it is rejected at startup for every deployment type, so the same
+configuration stays valid across all of them. A lone `}}` is unaffected.
+
+Parameters that apply to one DPU generation but not the others go on that deployment
+instead. Each `[dpf.deployments.<name>]` entry owns exactly one `DPUFlavor`, so a
+per-deployment list is a per-flavor list:
+
+```toml
+[dpf.deployments.bf4_generic]
+extra_bfcfg_parameters = ["SOME_BF4_ONLY_PARAMETER=1"]
+```
+
+A deployment's list **appends to** the site-wide one rather than replacing it — unlike
+`[dpf.deployments.<name>.services]`, which replaces `[dpf.services]`. Site-wide entries
+come first, followed by the deployment's own. A site-wide password therefore stays
+declared once even for a deployment that adds parameters of its own, and only deployments
+whose resolved list changed are reprovisioned.
+
+> **Warning:** Changing, adding, reordering, or removing an entry generates a new
+> `DPUFlavor` and reprovisions that deployment's DPUs. Because `bf.cfg` is applied at
+> install time, that reprovision is also the only way a changed value reaches DPUs that
+> are already installed.
+
+These values are stored in the `DPUFlavor` CR in plain text, readable by anything that can
+read `dpuflavors` in `dpf-operator-system`; a `$6$` hash is not plaintext, but it is
+offline-crackable, so treat it as site-sensitive.
+
 Field reference (all under `[dpf]`):
 
 | TOML key | Type | Default | Meaning |
@@ -865,6 +985,8 @@ Field reference (all under `[dpf]`):
 | `deployments.<name>.extra_services.<svc>` | table | none | Deployment-local field overrides for one deployment-specific service. Supported keys are `doca_weave_dhcp_agent`, `doca_weave_flow_controller`, and `doca_xplane`; unsupported services are ignored for that deployment type. |
 | `proxy.https_proxy` | string | — | HTTPS proxy URL for DPU image pulls (see section 3.5). |
 | `proxy.no_proxy` | list of strings | `[]` | Hosts/CIDRs that must bypass the proxy. |
+| `extra_bfcfg_parameters` | list of strings | `[]` | `bf.cfg` lines appended verbatim to every deployment's `DPUFlavor` `bfcfgParameters`. Not interpreted or quoted by NICo; entries containing `{{` are rejected at startup. Changing the list renames every flavor and reprovisions the site's DPUs. |
+| `deployments.<name>.extra_bfcfg_parameters` | list of strings | `[]` | `bf.cfg` lines for this deployment's `DPUFlavor` only. Appends to the site-wide `extra_bfcfg_parameters`; does not replace it. |
 
 Notes:
 
@@ -1222,14 +1344,18 @@ DPF initialization objects are created in the host cluster.
 
 On startup with `[dpf].enabled = true`, carbide-api creates the following
 objects in the `dpf-operator-system` namespace. It does this **once for each active
-deployment** in `[dpf.deployments.*]` (BF3 always, plus `bf4_generic` when
-that table is present), using that deployment's own `bfb_url`, `flavor_name`,
-and `deployment_name`:
+deployment** in `[dpf.deployments.*]` (BF3 always, plus enabled BF4 generic or
+Astra deployments), using that deployment's own `bfb_url`, `flavor_name`, and
+`deployment_name`:
 
 - A `Secret` (`bmc-shared-password`) holding the shared BMC password (shared
   across deployments)
 - A `BFB` CR named `bf-bundle-<sha256(bfb_url)>`, from the deployment's `bfb_url`
-- A `DPUFlavor` CR named `<flavor_name>-<spec-hash>`. (The 16-character hex suffix is a SHA-256 digest of the spec. Any change to the flavor, including adding or changing `[dpf.proxy]`, produces a new name and triggers reprovisioning of that deployment's DPUs.)
+- A `DPUFlavor` CR (BF3/generic BF4) or `DPUFlavorTemplate` CR (Astra) named
+  `<flavor_name>-<spec-hash>`. The 16-character hex suffix is a SHA-256 digest
+  of the flavor spec or template; changing it, including adding or changing
+  `[dpf.proxy]` or `[dpf].extra_bfcfg_parameters`, produces a new name and
+  triggers reprovisioning.
 - A set of `DPUServiceInterface`, `DPUServiceTemplate`,
   `DPUServiceConfiguration`, and `DPUServiceNAD` CRs, one per mandatory
   DPUService (`dts`, `doca-hbn`, `carbide-dpu-agent`, `carbide-dhcp-server`,
@@ -1237,17 +1363,18 @@ and `deployment_name`:
   resolved services -- either its `[dpf.deployments.<name>.services]` override if
   set, otherwise the top-level `[dpf.services]`.
 - A `DPUDeployment` CR named after the deployment's `deployment_name`, which
-  references the BFB, the DPUFlavor, and the service templates above, and which
-  the DPF operator then reconciles into actual `DPUService` and per-DPU
-  resources.
+  references the BFB, its flavor resource, and the service templates above. For
+  Astra, it uses `flavorTemplate`, which the DPF operator renders into a
+  per-DPU `DPUFlavor`; otherwise it uses `flavor`. The operator then reconciles
+  these into actual `DPUService` and per-DPU resources.
 
 Because this path runs only at process start, **any change to `[dpf]`** —
 enabling DPF for the first time, changing a deployment's BFB URL, renaming a
-`DPUDeployment`/`DPUFlavor`, adding or removing `[dpf.deployments.bf4_generic]`,
+`DPUDeployment`/flavor resource, adding or removing BF4 deployment tables,
 pinning a different chart/image version under `[dpf.services.*]` or a
 deployment's `[dpf.deployments.<name>.services]`, or adding/changing
-`[dpf.proxy]` — **requires a carbide-api restart** for the new configuration to
-take effect.
+`[dpf.proxy]` or `[dpf].extra_bfcfg_parameters` — **requires a carbide-api
+restart** for the new configuration to take effect.
 
 ---
 
@@ -1498,6 +1625,6 @@ The DTS (`doca-telemetry`) and `doca-hbn` services, and the DPF operator and
 operand images, are NVIDIA-published on NGC and **pull anonymously by default**
 — no build or registry needed. To mirror them into your own registry (air-gapped
 or one-registry setups), refer to
-[helm-prereqs → DPF images and registries](https://github.com/NVIDIA/infra-controller/blob/main/helm-prereqs/README.md#dpf-images-and-registries)
+[helm-prereqs → DPF images and registries](https://github.com/dsx-ai-factory/infra-controller/blob/main/helm-prereqs/README.md#dpf-images-and-registries)
 (`NICO_DPF_IMAGE_REPO`/`_TAG`/`_PULL_SECRET` for the operator image;
 `NICO_DPF_HELM_REPO_*` for the operand/service charts).

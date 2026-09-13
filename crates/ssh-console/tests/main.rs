@@ -54,6 +54,7 @@ async fn test_ssh_console() -> eyre::Result<()> {
     let Some(env) = run_baseline_test_environment(vec![
         MockBmcType::Ipmi,
         MockBmcType::Ssh,
+        MockBmcType::LenovoAmiSsh,
         MockBmcType::DpuSsh,
     ])
     .await?
@@ -500,7 +501,7 @@ async fn test_ssh_console_log_rotation() -> eyre::Result<()> {
             assert!(path.exists(), "did not see any logs at {}", path.display());
             let size = path.metadata()?.len();
             assert!(
-                size < 1024 * 10,
+                size <= 1024 * 10,
                 "logs at {} exceeded configured size: {} > 10 KiB",
                 path.display(),
                 size

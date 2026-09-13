@@ -3,7 +3,7 @@
 
 .PHONY: test postgres-up postgres-down ensure-postgres postgres-wait clean check-source-headers fix-source-headers check-command-bundle
 .PHONY: build docker-build docker-build-local
-.PHONY: test-ipam test-site-agent test-site-manager test-workflow test-db test-api test-auth test-common test-cert-manager test-site-workflow test-flow test-powershelf-manager test-nvswitch-manager test-proto migrate core-mock-server-build core-mock-server-start core-mock-server-stop flow-mock-server-build flow-mock-server-start flow-mock-server-stop
+.PHONY: test-ipam test-site-agent test-site-manager test-workflow test-db test-api test-auth test-common test-cert-manager test-site-workflow test-flow test-powershelf-manager test-nvswitch-manager test-proto test-sdk-simple migrate core-mock-server-build core-mock-server-start core-mock-server-stop flow-mock-server-build flow-mock-server-start flow-mock-server-stop
 .PHONY: validate-openapi preview-openapi generate-client
 .PHONY: core-proto core-proto-clean core-proto-fetch core-proto-fmt core-protogen flow-proto flow-protogen tools-build tools-clean
 .PHONY: pre-commit-install pre-commit-run pre-commit-update
@@ -260,7 +260,10 @@ test-nvswitch-manager:
 		DB_NAME=$(POSTGRES_DB) \
 		go test -p 1 ./... -count=1
 
-test: test-ipam test-db test-api test-auth test-common test-cert-manager test-site-workflow test-site-manager test-workflow test-site-agent test-flow test-powershelf-manager test-nvswitch-manager test-proto
+test-sdk-simple:
+	go test ./sdk/simple -count=1
+
+test: test-ipam test-db test-api test-auth test-common test-cert-manager test-site-workflow test-site-manager test-workflow test-site-agent test-flow test-powershelf-manager test-nvswitch-manager test-proto test-sdk-simple
 
 build:
 	mkdir -p $(BUILD_DIR)
@@ -297,15 +300,16 @@ docker-build:
 	fi
 	@set -e; \
 	for image in $(REST_IMAGES); do \
+		tags=""; \
 		for arch in $(DOCKER_ARCHES); do \
+			tag=$(IMAGE_REGISTRY)/$$image:$(IMAGE_TAG)-$$arch; \
 			docker buildx build --platform linux/$$arch --push \
 				--build-arg TARGETOS=linux --build-arg TARGETARCH=$$arch \
-				-t $(IMAGE_REGISTRY)/$$image:$(IMAGE_TAG)-$$arch \
+				-t $$tag \
 				-f $(DOCKERFILE_DIR)/Dockerfile.$$image .; \
+			tags="$$tags $$tag"; \
 		done; \
-		docker buildx imagetools create -t $(IMAGE_REGISTRY)/$$image:$(IMAGE_TAG) \
-			$(IMAGE_REGISTRY)/$$image:$(IMAGE_TAG)-amd64 \
-			$(IMAGE_REGISTRY)/$$image:$(IMAGE_TAG)-arm64; \
+		docker buildx imagetools create -t $(IMAGE_REGISTRY)/$$image:$(IMAGE_TAG) $$tags; \
 	done
 
 core-proto:

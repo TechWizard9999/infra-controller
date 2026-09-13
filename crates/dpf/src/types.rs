@@ -20,10 +20,14 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
+use derive_builder::Builder;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use serde::{Deserialize, Serialize};
 
-use crate::crds::dpus_generated::DpuStatusPhase;
+use crate::crds::dpus_generated::{
+    DpuStatusAgentStatus, DpuStatusOperationalConditions, DpuStatusPhase,
+};
 
 /// Async provider for BMC passwords used to create and refresh the K8s BMC
 /// secret. Implement this trait to supply credentials dynamically (e.g. from
@@ -42,6 +46,7 @@ impl BmcPasswordProvider for String {
 
 /// Service name constants for use across crates
 pub const DOCA_HBN_SERVICE_NAME: &str = "doca-hbn";
+pub const DOCA_HBN_SERVICE_NETWORK: &str = "mybrhbn";
 pub const DHCP_SERVER_SERVICE_NAME: &str = "carbide-dhcp-server";
 /// Shared marker applied to every DPF-managed DPUNode.
 pub const DPU_ENABLED_NODE_LABEL: &str = "feature.node.kubernetes.io/dpu-enabled";
@@ -50,14 +55,16 @@ pub const DPU_AGENT_SERVICE_NAME: &str = "carbide-dpu-agent";
 pub const OTEL_COLLECTOR_SERVICE_NAME: &str = "carbide-otelcol";
 pub const DTS_SERVICE_NAME: &str = "dts";
 pub const DOCA_WEAVE_DHCP_AGENT_SERVICE_NAME: &str = "doca-weave-dhcp-agent";
+/// Number of PF scalable functions (SFs) allocated to the DOCA Weave DHCP Agent.
+pub const DOCA_WEAVE_DHCP_AGENT_PF_TOTAL_SF: u32 = 8;
+/// Additional PF scalable functions (SFs) reserved for Astra capacity headroom.
+pub const PF_TOTAL_SF_BF4_ASTRA_FUDGE: u32 = 4;
 pub const DOCA_WEAVE_FLOW_CONTROLLER_SERVICE_NAME: &str = "doca-weave-flow-controller";
 pub const DOCA_XPLANE_SERVICE_NAME: &str = "doca-xplane";
 /// Hash-stable legacy VF population used by default DPF flavors and SDK initialization.
 pub const DEFAULT_DPU_NUM_OF_VFS: u32 = 16;
 /// Default SF capacity reserved beyond configured NICo-managed service endpoints.
 pub const DEFAULT_PF_TOTAL_SF_RESERVED: u32 = 30;
-/// Fixed SF capacity required by the BF4 Astra flavor.
-pub(crate) const ASTRA_PF_TOTAL_SF: u32 = 40;
 // Keep direct SDK validation aligned with api-core's general BlueField provisioning bound without
 // coupling this lightweight crate to the complete API configuration model.
 pub(crate) const MAX_BLUEFIELD_VFS_PER_PF: u32 = 126;
@@ -67,46 +74,83 @@ const MAX_INSTANCE_VF_ID: u8 = 15;
 
 /// Configuration for creating DPF operator resources (BFB or
 /// BlueFieldSoftware, DPUFlavor, DPUDeployment, services, etc.).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Builder)]
+#[builder(
+    name = "InitDpfResourcesConfigBuilder",
+    pattern = "owned",
+    public,
+    default,
+    field(private),
+    build_fn(private, name = "assemble")
+)]
+#[builder_struct_attr(must_use = "call build() to create a validated initialization configuration")]
 pub struct InitDpfResourcesConfig {
     /// URL for the BFB (BlueField Bundle) image. Used for BF3-class DPUs.
     /// Ignored when [`bluefield_software`](Self::bluefield_software) is set.
-    pub bfb_url: String,
+    #[builder(setter(into))]
+    pub(crate) bfb_url: String,
     /// BlueFieldSoftware spec for BF4-class DPUs. When set, a `BlueFieldSoftware`
     /// CR is created and referenced by the DPUDeployment instead of a BFB, and
     /// [`bfb_url`](Self::bfb_url) is ignored. Exactly one provisioning source
     /// (BFB or BlueFieldSoftware) is expected per deployment.
-    pub bluefield_software: Option<BlueFieldSoftwareParams>,
+    #[builder(setter(strip_option))]
+    pub(crate) bluefield_software: Option<BlueFieldSoftwareParams>,
     /// Name of the DPUDeployment CR.
-    pub deployment_name: String,
+    #[builder(setter(into))]
+    pub(crate) deployment_name: String,
     /// Name of the DPUFlavor CR.
-    pub flavor_name: String,
+    #[builder(setter(into))]
+    pub(crate) flavor_name: String,
     /// Service templates and configs for M4 DPUDeployment.
     /// When empty, `default_services()` is used automatically.
-    pub services: Vec<ServiceDefinition>,
+    pub(crate) services: Vec<ServiceDefinition>,
 
     /// Number of hardware VFs provisioned per DPU PF for BF3 and generic BF4.
-    pub num_of_vfs: u32,
+    pub(crate) num_of_vfs: u32,
     /// SF capacity reserved beyond configured NICo-managed service endpoints.
     /// Without intercept bridging, this remains the complete legacy `PF_TOTAL_SF` value.
-    pub pf_total_sf_reserved: u32,
+    pub(crate) pf_total_sf_reserved: u32,
+    /// Managed SF capacity not represented in [`interfaces`](Self::interfaces).
+    /// Added to calculated BF3/generic-BF4 capacity when intercept bridging is configured;
+    /// otherwise it consumes the unchanged legacy pool. BF4 Astra rejects a non-zero value.
+    pub(crate) additional_managed_sf: u32,
+    /// NICo-managed service-VPC slots wired from HBN to dedicated OVS bridges.
+    pub(crate) service_vpc_slots: crate::ServiceVpcSlots,
     /// Enables deployment-scoped DPUServiceInterface names and node selectors.
     /// False preserves the legacy global resource naming and selector mode for
-    /// BF3 and generic BF4; BF4 Astra requires this to be true.
-    /// Mode transitions require manual old-resource cleanup and DPU re-ingestion;
-    /// the SDK neither detects nor deletes the previous generation.
-    pub deployment_scoped_service_interfaces: bool,
+    /// BF3 (including BF3 GB200) and generic BF4. BF4 Astra requires this to be true for the
+    /// whole namespace so legacy match-all resources do not bind Astra nodes. When enabled,
+    /// initialization removes
+    /// legacy unscoped ServiceInterfaces before creating scoped replacements. If cleanup remains
+    /// incomplete for ten minutes, NICo logs an error and continues waiting. If an operator
+    /// manually completes unscoped cleanup, NICo creates scoped replacements. The setting is read
+    /// only at startup. To return to unscoped interfaces, callers must stop NICo, delete scoped
+    /// ServiceInterfaces and wait for their deletion, then restart with this disabled.
+    /// API-core rejects a disabled value during DPF initialization while scoped
+    /// ServiceInterfaces exist.
+    pub(crate) deployment_scoped_service_interfaces: bool,
     /// Optional intercept-bridging topology for BF3 and generic BF4. `Some` replaces the
     /// ordinary static PF/VF inventory and contains exactly one configured PF.
-    pub intercept_bridging: Option<DpfInterceptBridging>,
+    #[builder(setter(strip_option))]
+    pub(crate) intercept_bridging: Option<DpfInterceptBridging>,
     /// Effective interface inventory shared by ServiceInterfaces, service chains,
     /// and caller-built service definitions. Empty asks the SDK to build it. With
     /// intercept bridging, a non-empty inventory must exactly match the SDK projection.
-    pub interfaces: Vec<DpuServiceInterfaceTemplateDefinition>,
+    pub(crate) interfaces: Vec<DpuServiceInterfaceTemplateDefinition>,
 
-    pub proxy: Option<DpfProxyDetails>,
+    #[builder(setter(strip_option))]
+    pub(crate) proxy: Option<DpfProxyDetails>,
+    /// Operator-supplied bf.cfg lines appended to the flavor's built-in `bfcfgParameters`.
+    ///
+    /// Passed through verbatim; the SDK applies no quoting or interpretation. Entries containing
+    /// the Go template delimiter `{{` are rejected, since BF4 Astra renders its
+    /// DPUFlavorTemplate body and could not pass them through.
+    ///
+    /// WARNING: Changing this will generate a new DPUFlavor, reprovisioning the deployment's
+    /// DPUs.
+    pub(crate) extra_bfcfg_parameters: Vec<String>,
     /// Deployment type — determines which DPUFlavor spec to build.
-    pub deployment_type: DpuDeploymentType,
+    pub(crate) deployment_type: DpuDeploymentType,
 }
 
 /// Parameters for a `BlueFieldSoftware` CR, used to provision BF4-class DPUs.
@@ -116,9 +160,9 @@ pub struct InitDpfResourcesConfig {
 pub struct BlueFieldSoftwareParams {
     /// OS ISO URL used by the DPU OS installation flow (`spec.osIso`).
     pub os_iso: String,
-    /// Optional PLDM firmware bundle URL for baseline firmware updates
+    /// Optional PLDM firmware bundle URLs for baseline firmware updates
     /// (`spec.pldmFwBundle`).
-    pub pldm_fw_bundle: Option<String>,
+    pub pldm_fw_bundle: Option<BTreeMap<String, String>>,
 }
 
 impl Default for InitDpfResourcesConfig {
@@ -131,12 +175,26 @@ impl Default for InitDpfResourcesConfig {
             services: Vec::new(),
             num_of_vfs: DEFAULT_DPU_NUM_OF_VFS,
             pf_total_sf_reserved: DEFAULT_PF_TOTAL_SF_RESERVED,
+            additional_managed_sf: 0,
+            service_vpc_slots: crate::ServiceVpcSlots::default(),
             deployment_scoped_service_interfaces: false,
             intercept_bridging: None,
             interfaces: Vec::new(),
             proxy: None,
+            extra_bfcfg_parameters: Vec::new(),
             deployment_type: DpuDeploymentType::Bf3,
         }
+    }
+}
+
+impl InitDpfResourcesConfigBuilder {
+    /// Builds an immutable configuration after validation.
+    pub fn build(self) -> Result<InitDpfResourcesConfig, crate::DpfError> {
+        let config = self
+            .assemble()
+            .map_err(|error| crate::DpfError::ConfigError(error.to_string()))?;
+        crate::sdk::validate_initialization_config(&config)?;
+        Ok(config)
     }
 }
 
@@ -553,6 +611,7 @@ fn validate_ovs_patch_name(name: &str, resource_name: &str) -> Result<(), crate:
 pub struct DpuServiceInterfacePatch {
     pub(crate) peer_bridge: String,
     pub(crate) peer_patch_name: String,
+    pub(crate) peer_external_ids: Option<BTreeMap<String, String>>,
 }
 
 /// Network interface for a DPU service.
@@ -681,6 +740,8 @@ pub struct DpuServiceHelmChartObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DpuDeploymentType {
     Bf3,
+    /// BF3 B3240 on a GB200 platform using CPU as Root Complex mode.
+    Bf3Gb200,
     Bf4Generic,
     Bf4Astra,
 }
@@ -784,7 +845,7 @@ impl From<DpuStatusPhase> for DpuPhase {
                 Self::Provisioning("PerformArmForceRestart".into())
             }
             DpuStatusPhase::UpdateFirmware => Self::Provisioning("UpdateFirmware".into()),
-            DpuStatusPhase::HostOsInitRelease => Self::Provisioning("HostOsInitRelease".into()),
+            DpuStatusPhase::ServiceReadiness => Self::Provisioning("ServiceReadiness".into()),
         }
     }
 }
@@ -885,6 +946,16 @@ pub struct DpuSummary {
     pub spec_dpu_node_name: String,
     pub status_phase: Option<String>,
     pub status_bfb_file: Option<String>,
+    /// `status.conditions`, verbatim. `phase` alone says where a DPU is, not
+    /// why it is stuck there; the conditions carry the reason and message.
+    pub status_conditions: Option<Vec<Condition>>,
+    /// `status.operationalConditions`, verbatim. Separate from `conditions`:
+    /// these describe the DPU's health once provisioned, rather than the
+    /// progress of provisioning itself.
+    pub status_operational_conditions: Option<Vec<DpuStatusOperationalConditions>>,
+    /// `status.agentStatus`, verbatim. What the DPU-side agent reports about
+    /// itself, including its own conditions, kubelet version, and reboot state.
+    pub status_agent_status: Option<DpuStatusAgentStatus>,
 }
 
 /// Service version resolved from a DPUDeployment's services and their DPUServiceTemplate CRs.
@@ -1339,6 +1410,7 @@ mod tests {
                 (
                     config.num_of_vfs,
                     config.pf_total_sf_reserved,
+                    config.service_vpc_slots.is_empty(),
                     config.deployment_scoped_service_interfaces,
                     config.intercept_bridging.is_none(),
                     config.interfaces.is_empty(),
@@ -1349,6 +1421,7 @@ mod tests {
                 () => (
                     DEFAULT_DPU_NUM_OF_VFS,
                     DEFAULT_PF_TOTAL_SF_RESERVED,
+                    true,
                     false,
                     true,
                     true,

@@ -16,7 +16,7 @@
  */
 
 use ::rpc::forge as rpc;
-use carbide_uuid::machine::MachineId;
+use carbide_uuid::machine::{HostMachineId, StableHostMachineId};
 use model::machine::ManagedHostState;
 use model::machine::machine_search_config::MachineSearchConfig;
 use tonic::{Request, Response, Status};
@@ -32,13 +32,8 @@ pub(crate) async fn decommission_managed_host(
     request: Request<rpc::DecommissionManagedHostRequest>,
 ) -> Result<Response<rpc::DecommissionManagedHostResponse>, Status> {
     log_request_data(&request);
-    let machine_id = convert_and_log_machine_id(request.into_inner().machine_id.as_ref())?;
-    if machine_id.machine_type().is_dpu() {
-        return Err(CarbideError::InvalidArgument(format!(
-            "machine {machine_id} is a DPU, not a managed host"
-        ))
-        .into());
-    }
+    let machine_id: StableHostMachineId =
+        convert_and_log_machine_id(request.into_inner().machine_id.as_ref())?;
 
     let mut txn = api.txn_begin().await?;
     let machine = db::machine::find_one(
@@ -168,12 +163,17 @@ pub(crate) async fn set_primary_interface(
 /// boot reconciliation is needed.
 async fn set_primary_interface_and_enqueue_reconciliation(
     api: &Api,
-    host_machine_id: MachineId,
+    host_machine_id: StableHostMachineId,
     selector: PrimaryInterfaceSelector,
     force_reconcile: bool,
 ) -> Result<Response<()>, Status> {
     let update = update_primary_interface(api, host_machine_id, selector, force_reconcile).await?;
-    enqueue_boot_interface_reconciliation(api, host_machine_id, update.reconciliation_needed).await;
+    enqueue_boot_interface_reconciliation(
+        api,
+        host_machine_id.into(),
+        update.reconciliation_needed,
+    )
+    .await;
 
     Ok(Response::new(()))
 }
@@ -196,17 +196,11 @@ pub(crate) async fn set_maintenance(
         .and_then(|ctx| ctx.get_external_user_name())
         .map(String::from);
     let req = request.into_inner();
-    let machine_id = convert_and_log_machine_id(req.host_id.as_ref())?;
+    let machine_id: HostMachineId = convert_and_log_machine_id(req.host_id.as_ref())?;
 
-    let (host_machine, mut txn) = api
+    let (_, mut txn) = api
         .load_machine(&machine_id, MachineSearchConfig::default())
         .await?;
-    if host_machine.is_dpu() {
-        return Err(CarbideError::InvalidArgument(
-            "DPU ID provided. need managed host".to_string(),
-        )
-        .into());
-    }
     let dpu_machines = db::machine::find_dpus_by_host_machine_id(&mut txn, &machine_id).await?;
     txn.commit().await?;
 

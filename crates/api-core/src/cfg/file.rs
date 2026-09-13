@@ -91,6 +91,14 @@ const RESERVED_DPF_DEPLOYMENT_NODE_LABELS: [(&str, &str); 2] = [
     ),
 ];
 
+const DPF_DEPLOYMENT_NAME_MAX_LENGTH: usize = 20;
+const DPF_FLAVOR_HASH_SUFFIX_LENGTH: usize = 17;
+const KUBERNETES_LABEL_NAME_MAX_LENGTH: usize = 63;
+const GB200_RESOURCE_SUFFIX: &str = "-gb200";
+// The DPUDeployment CRD allows only 20 characters. The default BF3 name already
+// uses 18, so `-g` is the longest suffix that preserves it without truncation.
+const GB200_DEPLOYMENT_SUFFIX: &str = "-g";
+
 /// Parses an optional duration ("30d", "12h", ...; absent = `None`) into
 /// `Option<chrono::Duration>`. Hand-rolled because `duration_str` deprecated
 /// its own Option variant -- we do NOT use the deprecated function.
@@ -223,11 +231,11 @@ pub struct CarbideConfig {
     #[serde(default)]
     pub site_fabric_prefixes: Vec<IpNetwork>,
 
-    /// Opts this site into tenant prefix overlap admission.
+    /// Opts this site into exact tenant VpcPrefix reuse checks.
     ///
-    /// Defaults to `false`. Participating FNN base profiles must separately
-    /// set `tenant_prefix_overlap_eligible`, and configuration alone does not permit
-    /// duplicate prefix persistence while database exclusions remain active.
+    /// Defaults to `false`. The complete eligibility, rejection, and database
+    /// fallback contract is documented under "Tenant prefix overlap checks"
+    /// in `crates/api-core/src/cfg/README.md`.
     #[serde(default)]
     pub tenant_prefix_overlap_enabled: bool,
 
@@ -313,6 +321,27 @@ pub struct CarbideConfig {
     #[serde(default = "default_bmc_session_lockout_threshold")]
     pub bmc_session_lockout_threshold: u32,
 
+    /// Cap on outstanding Redfish sessions per calling service identity per
+    /// BMC. Every `GetBmcCredentials` call mints a fresh session, so this is
+    /// what bounds a caller's session slots on the BMC: a mint that pushes
+    /// past the cap revokes that caller's oldest sessions. Size it to the
+    /// caller's replica count plus headroom for restarts.
+    /// Default is 4 (two replicas, each holding a current and a next
+    /// session). Values below 1 are treated as 1.
+    #[serde(default = "default_bmc_max_sessions_per_caller")]
+    pub bmc_max_sessions_per_caller: usize,
+
+    /// Routing of this instance's own BMC Redfish traffic through
+    /// nico-bmc-proxy. When enabled, ordinary traffic -- machine lifecycle
+    /// and established-endpoint credentialed exploration -- targets the
+    /// proxy, which authenticates upstream itself. Credential-subject work
+    /// (credential setup with factory/expected credentials, BMC session
+    /// minting, password rotation), exploration's anonymous vendor probes,
+    /// and component-manager compute-tray power control (explicit
+    /// per-endpoint credentials) stay direct. Absent or `enabled = false`
+    /// keeps every call direct.
+    pub bmc_proxy: Option<BmcProxyConfig>,
+
     /// When `true`, `GetBmcCredentials` may return
     /// `UsernamePassword` credentials for BMCs whose Redfish ServiceRoot
     /// does not expose `SessionService`. When `false` (the default), such
@@ -329,6 +358,24 @@ pub struct CarbideConfig {
     /// in single-IP mode.
     #[serde(default)]
     pub allow_insecure_discovery: bool,
+
+    /// Controls whether NICo may reconcile a boot interface selection recorded as
+    /// `RedfishChassisId` or `RedfishSerialNumber` after ordering DPU-attached Admin interfaces
+    /// by the `domain:bus:device.function` PCI addresses in scout's `HardwareInfo`.
+    ///
+    /// The setting is read at startup and defaults to `false`. NICo records available comparisons
+    /// in structured logs and `carbide_scout_pci_evaluations_total` regardless of this setting.
+    /// When `false`, it does not change the selection. When `true`, reconciliation requires at
+    /// least two eligible interfaces, a complete and unique candidate, `ManagedHostState::Ready`
+    /// or `ManagedHostState::HostInit` with `MachineState::Discovered`, no `Instance` or primary
+    /// interface prediction, and no conflicting or integrated-NIC primary.
+    ///
+    /// If the selected MAC is already desired and primary, NICo changes only the source to
+    /// `ScoutReportPci`. Otherwise it updates the desired target and primary together and enqueues
+    /// the state handler. A `Ready` host enters `BootConfiguring`; `HostInit` completes its reboot
+    /// handshake first.
+    #[serde(default)]
+    pub scout_boot_interface_correction_enabled: bool,
 
     /// Infiniband fabrics managed by the site
     /// Note: At the moment, only a single fabric is supported
@@ -410,6 +457,19 @@ pub struct CarbideConfig {
     #[serde(default)]
     pub uefi_rotation_enabled: bool,
 
+    /// Site-wide enable for NIC lockdown IKM rotation. When `false` (the
+    /// default), the SuperNIC lock/unlock flow keeps deriving keys from (and
+    /// re-locking cards at) their current tracked IKM version, so a staged
+    /// `RotateCredential(lockdown_ikm)` bumps the site-wide target without any
+    /// card migrating -- the deliberate cutover flip. When `true`, the
+    /// assignment-cycle lock derives from the staged site-wide target, so cards
+    /// migrate to the new IKM as tenants cycle. Unlock always derives from the
+    /// version a card is actually locked under regardless of this flag, so
+    /// flipping it off never bricks an already-migrated card. This is the fleet
+    /// kill-switch for rolling the feature out site-by-site.
+    #[serde(default, alias = "lockdown_ikm_rotation_enabled")]
+    pub nic_lockdown_ikm_rotation_enabled: bool,
+
     /// Site-wide enable for factory-resetting the host BMC during tenant
     /// release. When `false` (the default), tenant release skips the BMC
     /// factory-reset sub-flow entirely and proceeds directly to `PowerCycle`.
@@ -438,6 +498,10 @@ pub struct CarbideConfig {
     /// VpcPrefixStateController related configuration parameter
     #[serde(default)]
     pub vpc_prefix_state_controller: VpcPrefixStateControllerConfig,
+
+    /// ExtensionServiceStateController related configuration parameter
+    #[serde(default)]
+    pub extension_service_state_controller: ExtensionServiceStateControllerConfig,
 
     /// IbPartitionStateController related configuration parameter
     #[serde(default)]
@@ -609,10 +673,10 @@ pub struct CarbideConfig {
     #[serde(default)]
     pub oem_manager_profiles: libredfish::BiosProfileVendor,
 
-    /// DpaConfig refers to East West Ethernet (aka
+    /// EwEthersConfig refers to East West Ethernet (aka
     /// Cluster Interconnect Network) configuration
     #[serde(default)]
-    pub dpa_config: Option<DpaConfig>,
+    pub ewethers_config: Option<EwEthersConfig>,
 
     /// DSX Exchange Event Bus configuration. Publishes
     /// `ManagedHostState` transitions, BMS rack leak/isolation
@@ -665,39 +729,13 @@ pub struct CarbideConfig {
     )]
     pub mlxconfig_profiles: Option<HashMap<String, MlxConfigProfile>>,
 
-    /// The intent of this config option is to use the NICo site controller as a standalone
-    /// (disconnected / air-gapped) infrastructure manager for racks of GB200/GB300/VR144.
-    /// Only set this if using NICo site controller with Rack Manager to manage GB200/300/VR144.
-    /// It will change site controller behavior significantly in the following ways, etc.:
-    /// 1. skip DPU management and use DPUs as NICs (set the site-wide `[site_explorer] dpu_policy = "nic"`, or per-host `ExpectedMachine.dpu_policy`)
-    ///    a. no dpu bfb upgrade and host power cycle
-    ///    b. no firmware upgrade and host power cycle
-    ///    c. no hbn deployment (no ecmp, etc)
-    ///    d. no dpu agent deployment
-    ///    e. no restricted mode configuration
-    ///    f. no tenant overlay network via L2 vxlan/evpn or L3 vni (fnn)
-    /// 2. support any other nic interface on the compute nodes including the onboard 3p nic
-    /// 3. require expected machines table rows to have other/all mac addresses for each machine
-    /// 4. restrict dhcp service to only provide ip address to known mac addresses
-    ///    a. for additional mac addresses, use HostInband network segment when dpu is in nic mode
-    /// 5. disable compute host individual firmware upgrades
-    ///    a. only rack level firmware upgrades are allowed
-    /// 6. enable nvlink switch and power shelf discovery and ingestion
-    ///    a. site explorer changes to explore switch and power shelf bmc
-    ///    b. state machine for ingestion workflow
-    ///    c. nvlink switch nvos deployment/upgrade via onie
-    ///    d. nvlink switch default configuration and machine validation
-    /// 7. enable rack state machine and calls to rack manager
-    ///    a. depend on rack manager for firmware upgrades of the rack
-    ///    b. depend on rack manager for all power sequencing of the rack and components
-    ///    c. override/suspend component level state machine state transitions as needed
-    /// 8. enable nvlink control plane integration with nmx-c
-    ///    a. export nmx-c apis via site controller
-    ///    b. hardware health daemon polling of switch telemetry and collection into site controller
-    ///    prometheus instance
-    /// 9. enable domain power service integration
-    #[serde(default)]
-    pub rack_management_enabled: bool,
+    /// Deprecated compatibility key. This setting no longer affects runtime
+    /// behavior now that expected-machine DHCP lookup is unconditional. It
+    /// remains accepted so strict unknown-field validation does not block
+    /// upgrades from configurations that still contain the key.
+    #[doc(hidden)]
+    #[serde(default, rename = "rack_management_enabled", skip_serializing)]
+    pub deprecated_rack_management_enabled: Option<bool>,
 
     /// Rack Manager Service configuration for rack-level firmware upgrades,
     /// power sequencing, and mTLS connectivity.
@@ -868,6 +906,15 @@ pub struct CarbideConfig {
     /// env -> file -> vault behavior as when it is absent); see `SecretsConfig`.
     pub secrets: Option<SecretsConfig>,
 
+    /// Operator-managed static credential sources. These settings contain
+    /// only source locations and reload policy; credential values stay in the
+    /// referenced file or process environment. When a file is configured, the
+    /// local environment/file chain is read first for non-UFM credentials.
+    /// `credentials.ufm_source` exclusively selects local or persistent
+    /// backend ownership for all UFM credentials.
+    #[serde(default)]
+    pub credentials: CredentialsConfig,
+
     /// IP cleanup on lease expiry
     #[serde(default)]
     pub dhcp_lease_expiry_handling: bool,
@@ -1012,6 +1059,75 @@ pub struct CertificatesConfig {
     pub dedicated_vault: Option<DedicatedVaultSettings>,
 }
 
+/// Non-secret sources for operator-managed credentials.
+///
+/// The file source is optional. When present, it takes precedence over the
+/// legacy environment-selected file source and is read before credential
+/// backends such as Vault or Postgres. `ufm_source` controls whether UFM reads
+/// preserve that local-first order or use one authoritative source.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialsConfig {
+    /// Selects the read precedence and mutation policy for UFM credentials.
+    /// Defaults to local-first reads with persistent-backend fallback.
+    #[serde(default)]
+    pub ufm_source: UfmCredentialSource,
+
+    /// A watched file containing static credentials. Its contents are never
+    /// embedded in `CarbideConfig`.
+    #[serde(default)]
+    pub file: Option<CredentialFileSourceConfig>,
+}
+
+/// Configuration for the watched static-credentials file.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialFileSourceConfig {
+    /// Absolute or working-directory-relative path to the JSON or YAML file
+    /// containing static credentials.
+    pub path: PathBuf,
+
+    /// Nonzero interval used to detect projected-Secret replacements that do
+    /// not emit a filesystem watch event. Defaults to 60 seconds.
+    #[serde(
+        default = "CredentialFileSourceConfig::default_poll_interval",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "as_std_duration"
+    )]
+    pub poll_interval: std::time::Duration,
+}
+
+/// Read precedence and mutation policy for site UFM credentials.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UfmCredentialSource {
+    /// Preserve the existing local-first behavior: read environment/file UFM
+    /// entries before the persistent backend and mutate the backend.
+    #[default]
+    LocalFirst,
+    /// Read and mutate UFM credentials in the configured persistent backend.
+    /// Local environment/file UFM entries are ignored.
+    Backend,
+    /// Read UFM credentials only from the local environment/file sources.
+    /// Every configured fabric must be present when IB management starts, and
+    /// persistent backend mutation is disabled.
+    Local,
+}
+
+impl CredentialFileSourceConfig {
+    /// Returns the polling interval used when `poll_interval` is omitted.
+    pub const fn default_poll_interval() -> std::time::Duration {
+        std::time::Duration::from_secs(60)
+    }
+}
+
+impl CredentialsConfig {
+    /// Returns whether local sources authoritatively own UFM credentials.
+    pub fn uses_authoritative_local_ufm_credentials(&self) -> bool {
+        self.ufm_source == UfmCredentialSource::Local
+    }
+}
+
 /// Tag selecting the certificate backend. The matching settings (if any) live
 /// in their own sub-table, so the choice is explicit rather than inferred.
 // The shared `Vault` suffix is intentional: both current backends are Vault
@@ -1049,6 +1165,10 @@ pub struct DedicatedVaultSettings {
     /// root / `VAULT_CACERT`.
     #[serde(default)]
     pub vault_cacert: Option<String>,
+    /// Optional Vault Enterprise or HCP Vault Dedicated namespace for this
+    /// dedicated certificate client. Takes precedence over `VAULT_NAMESPACE`.
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 // Hand-rolled so the root `token` is never printed verbatim in logs or errors;
@@ -1063,6 +1183,7 @@ impl std::fmt::Debug for DedicatedVaultSettings {
             .field("pki_role_name", &self.pki_role_name)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .field("vault_cacert", &self.vault_cacert)
+            .field("namespace", &self.namespace)
             .finish()
     }
 }
@@ -1087,6 +1208,7 @@ impl CertificatesConfig {
                         pki_role_name: dedicated.pki_role_name.clone(),
                         token: dedicated.token.clone(),
                         vault_cacert: dedicated.vault_cacert.clone(),
+                        namespace: dedicated.namespace.clone(),
                     },
                 )
             }
@@ -1126,17 +1248,20 @@ impl CarbideConfig {
             firmware_global: self.firmware_global.clone(),
             machine_state_controller: self.machine_state_controller.clone(),
             host_health: self.host_health,
+            rack_profiles: self.rack_profiles.clone(),
 
             selected_profile: self.selected_profile,
             bios_profiles: self.bios_profiles.clone(),
             oem_manager_profiles: self.oem_manager_profiles.clone(),
 
-            dpa_enabled: self.is_dpa_enabled(),
+            ewethers_enabled: self.is_ewethers_enabled(),
+            astra_enabled: self.is_astra_enabled(),
             dpf_enabled: self.dpf.enabled,
             dpu_service_sync_enabled: self.dpf.dpu_service_sync_enabled,
             spdm_enabled: self.spdm.enabled,
             bmc_rotation_enabled: self.bmc_rotation_enabled,
             uefi_rotation_enabled: self.uefi_rotation_enabled,
+            nic_lockdown_ikm_rotation_enabled: self.nic_lockdown_ikm_rotation_enabled,
             bmc_factory_reset_on_instance_termination_enabled: self
                 .bmc_factory_reset_on_instance_termination_enabled,
 
@@ -1332,7 +1457,7 @@ pub struct SecretsConfig {
     /// them, longest prefix winning. A "/" catch-all entry is required.
     /// Reads never consult routing -- every stored row records the KEK
     /// that wrapped it -- so rotating a key means changing it here and
-    /// running `carbide-admin-cli secrets re-wrap`.
+    /// running `nico-admin-cli secrets re-wrap`.
     ///
     /// Example:
     /// ```toml
@@ -1343,11 +1468,12 @@ pub struct SecretsConfig {
     pub routing: std::collections::HashMap<String, String>,
 
     /// The credential *backend* read order, highest priority first (first match
-    /// wins). The local-override readers (env, file) are always tried ahead of
-    /// these, when their `[credentials.*]` section is enabled; this list only
-    /// orders the backends behind them. Order is the operator's choice -- list
-    /// the backends you want, in the priority you want. Defaults to `["vault"]`
-    /// -- with the local overrides, that is the env -> file -> vault chain.
+    /// wins). Enabled local-override readers (env, file) are normally tried
+    /// ahead of these; `credentials.ufm_source` can suppress local UFM entries
+    /// or make them authoritative. This list only orders the persistent
+    /// backends. Order is the operator's choice -- list the backends you want,
+    /// in the priority you want. Defaults to `["vault"]` -- with the local
+    /// overrides, that is the env -> file -> vault chain.
     ///
     /// For example, to roll Postgres in gradually, walk this list:
     ///
@@ -1372,7 +1498,8 @@ pub struct SecretsConfig {
     /// fresh site with nothing to import; unsupported values fail config
     /// parsing rather than silently skipping the import. Independent of
     /// `backends`/`writer` -- importing from vault is orthogonal to where
-    /// reads and writes flow.
+    /// reads and writes flow. When `credentials.ufm_source = "local"`, UFM
+    /// paths are excluded so the import preserves local ownership.
     pub import_from: Option<ImportSource>,
 
     /// How to treat secrets that already exist in Postgres during import.
@@ -1555,6 +1682,19 @@ fn is_valid_kubernetes_data_key(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+fn is_valid_kubernetes_label_key(value: &str) -> bool {
+    let (prefix, name) = value
+        .split_once('/')
+        .map_or((None, value), |(prefix, name)| (Some(prefix), name));
+    let bytes = name.as_bytes();
+
+    prefix.is_none_or(is_valid_kubernetes_object_name)
+        && name.len() <= KUBERNETES_LABEL_NAME_MAX_LENGTH
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && is_valid_kubernetes_data_key(name)
+}
+
 /// Kubernetes object kinds supported as DPF DPU-agent trust-anchor sources.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1579,8 +1719,16 @@ pub struct DpfConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Opts the DPF namespace into deployment-scoped DPUServiceInterfaces.
-    /// Changing modes requires operators to remove old-mode NICo resources and
-    /// re-ingest DPUs; NICo neither detects nor deletes those resources.
+    /// BF3 sites (including BF3 GB200) and generic BF4 use the default
+    /// unscoped mode; BF4 Astra requires this to be enabled. When enabled, initialization
+    /// removes legacy unscoped ServiceInterfaces before creating
+    /// scoped replacements. If cleanup remains incomplete for ten minutes, NICo logs an error and
+    /// continues waiting. If an operator manually completes unscoped cleanup, NICo creates scoped
+    /// replacements. The setting is read only at startup. To return to unscoped interfaces, stop
+    /// NICo, delete scoped ServiceInterfaces and wait for their deletion, then restart with this
+    /// set to false.
+    /// DPF initialization rejects disabling this value while scoped
+    /// ServiceInterfaces exist.
     #[serde(default)]
     pub deployment_scoped_service_interfaces: bool,
     /// SF capacity reserved beyond configured NICo-managed service endpoints.
@@ -1625,6 +1773,23 @@ pub struct DpfConfig {
     /// configured to route outbound HTTPS traffic through the specified proxy.
     #[serde(default)]
     pub proxy: Option<DpfProxyDetails>,
+    /// `bf.cfg` lines appended to every deployment's DPUFlavor `bfcfgParameters`.
+    ///
+    /// Each entry is passed through verbatim; NICo applies no quoting or interpretation. The
+    /// BFB installer sources `bf.cfg` as shell, so values needing quotes must carry their own:
+    /// `extra_bfcfg_parameters = ["ubuntu_PASSWORD='$6$...'"]`.
+    ///
+    /// Entries containing the Go template delimiter `{{` are rejected at startup, since BF4
+    /// Astra renders its DPUFlavorTemplate body and could not pass them through.
+    ///
+    /// [`DpfDeploymentConfig::extra_bfcfg_parameters`] appends to this list for a single
+    /// deployment.
+    ///
+    /// WARNING: Changing this will generate a new DPUFlavor, reprovisioning every DPU at the
+    /// site. `bf.cfg` is applied at install, so that reprovision is also what delivers a
+    /// changed value to DPUs that are already installed.
+    #[serde(default)]
+    pub extra_bfcfg_parameters: Vec<String>,
     /// Per-generation DPUDeployment configurations. BF3 is always present with sensible
     /// defaults; BF4 variants are opt-in.
     #[serde(default)]
@@ -1643,6 +1808,7 @@ impl Default for DpfConfig {
             services: Box::default(),
             extra_services: Box::default(),
             proxy: None,
+            extra_bfcfg_parameters: Vec::new(),
             deployments: DpfDeploymentsConfig::default(),
         }
     }
@@ -1706,6 +1872,16 @@ impl DpfConfig {
         self.apply_extra_pull_secret_override(&mut extra);
 
         DpfResolvedMandatoryServicesConfig { base, extra }
+    }
+
+    /// Returns the site-wide `bf.cfg` parameters followed by `deployment`'s own.
+    ///
+    /// Appends rather than overrides, unlike [`Self::resolved_services_for`], so a deployment
+    /// setting one parameter of its own does not have to restate the site-wide list.
+    pub fn resolved_bfcfg_parameters_for(&self, deployment: &DpfDeploymentConfig) -> Vec<String> {
+        let mut parameters = self.extra_bfcfg_parameters.clone();
+        parameters.extend_from_slice(&deployment.extra_bfcfg_parameters);
+        parameters
     }
 
     /// Applies the optional [`Self::docker_image_pull_secret`] override to every
@@ -1852,7 +2028,7 @@ const BF4_ASTRA_EXTRA_SERVICES: &[DpfExtraService] = &[
 
 fn extra_service_types(deployment_type: DpuDeploymentType) -> &'static [DpfExtraService] {
     match deployment_type {
-        DpuDeploymentType::Bf3 | DpuDeploymentType::Bf4Generic => &[],
+        DpuDeploymentType::Bf3 | DpuDeploymentType::Bf3Gb200 | DpuDeploymentType::Bf4Generic => &[],
         DpuDeploymentType::Bf4Astra => BF4_ASTRA_EXTRA_SERVICES,
     }
 }
@@ -2085,6 +2261,17 @@ pub struct DpfDeploymentConfig {
     /// entries overlay the corresponding site-wide extra-service definition.
     #[serde(default)]
     pub extra_services: BTreeMap<DpfExtraService, DpfServiceConfigOverride>,
+
+    /// `bf.cfg` lines for this deployment's DPUFlavor only, for parameters that apply to one
+    /// DPU generation but not the others.
+    ///
+    /// Appends to the site-wide [`DpfConfig::extra_bfcfg_parameters`]; it does not replace it,
+    /// unlike `services`. See [`DpfConfig::resolved_bfcfg_parameters_for`].
+    ///
+    /// WARNING: Changing this will generate a new DPUFlavor, reprovisioning this deployment's
+    /// DPUs.
+    #[serde(default)]
+    pub extra_bfcfg_parameters: Vec<String>,
 }
 
 impl Default for DpfDeploymentConfig {
@@ -2097,26 +2284,79 @@ impl Default for DpfDeploymentConfig {
             node_label_key: default_dpf_node_label_key(),
             services: None,
             extra_services: BTreeMap::new(),
+            extra_bfcfg_parameters: Vec::new(),
         }
     }
+}
+
+impl DpfDeploymentConfig {
+    /// Derives the GB200 BF3 deployment from the configured BF3 source and services.
+    pub(crate) fn bf3_gb200(&self) -> Self {
+        Self {
+            flavor_name: append_bounded_identifier_suffix(
+                &self.flavor_name,
+                GB200_RESOURCE_SUFFIX,
+                KUBERNETES_DNS_SUBDOMAIN_MAX_LENGTH - DPF_FLAVOR_HASH_SUFFIX_LENGTH,
+            ),
+            deployment_name: append_bounded_identifier_suffix(
+                &self.deployment_name,
+                GB200_DEPLOYMENT_SUFFIX,
+                DPF_DEPLOYMENT_NAME_MAX_LENGTH,
+            ),
+            node_label_key: append_gb200_label_suffix(&self.node_label_key),
+            ..self.clone()
+        }
+    }
+}
+
+/// Appends `suffix` while reserving its bytes inside `max_len`.
+///
+/// Kubernetes identifiers are ASCII. If truncation lands on a separator,
+/// remove it so the suffix still ends a valid segment. Startup validation
+/// checks both the configured and derived identifiers after this step.
+fn append_bounded_identifier_suffix(value: &str, suffix: &str, max_len: usize) -> String {
+    let max_prefix_len = max_len.saturating_sub(suffix.len());
+    let prefix = value
+        .char_indices()
+        .take_while(|(index, ch)| index + ch.len_utf8() <= max_prefix_len)
+        .map(|(_, ch)| ch)
+        .collect::<String>();
+    let prefix = prefix.trim_end_matches(['-', '.', '_']);
+
+    format!("{prefix}{suffix}")
+}
+
+/// Adds the GB200 suffix to the name segment of a Kubernetes label key.
+fn append_gb200_label_suffix(label_key: &str) -> String {
+    let Some((prefix, name)) = label_key.rsplit_once('/') else {
+        return append_bounded_identifier_suffix(
+            label_key,
+            GB200_RESOURCE_SUFFIX,
+            KUBERNETES_LABEL_NAME_MAX_LENGTH,
+        );
+    };
+    let name = append_bounded_identifier_suffix(
+        name,
+        GB200_RESOURCE_SUFFIX,
+        KUBERNETES_LABEL_NAME_MAX_LENGTH,
+    );
+
+    format!("{prefix}/{name}")
 }
 
 /// BlueFieldSoftware spec for BF4-class DPU provisioning. Mirrors the `spec` of
 /// the `provisioning.dpu.nvidia.com/v1alpha1` `BlueFieldSoftware` CR.
 ///
 /// The PLDM firmware bundle is PSID-specific, so `pldm_fw_bundle` maps each PSID
-/// to its bundle URL. One `BlueFieldSoftware` CR and one DPUDeployment are
-/// created per PSID (see
-/// [`DpfDeploymentConfig::per_psid_deployment_name`] and
-/// [`DpfDeploymentConfig::per_psid_node_label_key`]).
+/// to its bundle URL. A single `BlueFieldSoftware` CR carries the complete map
+/// so DPF can select the matching bundle for each DPU model.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DpfBlueFieldSoftwareConfig {
     /// OS ISO URL used by the DPU OS installation flow (`spec.osIso`). Shared
     /// across all PSIDs.
     pub os_iso: String,
-    /// Map of PSID → PLDM firmware bundle URL (`spec.pldmFwBundle`). Each entry
-    /// fans out to its own `BlueFieldSoftware` CR and DPUDeployment.
+    /// Map of PSID → PLDM firmware bundle URL (`spec.pldmFwBundle`).
     #[serde(default)]
     pub pldm_fw_bundle: BTreeMap<String, String>,
 }
@@ -2153,10 +2393,15 @@ impl DpfDeploymentsConfig {
         v
     }
 
-    /// Validates that identifiers are unique and deployment label keys are not reserved.
-    /// Returns every conflict so the operator can fix them all in one pass.
+    /// Validates the final Kubernetes identifiers, their uniqueness, and reserved labels.
+    /// `DPU_ENABLED_NODE_LABEL` and `HOST_BMC_IP_LABEL` are reserved for the
+    /// shared DPF node marker and host BMC IP. Neither can be used as the
+    /// `node_label_key` for an individual deployment.
+    /// Returns every error so the operator can fix them all in one pass.
     pub fn validate_unique_identifiers(&self) -> eyre::Result<()> {
-        let deployments = self.all();
+        let bf3_gb200 = self.bf3.bf3_gb200();
+        let mut deployments = self.all();
+        deployments.push(("bf3_gb200", &bf3_gb200));
         let mut errors: Vec<String> = Vec::new();
 
         let name_vals: Vec<(&str, &str)> = deployments
@@ -2187,9 +2432,33 @@ impl DpfDeploymentsConfig {
             }
         }
 
+        for (deployment, name) in &name_vals {
+            if name.len() > DPF_DEPLOYMENT_NAME_MAX_LENGTH || !is_valid_kubernetes_object_name(name)
+            {
+                errors.push(format!(
+                    "deployment_name {name:?} for deployment {deployment:?} is not a valid DPUDeployment name"
+                ));
+            }
+        }
+
+        for (deployment, name) in &flavor_vals {
+            if name.len() + DPF_FLAVOR_HASH_SUFFIX_LENGTH > KUBERNETES_DNS_SUBDOMAIN_MAX_LENGTH
+                || !is_valid_kubernetes_object_name(name)
+            {
+                errors.push(format!(
+                    "flavor_name {name:?} for deployment {deployment:?} cannot form a valid hash-suffixed DPUFlavor name"
+                ));
+            }
+        }
+
         // This is intentionally a local configuration check. Querying current DPUNode labels
         // cannot establish safety: these keys have fixed NICo semantics before any node exists.
         for (deployment, label_key) in &label_vals {
+            if !is_valid_kubernetes_label_key(label_key) {
+                errors.push(format!(
+                    "node_label_key {label_key:?} for deployment {deployment:?} is not a valid Kubernetes label key"
+                ));
+            }
             if let Some((_, purpose)) = RESERVED_DPF_DEPLOYMENT_NODE_LABELS
                 .iter()
                 .find(|(reserved, _)| label_key == reserved)
@@ -2252,14 +2521,9 @@ impl DpfDeploymentsConfig {
                 (None, None) => errors.push(format!(
                     "deployment {name:?} sets neither bfb_url nor bluefield_software; set exactly one"
                 )),
-                // Exactly one PSID entry is allowed for now. Multi-PSID support
-                // is pending a DPF change that lets one `BlueFieldSoftware` CR
-                // carry a PSID→PLDM map; until then a single BF4 deployment uses
-                // the one entry's PLDM bundle.
-                (None, Some(bfs)) if bfs.pldm_fw_bundle.len() != 1 => errors.push(format!(
-                    "deployment {name:?} bluefield_software.pldm_fw_bundle must have exactly one \
-                     PSID → PLDM bundle URL entry (found {}).",
-                    bfs.pldm_fw_bundle.len()
+                (None, Some(bfs)) if bfs.pldm_fw_bundle.is_empty() => errors.push(format!(
+                    "deployment {name:?} bluefield_software.pldm_fw_bundle must have at least one \
+                     PSID → PLDM bundle URL entry.",
                 )),
                 _ => {}
             }
@@ -2576,12 +2840,12 @@ pub struct FnnRoutingProfileConfig {
     #[serde(default)]
     pub internal: Option<bool>,
 
-    /// Opts VPCs based on this profile into future tenant prefix overlap admission.
+    /// Opts VPCs based on this profile into exact tenant VpcPrefix reuse checks.
     ///
     /// This base-profile setting defaults to `false` and cannot be overridden
-    /// by a VPC. Admission support is tracked by
-    /// <https://github.com/NVIDIA/infra-controller/issues/3890>; this value
-    /// alone changes neither routing nor prefix persistence.
+    /// by a VPC. The complete eligibility, rejection, and database fallback
+    /// contract is documented under "Tenant prefix overlap checks" in
+    /// `crates/api-core/src/cfg/README.md`.
     #[serde(default)]
     pub tenant_prefix_overlap_eligible: bool,
 
@@ -2628,22 +2892,27 @@ pub struct FnnRoutingProfileConfig {
 }
 
 impl FnnRoutingProfileConfig {
-    /// Returns whether this resolved profile satisfies the profile-local overlap policy.
+    /// `is_eligible_for_tenant_prefix_overlap` returns whether the resolved
+    /// profile meets every profile condition for exact prefix reuse.
     ///
     /// Evaluate the profile returned by [`FnnConfig::resolve_vpc_routing_profile`],
     /// not the raw base profile, so VPC overrides participate in the decision.
-    /// This check cannot see site-wide route targets, additional FNN imports,
-    /// VPC peering, or retained routing state. Callers must reject those paths
-    /// between overlapping VPCs and separately require the site gate and
-    /// site-wide `vpc_isolation_behavior = "mutual_isolation"`.
-    #[allow(dead_code)] // Staged for https://github.com/NVIDIA/infra-controller/issues/3890.
+    /// The caller adds the site-wide conditions for these prefix writers.
+    /// Peering and VPC policy changes are tracked in
+    /// <https://github.com/NVIDIA/infra-controller/issues/5114>, and retained
+    /// Instance paths are tracked in
+    /// <https://github.com/NVIDIA/infra-controller/issues/5115>. Startup and
+    /// complete writer coverage are tracked in
+    /// <https://github.com/NVIDIA/infra-controller/issues/5116>. All three must
+    /// land before the database cutover in
+    /// <https://github.com/NVIDIA/infra-controller/issues/3892>.
     pub(crate) fn is_eligible_for_tenant_prefix_overlap(&self) -> bool {
         // Keep this exhaustive so new profile fields require an explicit eligibility decision.
         let Self {
             tenant_prefix_overlap_eligible,
             route_target_imports,
             route_targets_on_exports,
-            // External profiles are outside the initial overlap-admission scope.
+            // External profiles cannot participate in exact prefix reuse.
             internal,
             leak_default_route_from_underlay,
             leak_tenant_host_routes_to_underlay,
@@ -2888,6 +3157,14 @@ impl CarbideConfig {
         Ok(())
     }
 
+    pub(crate) fn validate_service_vpc_slots(&self) -> eyre::Result<()> {
+        eyre::ensure!(
+            self.dpu_config.service_vpc_slot_count == 0 || self.site_global_vpc_vni.is_none(),
+            "dpu_config.service_vpc_slot_count requires site_global_vpc_vni to be unset because service VPCs require distinct HBN VRFs"
+        );
+        Ok(())
+    }
+
     /// validate_supernic_firmware_profiles checks that each profile's inner
     /// part_number and psid match the HashMap keys they are nested under.
     /// Logs a warning for any mismatches (the inner values are authoritative
@@ -2943,16 +3220,32 @@ impl CarbideConfig {
         }
     }
 
-    pub fn is_dpa_enabled(&self) -> bool {
-        let Some(conf) = &self.dpa_config else {
+    pub fn is_ewethers_enabled(&self) -> bool {
+        let Some(conf) = &self.ewethers_config else {
             return false;
         };
 
         conf.enabled
     }
 
+    pub fn is_svpc_enabled(&self) -> bool {
+        let Some(conf) = &self.ewethers_config else {
+            return false;
+        };
+
+        conf.svpc_enabled
+    }
+
+    pub fn is_astra_enabled(&self) -> bool {
+        let Some(conf) = &self.ewethers_config else {
+            return false;
+        };
+
+        conf.astra_enabled
+    }
+
     pub fn get_dpa_subnet_ip(&self) -> Result<Ipv4Addr, eyre::Report> {
-        let Some(conf) = &self.dpa_config else {
+        let Some(conf) = &self.ewethers_config else {
             tracing::error!("get_dpa_subnet_ip: DPA config missing");
             return Err(eyre::eyre!("get_dpa_subnet_ip: DPA config missing"));
         };
@@ -2961,7 +3254,7 @@ impl CarbideConfig {
     }
 
     pub fn get_dpa_subnet_mask(&self) -> Result<i32, eyre::Report> {
-        let Some(conf) = &self.dpa_config else {
+        let Some(conf) = &self.ewethers_config else {
             tracing::error!("get_dpa_subnet_mask: DPA config missing");
             return Err(eyre::eyre!("get_dpa_subnet_mask: DPA config missing"));
         };
@@ -2970,17 +3263,21 @@ impl CarbideConfig {
     }
 
     pub fn mqtt_broker_host(&self) -> Option<String> {
-        self.dpa_config
+        self.ewethers_config
             .as_ref()
-            .map(|conf| conf.mqtt_endpoint.clone())
+            .map(|conf| conf.svpc.mqtt_endpoint.clone())
     }
 
     pub fn mqtt_broker_port(&self) -> Option<u16> {
-        self.dpa_config.as_ref().map(|conf| conf.mqtt_broker_port)
+        self.ewethers_config
+            .as_ref()
+            .map(|conf| conf.svpc.mqtt_broker_port)
     }
 
     pub fn get_hb_interval(&self) -> Option<chrono::TimeDelta> {
-        self.dpa_config.as_ref().map(|conf| conf.hb_interval)
+        self.ewethers_config
+            .as_ref()
+            .map(|conf| conf.svpc.hb_interval)
     }
 
     /// Returns true if the DSX Exchange Event Bus is enabled.
@@ -3131,6 +3428,14 @@ impl Default for VpcPrefixStateControllerConfig {
     }
 }
 
+/// Extension-service state-controller configuration.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ExtensionServiceStateControllerConfig {
+    /// Common state-controller configuration.
+    #[serde(default = "StateControllerConfig::default")]
+    pub controller: StateControllerConfig,
+}
+
 /// IbPartitionStateController related config
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -3212,7 +3517,7 @@ pub struct SwitchStateControllerConfig {
 
     /// Switch services that receive installed mTLS certificates during RMS
     /// `configure_switch_certificate` calls initiated by the switch state
-    /// machine.
+    /// machine or the direct `ComponentConfigureSwitchCertificate` RPC path.
     ///
     /// When this field is omitted or empty, all supported services are used.
     ///
@@ -3369,6 +3674,85 @@ pub const fn default_bmc_session_lockout_threshold() -> u32 {
     3
 }
 
+pub const fn default_bmc_max_sessions_per_caller() -> usize {
+    4
+}
+
+/// Routing of core's own BMC Redfish traffic through nico-bmc-proxy.
+///
+/// The client certificate identifies this instance to the proxy's mTLS
+/// listener; the defaults are the SPIFFE workload paths every nico-api pod
+/// already mounts. `root_ca` is what verifies the proxy's own certificate --
+/// unlike direct BMC connections, the proxy presents a real, verifiable
+/// identity, so certificate checking stays on.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BmcProxyConfig {
+    /// Master switch; `false` keeps all BMC traffic direct even when the
+    /// rest of this section is filled in.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Proxy address as `host:port` or `host` (port defaults to the BMC
+    /// proxy's 1079). Required when `enabled` is true; the serde default
+    /// (empty) only lets a disabled section omit it.
+    #[serde(default)]
+    pub address: String,
+    /// PEM client certificate presented to the proxy.
+    #[serde(default = "default_bmc_proxy_client_cert")]
+    pub client_cert: String,
+    /// PEM private key for `client_cert`.
+    #[serde(default = "default_bmc_proxy_client_key")]
+    pub client_key: String,
+    /// PEM bundle that verifies the proxy's server certificate.
+    #[serde(default = "default_bmc_proxy_root_ca")]
+    pub root_ca: String,
+}
+
+/// The port nico-bmc-proxy listens on, applied when `bmc_proxy.address` names
+/// only a host.
+const BMC_PROXY_DEFAULT_PORT: u16 = 1079;
+
+impl BmcProxyConfig {
+    /// The proxy address as a host-and-port pair.
+    ///
+    /// A host-only `address` gets the BMC proxy's default port; an address
+    /// without a host (e.g. `":1079"`) is rejected here rather than producing
+    /// a client that silently dials the BMC itself.
+    pub(crate) fn proxy_target(&self) -> Result<carbide_utils::HostPortPair, String> {
+        if self.address.trim().is_empty() {
+            return Err("bmc_proxy.address is required when bmc_proxy.enabled is true".to_string());
+        }
+        let parsed: carbide_utils::HostPortPair = self
+            .address
+            .parse()
+            .map_err(|err| format!("bmc_proxy.address {:?}: {err}", self.address))?;
+        match parsed {
+            carbide_utils::HostPortPair::HostAndPort(host, port) => {
+                Ok(carbide_utils::HostPortPair::HostAndPort(host, port))
+            }
+            carbide_utils::HostPortPair::HostOnly(host) => Ok(
+                carbide_utils::HostPortPair::HostAndPort(host, BMC_PROXY_DEFAULT_PORT),
+            ),
+            carbide_utils::HostPortPair::PortOnly(_) => Err(format!(
+                "bmc_proxy.address {:?} names no host; expected \"host\" or \"host:port\"",
+                self.address
+            )),
+        }
+    }
+}
+
+fn default_bmc_proxy_client_cert() -> String {
+    "/var/run/secrets/spiffe.io/tls.crt".to_string()
+}
+
+fn default_bmc_proxy_client_key() -> String {
+    "/var/run/secrets/spiffe.io/tls.key".to_string()
+}
+
+fn default_bmc_proxy_root_ca() -> String {
+    "/var/run/secrets/spiffe.io/ca.crt".to_string()
+}
+
 /// DpuConfig related internal configuration
 #[derive(Clone, Debug, Serialize)]
 pub struct DpuConfig {
@@ -3400,6 +3784,14 @@ pub struct DpuConfig {
     /// Defaults to 16 and must not exceed 126.
     #[serde(default)]
     pub num_of_vfs: u32,
+
+    /// Number of deterministic HBN interfaces reserved for service-VPC attachments.
+    #[serde(default)]
+    pub service_vpc_slot_count: u32,
+
+    /// Additional SF capacity that is not assigned to an HBN interface.
+    #[serde(default)]
+    pub additional_managed_sf: u32,
 
     /// Restart OVS on DPU agents whenever the host switches between
     /// admin and tenant networking. Required in some environments to
@@ -3449,6 +3841,10 @@ impl<'de> Deserialize<'de> for DpuConfig {
             #[serde(default)]
             num_of_vfs: Option<u32>,
             #[serde(default)]
+            service_vpc_slot_count: Option<u32>,
+            #[serde(default)]
+            additional_managed_sf: Option<u32>,
+            #[serde(default)]
             restart_ovs_on_use_admin_network_change: Option<bool>,
         }
 
@@ -3479,6 +3875,12 @@ impl<'de> Deserialize<'de> for DpuConfig {
                 .dpu_enable_secure_boot
                 .unwrap_or(default.dpu_enable_secure_boot),
             num_of_vfs,
+            service_vpc_slot_count: partial
+                .service_vpc_slot_count
+                .unwrap_or(default.service_vpc_slot_count),
+            additional_managed_sf: partial
+                .additional_managed_sf
+                .unwrap_or(default.additional_managed_sf),
             restart_ovs_on_use_admin_network_change: partial
                 .restart_ovs_on_use_admin_network_change
                 .unwrap_or(default.restart_ovs_on_use_admin_network_change),
@@ -3609,6 +4011,8 @@ impl Default for DpuConfig {
             ],
             dpu_enable_secure_boot: false,
             num_of_vfs: DEFAULT_DPU_NUM_OF_VFS,
+            service_vpc_slot_count: 0,
+            additional_managed_sf: 0,
             restart_ovs_on_use_admin_network_change: false,
         }
     }
@@ -3668,10 +4072,10 @@ pub struct NetworkSecurityGroupConfig {
     /// (src port range * dst port range * src prefix list * dst prefix list)
     #[serde(default = "default_max_network_security_group_size")]
     pub max_network_security_group_size: u32,
-    /// Whether to allow stateful security groups.
-    /// This will initially only be passed through to the
-    /// DPU as a way to toggle default stateful options
-    /// in nvue config.
+    /// Whether NSGs may enable stateful egress and the DPU enables its supporting NVUE options.
+    ///
+    /// When disabled, stateful NSG creation and updates from stateless to stateful are rejected.
+    /// Existing stateful NSGs remain editable, but the DPU applies their rules statelessly.
     #[serde(default = "default_to_true")]
     pub stateful_acls_enabled: bool,
 
@@ -3908,17 +4312,34 @@ impl From<CarbideConfig> for rpc::forge::RuntimeConfig {
                 .bom_validation
                 .allow_allocation_on_validation_failure,
             dpu_nic_firmware_update_versions: value.dpu_config.dpu_nic_firmware_update_versions,
-            dpa_enabled: value.dpa_config.clone().unwrap_or_default().enabled,
-            mqtt_endpoint: value.dpa_config.clone().unwrap_or_default().mqtt_endpoint,
-            mqtt_broker_port: value
-                .dpa_config
+            ewethers_enabled: value.ewethers_config.clone().unwrap_or_default().enabled,
+            svpc_enabled: value
+                .ewethers_config
                 .clone()
                 .unwrap_or_default()
+                .svpc_enabled,
+            astra_enabled: value
+                .ewethers_config
+                .clone()
+                .unwrap_or_default()
+                .astra_enabled,
+            mqtt_endpoint: value
+                .ewethers_config
+                .clone()
+                .unwrap_or_default()
+                .svpc
+                .mqtt_endpoint,
+            mqtt_broker_port: value
+                .ewethers_config
+                .clone()
+                .unwrap_or_default()
+                .svpc
                 .mqtt_broker_port as i32,
             mqtt_hb_interval: value
-                .dpa_config
+                .ewethers_config
                 .clone()
                 .unwrap_or_default()
+                .svpc
                 .hb_interval
                 .to_string(),
             bom_validation_auto_generate_missing_sku: value
@@ -3930,12 +4351,12 @@ impl From<CarbideConfig> for rpc::forge::RuntimeConfig {
                 .as_secs(),
             dpu_secure_boot_enabled: value.dpu_config.dpu_enable_secure_boot,
             dpa_subnet_ip: value
-                .dpa_config
+                .ewethers_config
                 .clone()
                 .unwrap_or_default()
                 .subnet_ip
                 .to_string(),
-            dpa_subnet_mask: value.dpa_config.unwrap_or_default().subnet_mask,
+            dpa_subnet_mask: value.ewethers_config.unwrap_or_default().subnet_mask,
             dpf_enabled: value.dpf.enabled,
             compile_time_helm_version: crate::dpf_services::COMPILE_TIME_HELM_VERSION.to_string(),
             compile_time_docker_version: crate::dpf_services::COMPILE_TIME_IMAGE_TAG.to_string(),
@@ -3954,7 +4375,7 @@ fn default_mqtt_broker_port() -> u16 {
     1884
 }
 
-pub use carbide_dpa_manager::config::{DpaConfig, MqttAuthConfig, MqttAuthMode};
+pub use carbide_dpa_manager::config::{EwEthersConfig, MqttAuthConfig, MqttAuthMode, SvpcConfig};
 use model::vpc::VpcDefinition;
 
 /// DSX Exchange Event Bus configuration for publishing state change events via MQTT 3.1.1.
@@ -4289,6 +4710,72 @@ mod tests {
         let error = toml::from_str::<NodeAuthConfig>("audience = \"nico-api-eu\"")
             .expect_err("the node-auth audience is fixed");
         assert!(error.to_string().contains("unknown field `audience`"));
+    }
+
+    #[test]
+    fn credentials_file_config_contract() {
+        scenarios!(
+            run = |config: &str| toml::from_str::<CredentialsConfig>(config).map_err(drop);
+            "optional source" {
+                "" => Yields(CredentialsConfig::default()),
+            }
+
+            "valid file source" {
+                r#"
+ufm_source = "local"
+
+[file]
+path = "/var/run/secrets/nico/ufm/credentials.yaml"
+poll_interval = "17s"
+"# => Yields(CredentialsConfig {
+                    ufm_source: UfmCredentialSource::Local,
+                    file: Some(CredentialFileSourceConfig {
+                        path: PathBuf::from("/var/run/secrets/nico/ufm/credentials.yaml"),
+                        poll_interval: std::time::Duration::from_secs(17),
+                    }),
+                }),
+            }
+
+            "file source default poll interval" {
+                r#"
+[file]
+path = "credentials.yaml"
+"# => Yields(CredentialsConfig {
+                    ufm_source: UfmCredentialSource::LocalFirst,
+                    file: Some(CredentialFileSourceConfig {
+                        path: PathBuf::from("credentials.yaml"),
+                        poll_interval: std::time::Duration::from_secs(60),
+                    }),
+                }),
+            }
+
+            "missing file path" {
+                "[file]\npoll_interval = \"17s\"" => Fails,
+            }
+
+            "unknown field" {
+                "[file]\npath = \"credentials.yaml\"\ntoken = \"not-a-secret-here\"" => Fails,
+            }
+
+            "unknown UFM source" {
+                "ufm_source = \"fallback\"" => Fails,
+            }
+        );
+    }
+
+    #[test]
+    fn ufm_source_contract() {
+        value_scenarios!(
+            run = |ufm_source| CredentialsConfig {
+                ufm_source,
+                file: None,
+            }.uses_authoritative_local_ufm_credentials();
+            "credential source modes" {
+                UfmCredentialSource::LocalFirst => false,
+                UfmCredentialSource::Backend => false,
+                UfmCredentialSource::Local => true,
+            }
+        );
     }
 
     /// A cap below the clients' fixed 300 s lifetime is accepted-looking and
@@ -4817,6 +5304,7 @@ mod tests {
                 pki_role_name: &'static str,
                 token: Option<&'static str>,
                 vault_cacert: Option<&'static str>,
+                namespace: Option<&'static str>,
             },
         }
 
@@ -4844,6 +5332,7 @@ mod tests {
                     pki_role_name = "machine"
                     token = "s.abc123"
                     vault_cacert = "/etc/ssl/certs/vault-ca.pem"
+                    namespace = "admin/certificates"
                 "#,
                 Expect::Dedicated {
                     address: "https://vault-certs.example:8200",
@@ -4851,6 +5340,7 @@ mod tests {
                     pki_role_name: "machine",
                     token: Some("s.abc123"),
                     vault_cacert: Some("/etc/ssl/certs/vault-ca.pem"),
+                    namespace: Some("admin/certificates"),
                 },
             ),
             (
@@ -4912,6 +5402,7 @@ mod tests {
                     pki_role_name,
                     token,
                     vault_cacert,
+                    namespace,
                 } => {
                     let cfg = parsed
                         .unwrap_or_else(|e| panic!("{name}: expected parse to succeed, got {e}"));
@@ -4929,6 +5420,7 @@ mod tests {
                                 *vault_cacert,
                                 "{name}: vault_cacert"
                             );
+                            assert_eq!(d.namespace.as_deref(), *namespace, "{name}: namespace");
                         }
                         other => panic!("{name}: expected dedicated vault backend, got {other:?}"),
                     }
@@ -5141,6 +5633,26 @@ mod tests {
     }
 
     #[test]
+    fn validate_service_vpc_slots_rejects_site_global_vpc_vni() {
+        let mut config: CarbideConfig = Figment::new()
+            .merge(Toml::file(format!("{TEST_DATA_DIR}/min_config.toml")))
+            .extract()
+            .unwrap();
+
+        config.dpu_config.service_vpc_slot_count = 1;
+        assert!(config.validate_service_vpc_slots().is_ok());
+
+        config.site_global_vpc_vni = Some(6_000);
+        assert!(
+            config
+                .validate_service_vpc_slots()
+                .unwrap_err()
+                .to_string()
+                .contains("requires site_global_vpc_vni to be unset")
+        );
+    }
+
+    #[test]
     fn periodic_state_republish_defaults_enabled() {
         let config = PeriodicStateRepublishConfig::default();
 
@@ -5319,6 +5831,7 @@ mod tests {
             pki_role_name: "leaf".to_string(),
             token: Some("s.super-secret-root-token".to_string()),
             vault_cacert: None,
+            namespace: None,
         });
         let redacted = config.redacted();
         assert_eq!(
@@ -5376,16 +5889,22 @@ mod tests {
         );
         assert!(config.dhcp_servers.is_empty());
         assert!(!config.allow_insecure_discovery);
+        assert!(!config.scout_boot_interface_correction_enabled);
         assert!(config.route_servers.is_empty());
         assert!(config.tls.is_none());
         assert!(config.auth.is_none());
         assert!(config.pools.is_none());
         assert!(config.ib_config.is_none());
         assert!(config.ib_fabrics.is_empty());
+        assert_eq!(config.credentials, CredentialsConfig::default());
         assert_eq!(
             config.bmc_session_lockout_threshold,
             default_bmc_session_lockout_threshold()
         );
+        // The literal, not the helper: this pins the documented default so a
+        // drive-by change to the helper cannot silently diverge from the
+        // config docs.
+        assert_eq!(config.bmc_max_sessions_per_caller, 4);
         assert!(
             !config.allow_bmc_basic_auth_fallback,
             "allow_bmc_basic_auth_fallback must default to false to preserve \
@@ -5413,6 +5932,10 @@ mod tests {
         assert_eq!(
             config.vpc_prefix_state_controller,
             VpcPrefixStateControllerConfig::default()
+        );
+        assert_eq!(
+            config.extension_service_state_controller,
+            ExtensionServiceStateControllerConfig::default()
         );
         assert_eq!(
             config.ib_partition_state_controller,
@@ -5466,6 +5989,56 @@ mod tests {
         );
     }
 
+    // The address contract: host-only gets the BMC proxy's default port, a
+    // host-less address is rejected at parse time rather than producing a client
+    // that silently dials the BMC itself.
+    #[test]
+    fn bmc_proxy_target_requires_a_host_and_defaults_the_port() {
+        let target = |address: &str| {
+            BmcProxyConfig {
+                enabled: true,
+                address: address.to_string(),
+                client_cert: default_bmc_proxy_client_cert(),
+                client_key: default_bmc_proxy_client_key(),
+                root_ca: default_bmc_proxy_root_ca(),
+            }
+            .proxy_target()
+        };
+
+        assert_eq!(
+            target("bmc-proxy.example").unwrap(),
+            carbide_utils::HostPortPair::HostAndPort("bmc-proxy.example".to_string(), 1079),
+        );
+        assert_eq!(
+            target("bmc-proxy.example:2079").unwrap(),
+            carbide_utils::HostPortPair::HostAndPort("bmc-proxy.example".to_string(), 2079),
+        );
+        assert!(
+            target(":1079").unwrap_err().contains("names no host"),
+            "a port-only address must be rejected"
+        );
+        assert!(
+            target("").unwrap_err().contains("required"),
+            "an omitted address must be rejected on an enabled section, not \
+             parsed as a host"
+        );
+    }
+
+    // `address` carries a serde default so a disabled `[bmc_proxy]` section can
+    // omit it; the empty default is only rejected when the section is
+    // actually enabled (see the `proxy_target` case above).
+    #[test]
+    fn bmc_proxy_section_parses_without_address_when_disabled() {
+        let config: CarbideConfig = Figment::new()
+            .merge(Toml::file(format!("{TEST_DATA_DIR}/min_config.toml")))
+            .merge(Toml::string("[bmc_proxy]\nenabled = false"))
+            .extract()
+            .unwrap();
+        let bmc_proxy = config.bmc_proxy.expect("section should parse");
+        assert!(!bmc_proxy.enabled);
+        assert_eq!(bmc_proxy.address, "");
+    }
+
     fn rendered_helm_api_config() -> String {
         let mut config =
             include_str!("../../../../helm/charts/nico-api/files/carbide-api-config.toml")
@@ -5480,6 +6053,18 @@ mod tests {
             (
                 r#"{{ .Values.auth.namespace | default (include "nico-api.namespace" .) }}"#,
                 "nico-system",
+            ),
+            (
+                r#"{{ printf "%s/credentials.yaml" (required "nico-api.credentials.file.mountPath is required when credentials.file.existingSecret.name is set" .Values.credentials.file.mountPath) | quote }}"#,
+                r#""/var/run/secrets/nico/ufm/credentials.yaml""#,
+            ),
+            (
+                r#"{{ required "nico-api.credentials.file.pollInterval is required when credentials.file.existingSecret.name is set" .Values.credentials.file.pollInterval | quote }}"#,
+                r#""60s""#,
+            ),
+            (
+                "{{ .Values.credentials.ufmSource | quote }}",
+                r#""local_first""#,
             ),
             (
                 "{{ range $i, $cn := .Values.auth.additionalIssuerCns }}{{ if $i }}, {{ end }}{{ $cn | quote }}{{ end }}",
@@ -5523,6 +6108,10 @@ mod tests {
                 r#""https://rms.example.test""#,
             ),
             ("{{ .Values.rms.enforceTls }}", "true"),
+            (
+                r#"{{ .Values.bmcProxy.address | default (printf "nico-bmc-proxy.%s.svc.cluster.local:1079" (include "nico-api.namespace" .)) }}"#,
+                "nico-bmc-proxy.nico-system.svc.cluster.local:1079",
+            ),
             ("{{ . | quote }}", r#""/tmp/test.pem""#),
         ] {
             config = config.replace(template, rendered);
@@ -5614,6 +6203,7 @@ mod tests {
         figment::Jail::expect_with(|jail| {
             jail.set_env("CARBIDE_API_DATABASE_URL", "postgres://othersql");
             jail.set_env("CARBIDE_API_ASN", 777);
+            jail.set_env("CARBIDE_API_SCOUT_BOOT_INTERFACE_CORRECTION_ENABLED", true);
             jail.set_env("CARBIDE_API_AUTH", "{permissive_mode=true}");
             jail.set_env(
                 "CARBIDE_API_DSX_EXCHANGE_EVENT_BUS",
@@ -5633,6 +6223,17 @@ mod tests {
             assert_eq!(config.metrics_endpoint, Some("[::]:1080".parse().unwrap()));
             assert_eq!(config.database_url, "postgres://othersql".to_string());
             assert_eq!(config.asn, 777);
+            assert!(config.scout_boot_interface_correction_enabled);
+            assert_eq!(
+                config.credentials,
+                CredentialsConfig {
+                    ufm_source: UfmCredentialSource::Backend,
+                    file: Some(CredentialFileSourceConfig {
+                        path: PathBuf::from("/var/run/secrets/nico/ufm/credentials.yaml"),
+                        poll_interval: std::time::Duration::from_secs(17),
+                    }),
+                }
+            );
             assert_eq!(
                 config.dhcp_servers,
                 vec![Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8)]
@@ -6072,22 +6673,30 @@ enabled = true
     fn deserialize_dpa_config() {
         let toml = r#"
 enabled=true
+svpc_enabled=true
+
+[svpc]
 mqtt_endpoint = "mqtt.forge"
         "#;
 
-        let dpa_config: DpaConfig = Figment::new().merge(Toml::string(toml)).extract().unwrap();
+        let dpa_config: EwEthersConfig =
+            Figment::new().merge(Toml::string(toml)).extract().unwrap();
 
         assert_eq!(
             dpa_config,
-            DpaConfig {
+            EwEthersConfig {
                 enabled: true,
-                mqtt_endpoint: "mqtt.forge".to_string(),
-                mqtt_broker_port: 1884,
-                hb_interval: chrono::TimeDelta::minutes(2),
+                svpc_enabled: true,
+                astra_enabled: false,
                 monitor_run_interval: std::time::Duration::from_secs(60),
                 subnet_ip: Ipv4Addr::UNSPECIFIED,
                 subnet_mask: 0_i32,
-                auth: MqttAuthConfig::default(),
+                svpc: SvpcConfig {
+                    mqtt_endpoint: "mqtt.forge".to_string(),
+                    mqtt_broker_port: 1884,
+                    hb_interval: chrono::TimeDelta::minutes(2),
+                    auth: MqttAuthConfig::default(),
+                },
             }
         );
     }
@@ -6099,6 +6708,8 @@ mqtt_endpoint = "mqtt.forge"
 bootstrap_ca_source = "embedded"
 dpu_enable_secure_boot = true
 num_of_vfs = 64
+service_vpc_slot_count = 5
+additional_managed_sf = 2
 "#;
 
         let config: CarbideConfig = Figment::new()
@@ -6113,6 +6724,8 @@ num_of_vfs = 64
         );
         assert!(config.dpu_config.dpu_enable_secure_boot);
         assert_eq!(config.dpu_config.num_of_vfs, 64);
+        assert_eq!(config.dpu_config.service_vpc_slot_count, 5);
+        assert_eq!(config.dpu_config.additional_managed_sf, 2);
         assert!(!config.dpu_config.dpu_models.is_empty());
     }
 
@@ -6470,6 +7083,87 @@ sign_proxy_url = "http://dsx-imds.dpf-operator-system.svc.cluster.local:8080"
     }
 
     #[test]
+    fn dpf_extra_bfcfg_parameters_reach_the_config_verbatim() {
+        // The strings reach bf.cfg unquoted and uninterpreted, so parsing must not alter them.
+        let parse = |body: &str| {
+            toml::from_str::<DpfConfig>(body)
+                .expect("dpf config must parse")
+                .extra_bfcfg_parameters
+        };
+
+        value_scenarios!(
+            run = |body: &str| parse(body);
+
+            "absent key defaults to no extra parameters" {
+                "enabled = true\n" => Vec::<String>::new(),
+            }
+
+            "explicit empty list is accepted" {
+                "extra_bfcfg_parameters = []\n" => Vec::<String>::new(),
+            }
+
+            "a quoted password hash survives parsing unchanged" {
+                // Single-quoted in bf.cfg so the hash's `$` sections are not shell-expanded.
+                "extra_bfcfg_parameters = [\"ubuntu_PASSWORD='$6$sa.lt$h/a.sh'\"]\n"
+                    => vec!["ubuntu_PASSWORD='$6$sa.lt$h/a.sh'".to_string()],
+            }
+
+            "configured order is preserved" {
+                "extra_bfcfg_parameters = [\"FIRST=1\", \"SECOND=2\"]\n"
+                    => vec!["FIRST=1".to_string(), "SECOND=2".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn deployment_bfcfg_parameters_append_to_the_site_wide_list() {
+        // Append, not override, so a deployment setting its own parameter keeps the site-wide
+        // list rather than replacing it.
+        let resolved = |body: &str| {
+            let config = toml::from_str::<DpfConfig>(body).expect("dpf config must parse");
+            config.resolved_bfcfg_parameters_for(&config.deployments.bf3)
+        };
+        let deployment_keys = "\nflavor_name = \"f\"\ndeployment_name = \"d\"\n\
+                               node_label_key = \"k\"\n";
+
+        value_scenarios!(
+            run = |body: &str| resolved(body);
+
+            "neither level configured yields nothing" {
+                "enabled = true\n" => Vec::<String>::new(),
+            }
+
+            "site-wide only applies to the deployment" {
+                "extra_bfcfg_parameters = [\"SITE=1\"]\n" => vec!["SITE=1".to_string()],
+            }
+
+            "deployment-only applies without a site-wide list" {
+                &format!("[deployments.bf3]{deployment_keys}\
+                          extra_bfcfg_parameters = [\"OWN=1\"]\n")
+                    => vec!["OWN=1".to_string()],
+            }
+
+            "site-wide comes first, then the deployment's own" {
+                &format!("extra_bfcfg_parameters = [\"SITE=1\", \"SITE=2\"]\n\
+                          [deployments.bf3]{deployment_keys}\
+                          extra_bfcfg_parameters = [\"OWN=1\"]\n")
+                    => vec!["SITE=1".to_string(), "SITE=2".to_string(), "OWN=1".to_string()],
+            }
+
+            "a deployment list does not replace the site-wide one" {
+                // A site-wide password survives a deployment adding a parameter of its own.
+                &format!("extra_bfcfg_parameters = [\"ubuntu_PASSWORD='$6$sa.lt$h/a.sh'\"]\n\
+                          [deployments.bf3]{deployment_keys}\
+                          extra_bfcfg_parameters = [\"OWN=1\"]\n")
+                    => vec![
+                        "ubuntu_PASSWORD='$6$sa.lt$h/a.sh'".to_string(),
+                        "OWN=1".to_string(),
+                    ],
+            }
+        );
+    }
+
+    #[test]
     fn dpf_service_helm_values_require_a_table() {
         for value in ["true", "[\"value\"]"] {
             let config = format!("[services.dpu_agent]\nextra_helm_values = {value}\n");
@@ -6630,7 +7324,11 @@ helm_repo_url = "oci://registry.example.test/doca"
         .unwrap();
 
         let deployment = DpfDeploymentConfig::default();
-        for deployment_type in [DpuDeploymentType::Bf3, DpuDeploymentType::Bf4Generic] {
+        for deployment_type in [
+            DpuDeploymentType::Bf3,
+            DpuDeploymentType::Bf3Gb200,
+            DpuDeploymentType::Bf4Generic,
+        ] {
             assert!(
                 config
                     .resolved_services_for(&deployment, deployment_type)
@@ -7172,6 +7870,7 @@ helm_repo_url = "oci://registry.example.test/doca"
             node_label_key: "carbide.nvidia.com/bf4".to_string(),
             services: None,
             extra_services: BTreeMap::new(),
+            extra_bfcfg_parameters: Vec::new(),
         }
     }
 
@@ -7218,6 +7917,55 @@ helm_repo_url = "oci://registry.example.test/doca"
                 ) => false,
             }
         );
+    }
+
+    #[test]
+    fn gb200_bf3_deployment_derives_distinct_identifiers_and_reuses_bf3_inputs() {
+        let bf3 = DpfDeploymentConfig {
+            bfb_url: Some("https://example.com/custom.bfb".to_string()),
+            flavor_name: "site-bf3-flavor".to_string(),
+            deployment_name: "site-bf3-deploy".to_string(),
+            node_label_key: "carbide.nvidia.com/site-bf3".to_string(),
+            ..Default::default()
+        };
+
+        let gb200 = bf3.bf3_gb200();
+        assert_eq!(gb200.bfb_url, bf3.bfb_url);
+        assert_eq!(gb200.flavor_name, "site-bf3-flavor-gb200");
+        assert_eq!(gb200.deployment_name, "site-bf3-deploy-g");
+        assert_eq!(gb200.node_label_key, "carbide.nvidia.com/site-bf3-gb200");
+    }
+
+    #[test]
+    fn gb200_bf3_derived_identifiers_stay_within_kubernetes_limits() {
+        let bf3 = DpfDeploymentConfig {
+            flavor_name: "f"
+                .repeat(KUBERNETES_DNS_SUBDOMAIN_MAX_LENGTH - DPF_FLAVOR_HASH_SUFFIX_LENGTH),
+            deployment_name: "d".repeat(DPF_DEPLOYMENT_NAME_MAX_LENGTH),
+            node_label_key: format!(
+                "carbide.nvidia.com/{}",
+                "n".repeat(KUBERNETES_LABEL_NAME_MAX_LENGTH)
+            ),
+            ..Default::default()
+        };
+
+        let gb200 = bf3.bf3_gb200();
+        let label_name = gb200.node_label_key.rsplit_once('/').unwrap().1;
+
+        assert_eq!(gb200.deployment_name.len(), DPF_DEPLOYMENT_NAME_MAX_LENGTH);
+        assert_eq!(
+            gb200.flavor_name.len() + DPF_FLAVOR_HASH_SUFFIX_LENGTH,
+            KUBERNETES_DNS_SUBDOMAIN_MAX_LENGTH
+        );
+        assert_eq!(label_name.len(), KUBERNETES_LABEL_NAME_MAX_LENGTH);
+        assert!(is_valid_kubernetes_label_key(&gb200.node_label_key));
+
+        let deployments = DpfDeploymentsConfig {
+            bf3,
+            bf4_generic: None,
+            bf4_astra: None,
+        };
+        assert!(deployments.validate_unique_identifiers().is_ok());
     }
 
     #[test]
@@ -7332,16 +8080,7 @@ helm_repo_url = "oci://registry.example.test/doca"
     }
 
     #[test]
-    fn validate_provisioning_sources_requires_exactly_one_psid() {
-        // Exactly one PSID entry is accepted.
-        let one = DpfDeploymentsConfig {
-            bf3: DpfDeploymentConfig::default(),
-            bf4_generic: Some(bf4_config(None, Some(bf4_with_psids(&["MT_0000000884"])))),
-            bf4_astra: None,
-        };
-        assert!(one.validate_provisioning_sources().is_ok());
-
-        // More than one PSID is rejected (multi-PSID support is pending a DPF change).
+    fn validate_provisioning_sources_accepts_multiple_psids() {
         let many = DpfDeploymentsConfig {
             bf3: DpfDeploymentConfig::default(),
             bf4_generic: Some(bf4_config(
@@ -7350,6 +8089,6 @@ helm_repo_url = "oci://registry.example.test/doca"
             )),
             bf4_astra: None,
         };
-        assert!(many.validate_provisioning_sources().is_err());
+        assert!(many.validate_provisioning_sources().is_ok());
     }
 }

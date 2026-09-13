@@ -82,6 +82,40 @@ func TestInjectExpectation(t *testing.T) {
 	}
 }
 
+func TestNormalizeDecommissionState(t *testing.T) {
+	testCases := map[string]struct {
+		raw  string
+		want string
+	}{
+		"terminal state": {
+			raw:  `{"state":"decommissioning","decommissioning_state":{"state":"decommissioned"}}`,
+			want: "Decommissioned",
+		},
+		"in-progress state": {
+			raw:  `{"state":"decommissioning","decommissioning_state":{"state":"factoryresetbmc"}}`,
+			want: "Decommissioning/factoryresetbmc",
+		},
+		"unrelated state remains unchanged": {
+			raw:  `{"state":"ready"}`,
+			want: `{"state":"ready"}`,
+		},
+		"malformed state remains unchanged": {
+			raw:  "Ready",
+			want: "Ready",
+		},
+		"decommissioning state without substate remains unchanged": {
+			raw:  `{"state":"decommissioning"}`,
+			want: `{"state":"decommissioning"}`,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.want, normalizeDecommissionState(tc.raw))
+		})
+	}
+}
+
 func TestPowerControl(t *testing.T) {
 	m := New(nicoapi.NewMockClient(), nil)
 
@@ -134,7 +168,7 @@ func TestAggregateNICoStatuses(t *testing.T) {
 	mkStatus := func(compID string, state corev1.FirmwareUpdateState, errMsg string) *corev1.FirmwareUpdateStatus {
 		return &corev1.FirmwareUpdateStatus{
 			Result: &corev1.ComponentResult{
-				ComponentId: compID,
+				ComponentId: &compID,
 				Error:       errMsg,
 			},
 			State: state,

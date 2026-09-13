@@ -116,16 +116,24 @@ func (vp *VpcPrefix) ToProto(vpc *Vpc) *corev1.VpcPrefix {
 	return proto
 }
 
-// GetIPv4CIDR returns the VPC prefix's IPv4 CIDR string, or nil when Prefix is unset.
-func (vp *VpcPrefix) GetIPv4CIDR() *string {
+// GetCIDR parses the stored VPC Prefix into a canonical netip.Prefix.
+// PrefixLength completes legacy rows that store an address without CIDR
+// notation. Valid prefixes are masked to their network address. An unset
+// prefix returns an invalid zero value, while malformed stored prefixes return
+// an error.
+func (vp *VpcPrefix) GetCIDR() (netip.Prefix, error) {
 	if vp.Prefix == "" {
-		return nil
+		return netip.Prefix{}, nil
 	}
-	if strings.Contains(vp.Prefix, "/") {
-		return &vp.Prefix
+	cidr := vp.Prefix
+	if !strings.Contains(cidr, "/") {
+		cidr = fmt.Sprintf("%s/%d", cidr, vp.PrefixLength)
 	}
-	cidr := fmt.Sprintf("%s/%d", vp.Prefix, vp.PrefixLength)
-	return &cidr
+	prefix, err := netip.ParsePrefix(cidr)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("invalid stored VPC Prefix CIDR %q: %w", cidr, err)
+	}
+	return prefix.Masked(), nil
 }
 
 // FromProto populates this VpcPrefix from its workflow proto representation.
@@ -215,6 +223,13 @@ type VpcPrefixUpdateInput struct {
 	IsMissingOnSite *bool
 }
 
+// VpcPrefixClearInput input parameters for Clear method
+type VpcPrefixClearInput struct {
+	VpcPrefixID uuid.UUID
+	// Deleted clears the soft-delete timestamp (undelete).
+	Deleted bool
+}
+
 // VpcPrefixFilterInput input parameters for Filter method
 type VpcPrefixFilterInput struct {
 	VpcPrefixIDs  []uuid.UUID
@@ -228,6 +243,8 @@ type VpcPrefixFilterInput struct {
 	SearchQuery   *string
 	Prefixes      []string
 	PrefixLengths []int
+	// IncludeDeleted returns soft-deleted rows in addition to active ones.
+	IncludeDeleted bool
 }
 
 var _ bun.BeforeAppendModelHook = (*VpcPrefix)(nil)
@@ -266,10 +283,12 @@ type VpcPrefixDAO interface {
 	//
 	Update(ctx context.Context, tx *db.Tx, input VpcPrefixUpdateInput) (*VpcPrefix, error)
 	//
+	Clear(ctx context.Context, tx *db.Tx, input VpcPrefixClearInput) (*VpcPrefix, error)
+	//
 	Delete(ctx context.Context, tx *db.Tx, id uuid.UUID) error
 	//
 	// GetPrefixUsage returns IPv4 interface usage per VPC prefix ID (in-memory IPAM simulation).
-	// VPC prefixes without a valid CIDR are omitted from the result map.
+	// Unset and IPv6 prefixes are omitted; malformed stored prefixes return an error.
 	GetPrefixUsage(ctx context.Context, tx *db.Tx, vpcPrefixes ...*VpcPrefix) (map[uuid.UUID]*cipam.Usage, error)
 }
 
@@ -368,6 +387,10 @@ func (vpsd VpcPrefixSQLDAO) GetAll(ctx context.Context, tx *db.Tx, filter VpcPre
 	vps := []VpcPrefix{}
 
 	query := db.GetIDB(tx, vpsd.dbSession).NewSelect().Model(&vps)
+	// Soft-deleted rows are excluded by default.
+	if filter.IncludeDeleted {
+		query = query.WhereAllWithDeleted()
+	}
 	if filter.VpcPrefixIDs != nil {
 		query = query.Where("vp.id IN (?)", bun.In(filter.VpcPrefixIDs))
 		vpsd.tracerSpan.SetAttribute(vpDAOSpan, "vpc_prefix_ids", filter.VpcPrefixIDs)
@@ -519,6 +542,46 @@ func (vpsd VpcPrefixSQLDAO) Update(ctx context.Context, tx *db.Tx, input VpcPref
 	return nvp, nil
 }
 
+// Clear clears VpcPrefix attributes based on provided arguments
+func (vpsd VpcPrefixSQLDAO) Clear(ctx context.Context, tx *db.Tx, input VpcPrefixClearInput) (*VpcPrefix, error) {
+	ctx, vpDAOSpan := vpsd.tracerSpan.CreateChildInCurrentContext(ctx, "VpcPrefixDAO.Clear")
+	if vpDAOSpan != nil {
+		defer vpDAOSpan.End()
+
+		vpsd.tracerSpan.SetAttribute(vpDAOSpan, "id", input.VpcPrefixID.String())
+	}
+
+	vp := &VpcPrefix{
+		ID: input.VpcPrefixID,
+	}
+	updatedFields := []string{}
+
+	if input.Deleted {
+		vp.Deleted = nil
+		updatedFields = append(updatedFields, "deleted")
+	}
+
+	if len(updatedFields) > 0 {
+		updatedFields = append(updatedFields, "updated")
+
+		query := db.GetIDB(tx, vpsd.dbSession).NewUpdate().Model(vp).Column(updatedFields...).Where("id = ?", input.VpcPrefixID)
+		// Soft-deleted rows are excluded by default; include them when undeleting.
+		if input.Deleted {
+			query = query.WhereAllWithDeleted()
+		}
+		_, err := query.Exec(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	nvp, err := vpsd.GetByID(ctx, tx, vp.ID, nil)
+	if err != nil {
+		return nil, err
+	}
+	return nvp, nil
+}
+
 // Delete deletes an VpcPrefix by ID
 // error is returned only if there is a db error
 // if the object being deleted doesnt exist, error is not returned (idempotent delete)
@@ -633,11 +696,14 @@ func (vpsd VpcPrefixSQLDAO) GetPrefixUsage(ctx context.Context, tx *db.Tx, vpcPr
 		if vp == nil {
 			return nil, fmt.Errorf("Failed to calculate usage stats for VPC Prefix: nil argument")
 		}
-		cidr := vp.GetIPv4CIDR()
-		if cidr == nil {
+		prefix, err := vp.GetCIDR()
+		if err != nil {
+			return nil, fmt.Errorf("failed to calculate usage stats for VPC Prefix %s: %w", vp.ID, err)
+		}
+		if !prefix.Addr().Is4() {
 			continue
 		}
-		vpcPrefixCIDRs[vp.ID] = *cidr
+		vpcPrefixCIDRs[vp.ID] = prefix.String()
 		vpcPrefixIDs = append(vpcPrefixIDs, vp.ID)
 	}
 	if len(vpcPrefixIDs) == 0 {

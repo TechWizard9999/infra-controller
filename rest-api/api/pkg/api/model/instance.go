@@ -4,14 +4,17 @@
 package model
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"slices"
 	"time"
 
 	"github.com/NVIDIA/infra-controller/rest-api/api/internal/config"
 	"github.com/NVIDIA/infra-controller/rest-api/api/pkg/api/model/util"
+	dpsclient "github.com/NVIDIA/infra-controller/rest-api/api/pkg/client/dps"
 	cdbm "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/model"
 	goset "github.com/deckarep/golang-set/v2"
 	validation "github.com/go-ozzo/ozzo-validation/v4"
@@ -22,9 +25,40 @@ import (
 	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 )
 
+// ValidatePowerProfile validates and normalizes set operations when direct DPS
+// integration is enabled. Omitted values and explicit clears do not require
+// policy discovery.
+func ValidatePowerProfile(ctx context.Context, dpsEnabled bool, provider dpsclient.PolicyProvider, powerProfile *string) *cutil.APIError {
+	if !dpsEnabled || powerProfile == nil || *powerProfile == "" {
+		return nil
+	}
+	if provider == nil {
+		return cutil.NewAPIError(http.StatusServiceUnavailable, "DPS power-profile validation is unavailable", nil)
+	}
+
+	normalized, err := dpsclient.ValidatePowerProfile(ctx, provider, *powerProfile)
+	if err == nil {
+		*powerProfile = normalized
+		return nil
+	}
+	if errors.Is(err, dpsclient.ErrPowerProfileRequired) {
+		return cutil.NewAPIError(http.StatusBadRequest, "Power profile must not be empty", nil)
+	}
+	if errors.Is(err, dpsclient.ErrPowerProfileNotFound) {
+		return cutil.NewAPIError(http.StatusBadRequest, "Power profile does not exist in DPS", nil)
+	}
+
+	return cutil.NewAPIError(http.StatusServiceUnavailable, "Failed to validate power profile with DPS", nil)
+}
+
 const (
 	// MaxInterfaceCount is the maximum number of Interfaces allowed per Instance
 	MaxInterfaceCount = 16
+	// MaxSpectrumXAttachmentCount is the maximum number of SpectrumX Attachments allowed per Instance.
+	// Core caps the usable count at the Machine's SpectrumX PFs, and multiplane splits each port into
+	// one PF per plane, so an 8-SuperNIC HGX node on the 4-plane Astra profile exposes 32. This only
+	// keeps an unbounded list from reaching the Site, so it sits above that rather than near it.
+	MaxSpectrumXAttachmentCount = 64
 	// MachineIssueCategoryHardware is the category for hardware issues
 	MachineIssueCategoryHardware = "Hardware"
 	// MachineIssueCategoryNetwork is the category for network issues
@@ -34,6 +68,10 @@ const (
 	// MachineIssueCategoryOther is the category for other issues
 	MachineIssueCategoryOther = "Other"
 )
+
+// validationErrorUserDataLength derives from util.MaxUserDataBytes so the
+// message and the enforced limit cannot drift apart.
+var validationErrorUserDataLength = fmt.Sprintf("`userData` must not exceed %d KiB", util.MaxUserDataBytes/1024)
 
 var (
 	// SitePhoneHomeCloudInit default cloudinit with phone home config
@@ -371,6 +409,41 @@ func ValidateDpuExtensionServiceDeployments(desdrs []APIDpuExtensionServiceDeplo
 	return nil
 }
 
+// ValidateSpectrumXAttachments validates the SpectrumX Attachments for the Instance create/update request.
+// Each attachment consumes one device instance in Core's allocate_spx_port_mac, which rejects a repeated
+// device and device instance pair irrespective of virtualFunctionId. Reject it here so the caller gets a
+// 400 instead of a Site failure. Core bounds the real count by the Machine's SpectrumX interfaces, so
+// MaxSpectrumXAttachmentCount only keeps an unbounded list from reaching it.
+func ValidateSpectrumXAttachments(sacs []APISpectrumXAttachmentCreateOrUpdateRequest) error {
+	if len(sacs) > MaxSpectrumXAttachmentCount {
+		return validation.Errors{
+			"spectrumXAttachments": fmt.Errorf("at most %v SpectrumX Attachments can be specified", MaxSpectrumXAttachmentCount),
+		}
+	}
+
+	deviceInstanceMap := map[string]bool{}
+
+	for _, sac := range sacs {
+		err := sac.Validate()
+		if err != nil {
+			return err
+		}
+
+		deviceInstanceID := fmt.Sprintf("%s-%d", sac.Device, *sac.DeviceInstance)
+
+		_, exists := deviceInstanceMap[deviceInstanceID]
+		if exists {
+			return validation.Errors{
+				"spectrumXAttachments": fmt.Errorf("duplicate SpectrumX Attachment specified for Device %v, Device Instance: %v", sac.Device, *sac.DeviceInstance),
+			}
+		}
+
+		deviceInstanceMap[deviceInstanceID] = true
+	}
+
+	return nil
+}
+
 // ValidateNVLinkInterfaces validates the NVLink interfaces for Instance create/update request.
 // A subset of GPUs may be specified; specifying more interfaces than GPUs is not allowed.
 // Each DeviceInstance (GPU index) must be unique and within the valid range for the machine.
@@ -445,6 +518,8 @@ type APIInstanceCreateRequest struct {
 	AutoNetwork bool `json:"autoNetwork"`
 	// InfiniBandInterfaces is the list of InfiniBandInterface to create for the Instance
 	InfiniBandInterfaces []APIInfiniBandInterfaceCreateOrUpdateRequest `json:"infinibandInterfaces"`
+	// SpectrumXAttachments is the list of SpectrumX Partition attachments to create for the Instance
+	SpectrumXAttachments []APISpectrumXAttachmentCreateOrUpdateRequest `json:"spectrumXAttachments"`
 	// DpuExtensionServiceDeployments is the list of DpuExtensionServiceDeployments to create for the Instance
 	DpuExtensionServiceDeployments []APIDpuExtensionServiceDeploymentRequest `json:"dpuExtensionServiceDeployments"`
 	// NVLinkInterfaces is the list of NVLinkInterface to create for the Instance
@@ -458,6 +533,10 @@ type APIInstanceCreateRequest struct {
 	NetworkSecurityGroupID *string `json:"networkSecurityGroupId"`
 	// MachineID is the ID of the Machine. Only MachineID or InstanceTypeID can be present
 	MachineID *string `json:"machineId"`
+	// MachineLabelSelector restricts automatic Machine selection, or validates a
+	// specifically requested Machine, by exact Machine label key/value matches.
+	// All entries must match.
+	MachineLabelSelector map[string]string `json:"machineLabelSelector"`
 	// AllowUnhealthyMachine is a flag that can be used to target Machines are in maintenance or have health alerts preventing regular provision flow.
 	AllowUnhealthyMachine *bool `json:"allowUnhealthyMachine"`
 	// PowerProfile is the external power provisioning profile for the Instance.
@@ -478,6 +557,9 @@ type APIBatchInstanceCreateRequest struct {
 	TenantID string `json:"tenantId"`
 	// InstanceTypeID is the ID of the Instance Type
 	InstanceTypeID string `json:"instanceTypeId"`
+	// MachineLabelSelector restricts Machine selection by exact Machine label
+	// key/value matches. All entries must match.
+	MachineLabelSelector map[string]string `json:"machineLabelSelector"`
 	// VpcID is the ID of the VPC containing the Instances
 	VpcID string `json:"vpcId"`
 	// SecondaryVpcIDs lists additional VPC UUIDs for non-primary interfaces on
@@ -508,6 +590,8 @@ type APIBatchInstanceCreateRequest struct {
 	AutoNetwork bool `json:"autoNetwork"`
 	// InfiniBandInterfaces is the list of InfiniBandInterface to create for each instance (shared across all instances)
 	InfiniBandInterfaces []APIInfiniBandInterfaceCreateOrUpdateRequest `json:"infinibandInterfaces"`
+	// SpectrumXAttachments is the list of SpectrumX Partition attachments to create for each instance (shared across all instances)
+	SpectrumXAttachments []APISpectrumXAttachmentCreateOrUpdateRequest `json:"spectrumXAttachments"`
 	// NVLinkInterfaces is the list of NVLinkInterface to create for each instance (shared across all instances)
 	NVLinkInterfaces []APINVLinkInterfaceCreateOrUpdateRequest `json:"nvLinkInterfaces"`
 	// DpuExtensionServiceDeployments is the list of DpuExtensionServiceDeployments to create for each Instance (shared across all instances)
@@ -543,6 +627,10 @@ func (icr APIInstanceCreateRequest) Validate() error {
 			validationis.UUID.Error(validationErrorInvalidUUID)),
 		validation.Field(&icr.OperatingSystemID,
 			validationis.UUID.Error(validationErrorInvalidUUID)),
+		validation.Field(&icr.UserData,
+			validation.When(icr.UserData != nil,
+				validation.Length(0, util.MaxUserDataBytes).Error(validationErrorUserDataLength)),
+		),
 		validation.Field(&icr.PowerProfile,
 			validation.When(icr.PowerProfile != nil, validation.Required.Error("`powerProfile` must not be empty"))),
 		validation.Field(&icr.Interfaces,
@@ -610,6 +698,12 @@ func (icr APIInstanceCreateRequest) Validate() error {
 		}
 	}
 
+	// Validate SpectrumX Attachments
+	err = ValidateSpectrumXAttachments(icr.SpectrumXAttachments)
+	if err != nil {
+		return err
+	}
+
 	// Validate DpuExtensionServiceDeployments
 	err = ValidateDpuExtensionServiceDeployments(icr.DpuExtensionServiceDeployments)
 	if err != nil {
@@ -625,7 +719,12 @@ func (icr APIInstanceCreateRequest) Validate() error {
 		}
 	}
 
-	if err := util.ValidateLabels(icr.Labels); err != nil {
+	err = util.ValidateLabels(icr.Labels)
+	if err != nil {
+		return err
+	}
+	err = validateMachineLabelSelector(icr.MachineLabelSelector)
+	if err != nil {
 		return err
 	}
 
@@ -662,6 +761,13 @@ func (icr *APIInstanceCreateRequest) ValidateAndSetOperatingSystemData(cfg *conf
 	mergedPhoneHomeEnabled := icr.PhoneHomeEnabled
 	mergedIpxeScript := icr.IpxeScript
 	mergedAlwaysBootWithCustomIpxe := icr.AlwaysBootWithCustomIpxe
+
+	// If the request supplies no user-data of its own, the document being
+	// edited is the base OS's blob, whose phone-home block NICo authored
+	// whenever the OS was stored with phone-home enabled. That block is
+	// removed by key, because the URL frozen into it may predate a change
+	// to site.phoneHomeUrl. Caller-supplied user-data stays URL-matched.
+	nicoAuthoredPhoneHome := icr.UserData == nil && os != nil && os.PhoneHomeEnabled
 
 	if os == nil {
 		// If no OS is being chosen...
@@ -821,7 +927,14 @@ func (icr *APIInstanceCreateRequest) ValidateAndSetOperatingSystemData(cfg *conf
 				// so we want to do this check silently and not alert people who
 				// are using non-YAML user-data.
 
-				if err := util.RemovePhoneHomeFromUserData(documentRoot, cutil.GetPtr(cfg.GetSitePhoneHomeUrl())); err != nil {
+				// NICo's own block is removed by key, because the URL frozen
+				// into it may predate a change to site.phoneHomeUrl.
+				var phoneHomeURLFilter *string
+				if !nicoAuthoredPhoneHome {
+					phoneHomeURLFilter = cutil.GetPtr(cfg.GetSitePhoneHomeUrl())
+				}
+
+				if err := util.RemovePhoneHomeFromUserData(documentRoot, phoneHomeURLFilter); err != nil {
 					return validation.Errors{
 						"userData": errors.New("failed to disable phone-home in userData after processing phone home config"),
 					}
@@ -832,7 +945,7 @@ func (icr *APIInstanceCreateRequest) ValidateAndSetOperatingSystemData(cfg *conf
 			// If there's still user-data, marshal so that it can be stored in the DB later
 			if isUserDataValidYAML && len(documentRoot.Content) > 0 {
 
-				byteUserData, err := yaml.Marshal(userDataMap)
+				byteUserData, err := util.MarshalUserData(userDataMap)
 				if err != nil {
 					return validation.Errors{
 						"userData": errors.New("failed to re-construct userData after processing phone home config"),
@@ -858,7 +971,7 @@ func (icr *APIInstanceCreateRequest) ValidateAndSetOperatingSystemData(cfg *conf
 		}
 	}
 
-	return nil
+	return util.ValidateEffectiveUserData(icr.UserData)
 }
 
 // ValidateMultiEthernetDeviceInterfaces validates the Multi-Ethernet Device Interfaces for the Instance
@@ -902,6 +1015,10 @@ func (bicr APIBatchInstanceCreateRequest) Validate() error {
 			validationis.UUID.Error(validationErrorInvalidUUID)),
 		validation.Field(&bicr.OperatingSystemID,
 			validationis.UUID.Error(validationErrorInvalidUUID)),
+		validation.Field(&bicr.UserData,
+			validation.When(bicr.UserData != nil,
+				validation.Length(0, util.MaxUserDataBytes).Error(validationErrorUserDataLength)),
+		),
 		validation.Field(&bicr.PowerProfile,
 			validation.When(bicr.PowerProfile != nil, validation.Required.Error("`powerProfile` must not be empty"))),
 		validation.Field(&bicr.Interfaces,
@@ -969,6 +1086,12 @@ func (bicr APIBatchInstanceCreateRequest) Validate() error {
 		}
 	}
 
+	// Validate SpectrumX Attachments
+	err = ValidateSpectrumXAttachments(bicr.SpectrumXAttachments)
+	if err != nil {
+		return err
+	}
+
 	// Validate DpuExtensionServiceDeployments
 	err = ValidateDpuExtensionServiceDeployments(bicr.DpuExtensionServiceDeployments)
 	if err != nil {
@@ -984,12 +1107,43 @@ func (bicr APIBatchInstanceCreateRequest) Validate() error {
 		}
 	}
 
-	if err := util.ValidateLabels(bicr.Labels); err != nil {
+	err = util.ValidateLabels(bicr.Labels)
+	if err != nil {
+		return err
+	}
+	err = validateMachineLabelSelector(bicr.MachineLabelSelector)
+	if err != nil {
 		return err
 	}
 
 	// err should be nil at this point
 	return err
+}
+
+// validateMachineLabelSelector applies the shared label-map contract while
+// reporting validation errors against the public request field.
+func validateMachineLabelSelector(selector map[string]string) error {
+	err := util.ValidateLabels(selector)
+	if err == nil {
+		return nil
+	}
+
+	labelErrors, ok := err.(validation.Errors)
+	if !ok {
+		return validation.Errors{"machineLabelSelector": err}
+	}
+
+	labelErr, found := labelErrors["labels"]
+	if !found {
+		return validation.Errors{"machineLabelSelector": err}
+	}
+	if errors.Is(labelErr, util.ErrValidationLabelNUL) {
+		return validation.Errors{
+			"machineLabelSelector": errors.New("machine label selector keys and values must not contain the Unicode NUL character (U+0000)"),
+		}
+	}
+
+	return validation.Errors{"machineLabelSelector": labelErr}
 }
 
 // ValidateForVpc validates request fields whose legality depends on the
@@ -1018,6 +1172,13 @@ func (bicr *APIBatchInstanceCreateRequest) ValidateAndSetOperatingSystemData(cfg
 	mergedPhoneHomeEnabled := bicr.PhoneHomeEnabled
 	mergedIpxeScript := bicr.IpxeScript
 	mergedAlwaysBootWithCustomIpxe := bicr.AlwaysBootWithCustomIpxe
+
+	// If the request supplies no user-data of its own, the document being
+	// edited is the base OS's blob, whose phone-home block NICo authored
+	// whenever the OS was stored with phone-home enabled. That block is
+	// removed by key, because the URL frozen into it may predate a change
+	// to site.phoneHomeUrl. Caller-supplied user-data stays URL-matched.
+	nicoAuthoredPhoneHome := bicr.UserData == nil && os != nil && os.PhoneHomeEnabled
 
 	if os == nil {
 		// If no OS is being chosen...
@@ -1143,7 +1304,14 @@ func (bicr *APIBatchInstanceCreateRequest) ValidateAndSetOperatingSystemData(cfg
 				}
 
 			} else if isUserDataValidYAML {
-				if err := util.RemovePhoneHomeFromUserData(documentRoot, cutil.GetPtr(cfg.GetSitePhoneHomeUrl())); err != nil {
+				// NICo's own block is removed by key, because the URL frozen
+				// into it may predate a change to site.phoneHomeUrl.
+				var phoneHomeURLFilter *string
+				if !nicoAuthoredPhoneHome {
+					phoneHomeURLFilter = cutil.GetPtr(cfg.GetSitePhoneHomeUrl())
+				}
+
+				if err := util.RemovePhoneHomeFromUserData(documentRoot, phoneHomeURLFilter); err != nil {
 					return validation.Errors{
 						"userData": errors.New("failed to disable phone-home in userData after processing phone home config"),
 					}
@@ -1153,7 +1321,7 @@ func (bicr *APIBatchInstanceCreateRequest) ValidateAndSetOperatingSystemData(cfg
 			// If there's still user-data, marshal so that it can be stored in the DB later
 			if isUserDataValidYAML && len(documentRoot.Content) > 0 {
 
-				byteUserData, err := yaml.Marshal(userDataMap)
+				byteUserData, err := util.MarshalUserData(userDataMap)
 				if err != nil {
 					return validation.Errors{
 						"userData": errors.New("failed to re-construct userData after processing phone home config"),
@@ -1172,7 +1340,7 @@ func (bicr *APIBatchInstanceCreateRequest) ValidateAndSetOperatingSystemData(cfg
 		}
 	}
 
-	return nil
+	return util.ValidateEffectiveUserData(bicr.UserData)
 }
 
 // ValidateNVLinkInterfaces validates the NVLink interfaces for the Instance
@@ -1220,6 +1388,9 @@ type APIInstanceUpdateRequest struct {
 	AutoNetwork *bool `json:"autoNetwork"`
 	// InfiniBandInterfaces is the list of InfiniBandInterface to update for the Instance
 	InfiniBandInterfaces []APIInfiniBandInterfaceCreateOrUpdateRequest `json:"infinibandInterfaces"`
+	// SpectrumXAttachments is the list of SpectrumX Partition attachments to update for the Instance. `nil` leaves
+	// the Instance's SpectrumX attachments unchanged; a non-nil (possibly empty) list replaces them entirely.
+	SpectrumXAttachments []APISpectrumXAttachmentCreateOrUpdateRequest `json:"spectrumXAttachments"`
 	// DpuExtensionServiceDeployments is the list of DpuExtensionServiceDeployments to update for the Instance
 	DpuExtensionServiceDeployments []APIDpuExtensionServiceDeploymentRequest `json:"dpuExtensionServiceDeployments"`
 	// NVLinkInterfaces is the list of NVLinkInterface to update for the Instance
@@ -1249,6 +1420,22 @@ func (iur *APIInstanceUpdateRequest) ValidateAndSetOperatingSystemData(cfg *conf
 	mergedPhoneHomeEnabled := iur.PhoneHomeEnabled
 	mergedIpxeScript := iur.IpxeScript
 	mergedAlwaysBootWithCustomIpxe := iur.AlwaysBootWithCustomIpxe
+
+	// If the request supplies no user-data of its own, the document being
+	// edited is a stored blob — the new base OS's when the request changes
+	// the OS, otherwise the instance's — and any phone-home block in it was
+	// authored by NICo whenever that blob was stored with phone-home
+	// enabled. Such a block is removed by key, because the URL frozen into
+	// it may predate a change to site.phoneHomeUrl. Caller-supplied
+	// user-data stays URL-matched.
+	nicoAuthoredPhoneHome := false
+	if iur.UserData == nil {
+		if iur.OperatingSystemID != nil {
+			nicoAuthoredPhoneHome = os != nil && os.PhoneHomeEnabled
+		} else {
+			nicoAuthoredPhoneHome = instance.PhoneHomeEnabled
+		}
+	}
 
 	if os == nil {
 		// If the OS is being cleared...
@@ -1437,7 +1624,14 @@ func (iur *APIInstanceUpdateRequest) ValidateAndSetOperatingSystemData(cfg *conf
 				// so we want to do this check silently and not alert people who
 				// are using non-YAML user-data.
 
-				if err := util.RemovePhoneHomeFromUserData(documentRoot, cutil.GetPtr(cfg.GetSitePhoneHomeUrl())); err != nil {
+				// NICo's own block is removed by key, because the URL frozen
+				// into it may predate a change to site.phoneHomeUrl.
+				var phoneHomeURLFilter *string
+				if !nicoAuthoredPhoneHome {
+					phoneHomeURLFilter = cutil.GetPtr(cfg.GetSitePhoneHomeUrl())
+				}
+
+				if err := util.RemovePhoneHomeFromUserData(documentRoot, phoneHomeURLFilter); err != nil {
 					return validation.Errors{
 						"userData": errors.New("failed to disable phone-home in userData after processing phone home config"),
 					}
@@ -1447,7 +1641,7 @@ func (iur *APIInstanceUpdateRequest) ValidateAndSetOperatingSystemData(cfg *conf
 			// If there's still user-data, marshal so that it can be stored in the DB later
 			if isUserDataValidYAML && len(documentRoot.Content) > 0 {
 
-				byteUserData, err := yaml.Marshal(userDataMap)
+				byteUserData, err := util.MarshalUserData(userDataMap)
 				if err != nil {
 					return validation.Errors{
 						"userData": errors.New("failed to re-construct userData after processing phone home config"),
@@ -1473,7 +1667,17 @@ func (iur *APIInstanceUpdateRequest) ValidateAndSetOperatingSystemData(cfg *conf
 		}
 	}
 
-	return nil
+	// An update that touches none of user-data, the base OS, or phone-home
+	// leaves iur.UserData nil, so the value heading to the Site is the stored
+	// blob that mergedUserData resolved to. Checking it here rather than
+	// assigning it back keeps the field absent from the update, so an
+	// unrelated update cannot rewrite a column the caller never named.
+	effectiveUserData := iur.UserData
+	if effectiveUserData == nil {
+		effectiveUserData = mergedUserData
+	}
+
+	return util.ValidateEffectiveUserData(effectiveUserData)
 }
 
 // ValidateMultiEthernetDeviceInterfaces validates the Multi-Ethernet Device Interfaces for the Instance
@@ -1510,6 +1714,7 @@ func (iur *APIInstanceUpdateRequest) IsUpdateRequest() bool {
 		iur.Interfaces != nil ||
 		iur.AutoNetwork != nil ||
 		iur.InfiniBandInterfaces != nil ||
+		iur.SpectrumXAttachments != nil ||
 		iur.NVLinkInterfaces != nil ||
 		iur.SSHKeyGroupIDs != nil ||
 		iur.NetworkSecurityGroupID != nil ||
@@ -1518,7 +1723,8 @@ func (iur *APIInstanceUpdateRequest) IsUpdateRequest() bool {
 
 // IsInterfaceUpdateRequest checks if the request is an instance interface update request
 func (iur *APIInstanceUpdateRequest) IsInterfaceUpdateRequest() bool {
-	return iur.Interfaces != nil || iur.AutoNetwork != nil || iur.InfiniBandInterfaces != nil || iur.NVLinkInterfaces != nil
+	return iur.Interfaces != nil || iur.AutoNetwork != nil || iur.InfiniBandInterfaces != nil || iur.NVLinkInterfaces != nil ||
+		iur.SpectrumXAttachments != nil
 }
 
 // IsRebootRequest checks if the request is an instance reboot request
@@ -1538,6 +1744,10 @@ func (iur APIInstanceUpdateRequest) Validate() error {
 		),
 		validation.Field(&iur.OperatingSystemID,
 			validationis.UUID.Error(validationErrorInvalidUUID),
+		),
+		validation.Field(&iur.UserData,
+			validation.When(iur.UserData != nil,
+				validation.Length(0, util.MaxUserDataBytes).Error(validationErrorUserDataLength)),
 		),
 		validation.Field(&iur.Interfaces,
 			validation.When(len(iur.Interfaces) > 0, validation.Length(1, MaxInterfaceCount).Error(fmt.Sprintf("at most %v Interfaces can be specified", MaxInterfaceCount))),
@@ -1612,6 +1822,12 @@ func (iur APIInstanceUpdateRequest) Validate() error {
 		if err != nil {
 			return err
 		}
+	}
+
+	// Validate SpectrumX Attachments
+	err = ValidateSpectrumXAttachments(iur.SpectrumXAttachments)
+	if err != nil {
+		return err
 	}
 
 	// Validate DpuExtensionServiceDeployments

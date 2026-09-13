@@ -20,7 +20,7 @@ use std::net::IpAddr;
 
 use carbide_libmlx_model::device::info::MlxDeviceInfo;
 use carbide_uuid::dpa_interface::{DpaInterfaceId, NULL_DPA_INTERFACE_ID};
-use carbide_uuid::machine::MachineId;
+use carbide_uuid::machine::HostMachineId;
 use config_version::ConfigVersion;
 use mac_address::MacAddress;
 use model::controller_outcome::PersistentStateHandlerOutcome;
@@ -32,6 +32,7 @@ use sqlx::PgConnection;
 
 use super::DatabaseError;
 use crate::db_read::DbReader;
+use crate::{ConditionalWrite, ControllerStateNotCurrent};
 
 pub async fn persist(
     value: NewDpaInterface,
@@ -196,7 +197,7 @@ pub async fn find_by_ip(
 // are found, because multiple would not make sense.
 pub async fn get_for_pci_name(
     txn: impl DbReader<'_>,
-    machine_id: &MachineId,
+    machine_id: &HostMachineId,
     pci_name: &str,
 ) -> Result<DpaInterface, DatabaseError> {
     let query = "SELECT row_to_json(m.*) from (select * from dpa_interfaces WHERE deleted is NULL AND machine_id = $1 AND pci_name = $2) m";
@@ -248,7 +249,7 @@ pub async fn find_by_mac_addr(
 /// is always available.
 pub async fn update_device_info(
     txn: &mut PgConnection,
-    machine_id: MachineId,
+    machine_id: HostMachineId,
     pci_name: &str,
     device_info: &MlxDeviceInfo,
 ) -> Result<(), DatabaseError> {
@@ -291,7 +292,7 @@ fn validate_search_config(search_config: &DpaSearchConfig) -> Result<(), Databas
 // Used by the machine statemachine controller to find all DPAs associated with a given machine
 pub async fn find_by_machine_id(
     txn: impl DbReader<'_>,
-    machine_id: MachineId,
+    machine_id: HostMachineId,
     search_config: DpaSearchConfig,
 ) -> Result<Vec<DpaInterface>, DatabaseError> {
     validate_search_config(&search_config)?;
@@ -331,9 +332,9 @@ pub async fn find_by_machine_id(
 /// (callers default such machines to an empty list).
 pub async fn find_by_machine_ids(
     txn: impl DbReader<'_>,
-    machine_ids: &[MachineId],
+    machine_ids: &[HostMachineId],
     search_config: DpaSearchConfig,
-) -> Result<std::collections::HashMap<MachineId, Vec<DpaInterface>>, DatabaseError> {
+) -> Result<std::collections::HashMap<HostMachineId, Vec<DpaInterface>>, DatabaseError> {
     validate_search_config(&search_config)?;
 
     // No machines means no interfaces; skip the round trip entirely.
@@ -364,7 +365,7 @@ pub async fn find_by_machine_ids(
         .map_err(|e| DatabaseError::query(builder.sql(), e))?;
 
     Ok(interfaces.into_iter().fold(
-        std::collections::HashMap::<MachineId, Vec<DpaInterface>>::new(),
+        std::collections::HashMap::<HostMachineId, Vec<DpaInterface>>::new(),
         |mut by_machine, interface| {
             by_machine
                 .entry(interface.machine_id)
@@ -448,18 +449,19 @@ pub async fn all_dpa_states_in_sync(
     Ok(true)
 }
 
-/// Updates the dpa interface state that is owned by the state controller
-/// under the premise that the current controller state version didn't change.
+/// `try_update_controller_state` updates the DPA controller state when its
+/// version matches `expected_version`, replacing that version with `new_version`.
 ///
-/// Returns `true` if the state could be updated, and `false` if the object
-/// either doesn't exist anymore or is at a different version.
+/// Returns `NotApplied(ControllerStateNotCurrent)` if the row is missing or its
+/// version differs. `new_version` must advance `expected_version`; the caller must
+/// commit any surrounding transaction. Database failures are returned as errors.
 pub async fn try_update_controller_state(
     txn: &mut PgConnection,
     id: DpaInterfaceId,
     expected_version: ConfigVersion,
     new_version: ConfigVersion,
     new_state: &DpaInterfaceControllerState,
-) -> Result<bool, DatabaseError> {
+) -> Result<ConditionalWrite<(), ControllerStateNotCurrent>, DatabaseError> {
     let query = "UPDATE dpa_interfaces SET controller_state_version=$1, controller_state=$2::json where id=$3::uuid AND controller_state_version=$4 returning id";
     let result = sqlx::query_as::<_, DpaInterfaceId>(query)
         .bind(new_version)
@@ -470,7 +472,10 @@ pub async fn try_update_controller_state(
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
 
-    Ok(result.is_some())
+    Ok(match result {
+        Some(_) => ConditionalWrite::Applied(()),
+        None => ConditionalWrite::NotApplied(ControllerStateNotCurrent),
+    })
 }
 
 pub async fn update_controller_state_outcome(
@@ -500,7 +505,7 @@ pub async fn delete(value: DpaInterface, txn: &mut PgConnection) -> Result<(), D
 
 pub async fn is_machine_dpa_capable(
     txn: &mut PgConnection,
-    machine_id: MachineId,
+    machine_id: HostMachineId,
 ) -> Result<bool, DatabaseError> {
     let result = batch_is_machine_dpa_capable(txn, &[machine_id]).await?;
     Ok(result.contains(&machine_id))
@@ -510,8 +515,8 @@ pub async fn is_machine_dpa_capable(
 /// Returns a HashSet of machine IDs that have DPA interfaces.
 pub async fn batch_is_machine_dpa_capable(
     txn: &mut PgConnection,
-    machine_ids: &[MachineId],
-) -> Result<HashSet<MachineId>, DatabaseError> {
+    machine_ids: &[HostMachineId],
+) -> Result<HashSet<HostMachineId>, DatabaseError> {
     if machine_ids.is_empty() {
         return Ok(HashSet::new());
     }
@@ -519,20 +524,12 @@ pub async fn batch_is_machine_dpa_capable(
     let query = "SELECT DISTINCT machine_id FROM dpa_interfaces
                  WHERE deleted IS NULL AND machine_id = ANY($1)";
 
-    let rows: Vec<(String,)> = sqlx::query_as(query)
-        .bind(
-            machine_ids
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>(),
-        )
+    Ok(sqlx::query_scalar(query)
+        .bind(machine_ids)
         .fetch_all(txn)
         .await
-        .map_err(|e| DatabaseError::query(query, e))?;
-
-    Ok(rows
+        .map_err(|e| DatabaseError::query(query, e))?
         .into_iter()
-        .filter_map(|(id,)| id.parse::<MachineId>().ok())
         .collect())
 }
 
@@ -569,7 +566,9 @@ mod test {
 
     use carbide_libmlx_model::device::info::MlxDeviceInfo;
     use carbide_test_support::query_counter::count_queries;
-    use carbide_uuid::machine::{MachineId, MachineIdSource, MachineType};
+    use carbide_uuid::machine::{
+        HostMachineId as MachineId, MachineId as GenericMachineId, MachineIdSource, MachineType,
+    };
     use mac_address::MacAddress;
     use model::dpa_interface::{
         DpaInterfaceControllerState, DpaInterfaceType, DpaSearchConfig, NewDpaInterface,
@@ -605,11 +604,13 @@ mod test {
             for i in offset..(offset + n) {
                 let mut hash = [0u8; 32];
                 hash[..8].copy_from_slice(&(i as u64).to_be_bytes());
-                let id = MachineId::new(
+                let id: MachineId = GenericMachineId::new(
                     MachineIdSource::ProductBoardChassisSerial,
                     hash,
                     MachineType::Host,
-                );
+                )
+                .try_into()
+                .unwrap();
                 machine::create(&mut txn, None, &id, ManagedHostState::Ready, None, 2).await?;
                 crate::dpa_interface::persist(
                     NewDpaInterface {

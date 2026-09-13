@@ -17,7 +17,7 @@
 
 /// The TAR files used here are a full crawl of a servers' Redfish tree using
 /// redfish-mockup-creator.
-/// https://gitlab-master.nvidia.com/nvmetal/libredfish/-/tree/forge/tests/mockups?ref_type=heads
+/// https://github.com/NVIDIA/libredfish/tree/main/tests/mockups
 ///
 /// There is one for each vendor we support in the libredfish repo.
 use std::collections::HashMap;
@@ -117,10 +117,12 @@ pub(super) fn tar_router(
 
     let cache = TarRouterCache { entries };
 
+    // Archive mocks answer errors in the same Redfish envelope as generated ones.
     Ok(Router::new()
         .route("/{*path}", get(get_from_tar))
         .fallback(not_found_handler)
-        .with_state(cache))
+        .with_state(cache)
+        .layer(axum::middleware::from_fn(super::redfish_error_envelope)))
 }
 
 lazy_static::lazy_static! {

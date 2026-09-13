@@ -33,6 +33,19 @@ type Client struct {
 	AuthRetryNotify func(AuthRetryEvent)
 }
 
+// http2StreamError matches net/http's private stream error through errors.As.
+type http2StreamError struct {
+	StreamID uint32
+	Code     uint32
+	Cause    error
+}
+
+const http2InternalErrorCode uint32 = 0x2
+
+func (hse http2StreamError) Error() string {
+	return fmt.Sprintf("HTTP/2 stream %d failed with code %d", hse.StreamID, hse.Code)
+}
+
 type AuthRetryAction string
 
 const (
@@ -112,11 +125,39 @@ func (c *Client) Do(method, pathTemplate string, pathParams, queryParams map[str
 	})
 }
 
-// executeWithRetry wraps a single request builder with the CLI's auth-token
-// refresh retry handling. The builder receives the client to execute against
-// so future transport-fallback handling can swap it without touching callers.
+// executeWithRetry wraps a single request builder with the CLI's retry
+// handling: the HTTP/2 INTERNAL_ERROR fallback for safe methods and the
+// auth-token refresh loop. The builder receives the client to execute
+// against so the fallback handling can swap it without touching callers.
 func (c *Client) executeWithRetry(method string, execute func(client *Client) ([]byte, http.Header, error)) ([]byte, http.Header, error) {
-	respBody, respHeader, err := execute(c)
+	doClient := c
+	respBody, respHeader, err := execute(doClient)
+	streamErr, isHTTP2StreamError := errors.AsType[http2StreamError](err)
+	if method == http.MethodGet && isHTTP2StreamError && streamErr.Code == http2InternalErrorCode {
+		var transport *http.Transport
+		switch currentTransport := c.HTTPClient.Transport.(type) {
+		case nil:
+			transport = http.DefaultTransport.(*http.Transport).Clone()
+		case *http.Transport:
+			transport = currentTransport.Clone()
+		}
+		if transport != nil {
+			protocols := new(http.Protocols)
+			protocols.SetHTTP1(true)
+			transport.Protocols = protocols
+			transport.TLSNextProto = nil
+			if transport.TLSClientConfig != nil {
+				transport.TLSClientConfig.NextProtos = nil
+			}
+
+			httpClient := *c.HTTPClient
+			httpClient.Transport = transport
+			retryClient := *c
+			retryClient.HTTPClient = &httpClient
+			doClient = &retryClient
+			respBody, respHeader, err = execute(doClient)
+		}
+	}
 	if isUnauthorizedError(err) && c.TokenRefresh != nil && !canReplayAfterAuthRefresh(method) {
 		apiErr := err.(*APIError)
 		c.notifyAuthRetry(AuthRetryEvent{
@@ -149,6 +190,7 @@ func (c *Client) executeWithRetry(method string, execute func(client *Client) ([
 			return nil, nil, fmt.Errorf("refreshing auth token after unauthorized response: no token returned")
 		}
 		c.Token = token
+		doClient.Token = token
 		c.notifyAuthRetry(AuthRetryEvent{
 			Action:      AuthRetryActionRetry,
 			Attempt:     attempt,
@@ -157,7 +199,7 @@ func (c *Client) executeWithRetry(method string, execute func(client *Client) ([
 			Status:      apiErr.Status,
 			Method:      method,
 		})
-		respBody, respHeader, err = execute(c)
+		respBody, respHeader, err = execute(doClient)
 	}
 	return respBody, respHeader, err
 }
