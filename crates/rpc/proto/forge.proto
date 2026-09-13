@@ -64,6 +64,10 @@ service Forge {
   // Operator cleanup after independently verifying that no DPU or fabric route
   // still uses the retained VNI. Core does not verify dataplane convergence.
   rpc ReleaseVpcInactiveVni(VpcReleaseInactiveVniRequest) returns (VpcReleaseInactiveVniResult);
+  // Admin-only recovery for soft-deleted VPCs that retain an orphaned VNI allocation.
+  // The RPC verifies ownership, deletion state, dependencies and expected VNI,
+  // then releases exactly one allocation in the same transaction.
+  rpc ReleaseVpcOrphanedVni(VpcReleaseOrphanedVniRequest) returns (VpcReleaseOrphanedVniResult);
   rpc UpdateVpcVirtualization(VpcUpdateVirtualizationRequest) returns (VpcUpdateVirtualizationResult);
   // Deletion does not release a retained VNI implicitly. Call
   // ReleaseVpcInactiveVni after verifying convergence before deleting the VPC.
@@ -10839,11 +10843,30 @@ message VpcReleaseInactiveVniResult {
   uint32 released_inactive_vni = 2;
 }
 
+message VpcReleaseOrphanedVniRequest {
+  // Required VPC ID of the soft-deleted VPC whose orphaned allocation will be released.
+  common.VpcId id = 1;
+  // Required version from the operator's original observation. Must match the locked row.
+  optional string if_version_match = 2;
+  // Required exact orphaned VNI to release, in 1..16777215.
+  optional uint32 expected_vni = 3;
+}
+
+message VpcReleaseOrphanedVniResult {
+  // ID of the VPC whose orphaned allocation was released.
+  common.VpcId id = 1;
+  // Exact VNI released.
+  uint32 released_vni = 2;
+}
+
 // Selects one VPC for authoritative allocation inspection.
 message VpcRoutingStateRequest {
   // Required VPC ID. Missing IDs fail INVALID_ARGUMENT; unknown or deleted
-  // VPCs fail NOT_FOUND.
+  // VPCs fail NOT_FOUND unless include_deleted is true.
   common.VpcId id = 1;
+  // Opt-in to read soft-deleted VPCs. Default false preserves existing NOT_FOUND
+  // behavior for deleted VPCs.
+  bool include_deleted = 2;
 }
 
 // Persisted routing state, read together with the VPC-owned allocations.
@@ -10871,6 +10894,8 @@ message VpcRoutingState {
   uint32 active_vni = 4;
   // Omitted only when the valid active allocation is the VPC's sole allocation.
   VpcRetainedVniAllocation retained_allocation = 5;
+  // True when the VPC is soft-deleted and was read via include_deleted.
+  bool is_deleted = 6;
 }
 
 // Allocation retained by the VPC in the pool other than its active allocation.
