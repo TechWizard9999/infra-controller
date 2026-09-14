@@ -3992,3 +3992,187 @@ async fn create_flat_vpc_rejects_routing_profile_type(
 
     Ok(())
 }
+
+#[crate::sqlx_test]
+async fn release_vpc_orphaned_vni_recovers_the_reported_state(
+    pool: sqlx::PgPool,
+) -> Result<(), eyre::Report> {
+    let env = create_test_env(pool).await;
+
+    // An unknown VPC fails NOT_FOUND.
+    let unknown = rpc::forge::VpcReleaseOrphanedVniRequest {
+        id: Some("abcdef01-2345-6789-abcd-ef0123456789".parse()?),
+        if_version_match: Some("V1-T0".into()),
+        expected_vni: Some(1),
+    };
+    let error = env
+        .api
+        .release_vpc_orphaned_vni(tonic::Request::new(unknown))
+        .await
+        .expect_err("unknown VPC must fail");
+    assert_eq!(error.code(), tonic::Code::NotFound, "got: {error}");
+
+    // A live VPC is refused: its allocation is owned by its normal lifecycle.
+    let (vpc_id, created) =
+        create_fixture_vpc(&env, "orphaned recovery".to_string(), None, None).await;
+    let vni = i32::try_from(
+        created
+            .status
+            .as_ref()
+            .and_then(|status| status.vni)
+            .expect("created VPC has an active VNI"),
+    )?;
+    let version = find_test_vpc(&env, vpc_id).await?.version.clone();
+    let request = rpc::forge::VpcReleaseOrphanedVniRequest {
+        id: Some(vpc_id),
+        if_version_match: Some(version.clone()),
+        expected_vni: Some(u32::try_from(vni)?),
+    };
+    let error = env
+        .api
+        .release_vpc_orphaned_vni(tonic::Request::new(request.clone()))
+        .await
+        .expect_err("a live VPC must fail");
+    assert_eq!(
+        error.code(),
+        tonic::Code::FailedPrecondition,
+        "got: {error}"
+    );
+    assert!(error.message().contains("is not deleted"), "got: {error}");
+    assert_eq!(
+        resource_pool_entry_state(&env, env.common_pools.ethernet.pool_vpc_vni.name(), vni).await?,
+        ResourcePoolEntryState::Allocated {
+            owner: vpc_id.to_string(),
+            owner_type: OwnerType::Vpc.to_string(),
+        },
+    );
+
+    // Construct the orphaned state: the VPC is soft-deleted while its VNI
+    // entry remains allocated.
+    sqlx::query("UPDATE vpcs SET deleted = NOW() WHERE id = $1")
+        .bind(vpc_id)
+        .execute(&env.pool)
+        .await?;
+
+    // A stale version is rejected before inspecting allocations.
+    let stale = rpc::forge::VpcReleaseOrphanedVniRequest {
+        id: Some(vpc_id),
+        if_version_match: Some("V1-T0".into()),
+        expected_vni: Some(u32::try_from(vni)?),
+    };
+    let error = env
+        .api
+        .release_vpc_orphaned_vni(tonic::Request::new(stale))
+        .await
+        .expect_err("a stale version must fail");
+    assert_eq!(
+        error.code(),
+        tonic::Code::FailedPrecondition,
+        "got: {error}"
+    );
+    assert_eq!(
+        resource_pool_entry_state(&env, env.common_pools.ethernet.pool_vpc_vni.name(), vni).await?,
+        ResourcePoolEntryState::Allocated {
+            owner: vpc_id.to_string(),
+            owner_type: OwnerType::Vpc.to_string(),
+        },
+    );
+
+    // The exact release frees the pool entry and reports the exact VNI.
+    let result = env
+        .api
+        .release_vpc_orphaned_vni(tonic::Request::new(request))
+        .await?
+        .into_inner();
+    assert_eq!(result.id, Some(vpc_id));
+    assert_eq!(result.released_vni, u32::try_from(vni)?);
+    assert_eq!(
+        resource_pool_entry_state(&env, env.common_pools.ethernet.pool_vpc_vni.name(), vni).await?,
+        ResourcePoolEntryState::Free,
+    );
+
+    // Retrying after the release fails safely and leaves the pool state free.
+    let retry = rpc::forge::VpcReleaseOrphanedVniRequest {
+        id: Some(vpc_id),
+        if_version_match: Some(version.clone()),
+        expected_vni: Some(u32::try_from(vni)?),
+    };
+    let error = env
+        .api
+        .release_vpc_orphaned_vni(tonic::Request::new(retry))
+        .await
+        .expect_err("retrying after the release must fail safely");
+    assert_eq!(
+        error.code(),
+        tonic::Code::FailedPrecondition,
+        "got: {error}"
+    );
+    assert_eq!(
+        resource_pool_entry_state(&env, env.common_pools.ethernet.pool_vpc_vni.name(), vni).await?,
+        ResourcePoolEntryState::Free,
+    );
+
+    Ok(())
+}
+
+#[crate::sqlx_test]
+async fn release_vpc_orphaned_vni_refuses_live_dependencies(
+    pool: sqlx::PgPool,
+) -> Result<(), eyre::Report> {
+    let env = create_test_env(pool).await;
+
+    let (vpc_id, created) =
+        create_fixture_vpc(&env, "orphaned with dependencies".to_string(), None, None).await;
+    let vni = i32::try_from(
+        created
+            .status
+            .as_ref()
+            .and_then(|status| status.vni)
+            .expect("created VPC has an active VNI"),
+    )?;
+    let version = find_test_vpc(&env, vpc_id).await?.version.clone();
+
+    // Construct the orphaned state with a live peering still referencing the
+    // soft-deleted VPC.
+    sqlx::query("UPDATE vpcs SET deleted = NOW() WHERE id = $1")
+        .bind(vpc_id)
+        .execute(&env.pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO vpc_peerings (id, vpc1_id, vpc2_id) VALUES (gen_random_uuid(), $1, $2)",
+    )
+    .bind(VpcId::new().to_string())
+    .bind(vpc_id.to_string())
+    .execute(&env.pool)
+    .await?;
+
+    let request = rpc::forge::VpcReleaseOrphanedVniRequest {
+        id: Some(vpc_id),
+        if_version_match: Some(version),
+        expected_vni: Some(u32::try_from(vni)?),
+    };
+    let error = env
+        .api
+        .release_vpc_orphaned_vni(tonic::Request::new(request))
+        .await
+        .expect_err("a live dependency must block reclamation");
+    assert_eq!(
+        error.code(),
+        tonic::Code::FailedPrecondition,
+        "got: {error}"
+    );
+    assert!(
+        error.message().contains("VPC peerings"),
+        "error should name the dependency, got: {}",
+        error.message()
+    );
+    assert_eq!(
+        resource_pool_entry_state(&env, env.common_pools.ethernet.pool_vpc_vni.name(), vni).await?,
+        ResourcePoolEntryState::Allocated {
+            owner: vpc_id.to_string(),
+            owner_type: OwnerType::Vpc.to_string(),
+        },
+    );
+
+    Ok(())
+}

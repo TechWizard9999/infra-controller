@@ -211,6 +211,13 @@ impl Forge for Api {
         crate::handlers::vpc::release_inactive_vni(self, request).await
     }
 
+    async fn release_vpc_orphaned_vni(
+        &self,
+        request: Request<rpc::VpcReleaseOrphanedVniRequest>,
+    ) -> Result<Response<rpc::VpcReleaseOrphanedVniResult>, Status> {
+        crate::handlers::vpc::release_orphaned_vni(self, request).await
+    }
+
     async fn update_vpc_virtualization(
         &self,
         request: Request<rpc::VpcUpdateVirtualizationRequest>,

@@ -193,10 +193,13 @@ async fn find_by_inner<'a, C: ColumnInfo<'a, TableType = Vpc>>(
     txn: impl DbReader<'_>,
     filter: ObjectColumnFilter<'a, C>,
     row_lock: VpcRowLock,
+    include_deleted: bool,
 ) -> Result<Vec<Vpc>, DatabaseError> {
     let mut query = FilterableQueryBuilder::new("SELECT * FROM vpcs").filter(&filter);
 
-    query.push(" AND deleted IS NULL");
+    if !include_deleted {
+        query.push(" AND deleted IS NULL");
+    }
     if matches!(row_lock, VpcRowLock::Mutation) {
         query.push(" FOR NO KEY UPDATE");
     }
@@ -214,14 +217,24 @@ pub async fn find_by_with_lock<'a, C: ColumnInfo<'a, TableType = Vpc>>(
     filter: ObjectColumnFilter<'a, C>,
     row_lock: VpcRowLock,
 ) -> Result<Vec<Vpc>, DatabaseError> {
-    find_by_inner(&mut *txn, filter, row_lock).await
+    find_by_inner(&mut *txn, filter, row_lock, false).await
+}
+
+/// Locks a VPC row including soft-deleted ones. Recovery operations need the
+/// deleted row's mutation lock; normal callers keep the deleted filter.
+pub async fn find_by_with_lock_including_deleted<'a, C: ColumnInfo<'a, TableType = Vpc>>(
+    txn: &mut PgConnection,
+    filter: ObjectColumnFilter<'a, C>,
+    row_lock: VpcRowLock,
+) -> Result<Vec<Vpc>, DatabaseError> {
+    find_by_inner(&mut *txn, filter, row_lock, true).await
 }
 
 pub async fn find_by<'a, C: ColumnInfo<'a, TableType = Vpc>>(
     txn: impl DbReader<'_>,
     filter: ObjectColumnFilter<'a, C>,
 ) -> Result<Vec<Vpc>, DatabaseError> {
-    find_by_inner(txn, filter, VpcRowLock::None).await
+    find_by_inner(txn, filter, VpcRowLock::None, false).await
 }
 
 pub async fn find_by_vni(txn: &mut PgConnection, vni: i32) -> Result<Vec<Vpc>, DatabaseError> {
@@ -374,6 +387,55 @@ pub async fn try_delete(txn: &mut PgConnection, id: VpcId) -> Result<Option<Vpc>
         Err(sqlx::Error::RowNotFound) => Ok(None),
         Err(e) => Err(DatabaseError::query(query, e)),
     }
+}
+
+/// Reports a failed precondition while any dependency still references the
+/// VPC. Recovery operations call this while holding the VPC's mutation lock;
+/// the guard only reports, it never deletes or repairs the referenced
+/// children.
+pub async fn has_live_dependencies(txn: &mut PgConnection, id: VpcId) -> Result<(), DatabaseError> {
+    let dependency_queries: [(&str, &str); 5] = [
+        (
+            "network segments",
+            "SELECT count(*) FROM network_segments WHERE vpc_id = $1",
+        ),
+        (
+            "VPC prefixes",
+            "SELECT count(*) FROM network_vpc_prefixes WHERE vpc_id = $1",
+        ),
+        (
+            "VPC peerings",
+            "SELECT count(*) FROM vpc_peerings WHERE vpc1_id = $1 OR vpc2_id = $1",
+        ),
+        (
+            "DPU loopbacks",
+            "SELECT count(*) FROM vpc_dpu_loopbacks WHERE vpc_id = $1",
+        ),
+        (
+            "instance addresses",
+            "SELECT count(*) FROM instance_addresses WHERE vpc_id = $1",
+        ),
+    ];
+    for (dependency, query) in dependency_queries {
+        let count: i64 = sqlx::query_scalar(query)
+            .bind(id)
+            .fetch_one(&mut *txn)
+            .await
+            .map_err(|e| DatabaseError::query(query, e))?;
+        if count > 0 {
+            return Err(DatabaseError::FailedPrecondition(format!(
+                "VPC {id} still has {count} {dependency}; reclamation requires all dependencies to be released"
+            )));
+        }
+    }
+
+    let instance_config_reference_count = crate::instance::count_vpc_references(txn, &id).await?;
+    if instance_config_reference_count > 0 {
+        return Err(DatabaseError::FailedPrecondition(format!(
+            "VPC {id} still has {instance_config_reference_count} instance network configurations; reclamation requires all dependencies to be released"
+        )));
+    }
+    Ok(())
 }
 
 pub async fn update(value: &UpdateVpc, txn: &mut PgConnection) -> DatabaseResult<Vpc> {

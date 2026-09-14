@@ -71,6 +71,7 @@ impl InternalRBACRules {
         x.perm("CreateVpc", vec![SiteAgent, Machineatron]);
         x.perm("UpdateVpc", vec![ForgeAdminCLI, SiteAgent]);
         x.perm("ReleaseVpcInactiveVni", vec![ForgeAdminCLI, SiteAgent]);
+        x.perm("ReleaseVpcOrphanedVni", vec![ForgeAdminCLI]);
         x.perm("ChangeVpcRoutingProfile", vec![ForgeAdminCLI, SiteAgent]);
         x.perm("UpdateVpcVirtualization", vec![ForgeAdminCLI, SiteAgent]);
         x.perm("DeleteVpc", vec![Machineatron, SiteAgent]);
@@ -1167,6 +1168,38 @@ mod rbac_rule_tests {
                     principal.as_identifier(),
                 );
             }
+        }
+    }
+
+    #[test]
+    fn orphaned_vni_recovery_permissions() {
+        // The orphaned-VNI recovery is an administrative operation; site-agent
+        // and tenant-facing callers are not granted it.
+        for (principal, allowed) in [
+            (
+                Principal::ExternalUser(ExternalUserInfo::new(
+                    None,
+                    "nico-admin-cli".to_string(),
+                    None,
+                )),
+                true,
+            ),
+            (
+                Principal::SpiffeServiceIdentifier("elektra-site-agent".to_string()),
+                false,
+            ),
+            (Principal::SpiffeMachineIdentifier("dpu".to_string()), false),
+            (Principal::Anonymous, false),
+        ] {
+            assert_eq!(
+                InternalRBACRules::allowed_from_static(
+                    "ReleaseVpcOrphanedVni",
+                    std::slice::from_ref(&principal),
+                ),
+                allowed,
+                "{}",
+                principal.as_identifier(),
+            );
         }
     }
 

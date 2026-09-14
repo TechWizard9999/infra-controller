@@ -36,6 +36,7 @@ const (
 	Forge_UpdateVpc_FullMethodName                                          = "/forge.Forge/UpdateVpc"
 	Forge_ChangeVpcRoutingProfile_FullMethodName                            = "/forge.Forge/ChangeVpcRoutingProfile"
 	Forge_ReleaseVpcInactiveVni_FullMethodName                              = "/forge.Forge/ReleaseVpcInactiveVni"
+	Forge_ReleaseVpcOrphanedVni_FullMethodName                              = "/forge.Forge/ReleaseVpcOrphanedVni"
 	Forge_UpdateVpcVirtualization_FullMethodName                            = "/forge.Forge/UpdateVpcVirtualization"
 	Forge_DeleteVpc_FullMethodName                                          = "/forge.Forge/DeleteVpc"
 	Forge_FindVpcIds_FullMethodName                                         = "/forge.Forge/FindVpcIds"
@@ -548,6 +549,11 @@ type ForgeClient interface {
 	// Operator cleanup after independently verifying that no DPU or fabric route
 	// still uses the retained VNI. Core does not verify dataplane convergence.
 	ReleaseVpcInactiveVni(ctx context.Context, in *VpcReleaseInactiveVniRequest, opts ...grpc.CallOption) (*VpcReleaseInactiveVniResult, error)
+	// Reclaims the one VNI allocation owned by an already soft-deleted VPC.
+	// Requires the exact persisted VNI, consistent single-pool ownership, and
+	// no remaining dependencies. Fails on missing, duplicate, or inconsistent
+	// allocations and never deletes dependencies.
+	ReleaseVpcOrphanedVni(ctx context.Context, in *VpcReleaseOrphanedVniRequest, opts ...grpc.CallOption) (*VpcReleaseOrphanedVniResult, error)
 	UpdateVpcVirtualization(ctx context.Context, in *VpcUpdateVirtualizationRequest, opts ...grpc.CallOption) (*VpcUpdateVirtualizationResult, error)
 	// Deletion does not release a retained VNI implicitly. Call
 	// ReleaseVpcInactiveVni after verifying convergence before deleting the VPC.
@@ -1563,6 +1569,16 @@ func (c *forgeClient) ReleaseVpcInactiveVni(ctx context.Context, in *VpcReleaseI
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(VpcReleaseInactiveVniResult)
 	err := c.cc.Invoke(ctx, Forge_ReleaseVpcInactiveVni_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) ReleaseVpcOrphanedVni(ctx context.Context, in *VpcReleaseOrphanedVniRequest, opts ...grpc.CallOption) (*VpcReleaseOrphanedVniResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VpcReleaseOrphanedVniResult)
+	err := c.cc.Invoke(ctx, Forge_ReleaseVpcOrphanedVni_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -6405,6 +6421,11 @@ type ForgeServer interface {
 	// Operator cleanup after independently verifying that no DPU or fabric route
 	// still uses the retained VNI. Core does not verify dataplane convergence.
 	ReleaseVpcInactiveVni(context.Context, *VpcReleaseInactiveVniRequest) (*VpcReleaseInactiveVniResult, error)
+	// Reclaims the one VNI allocation owned by an already soft-deleted VPC.
+	// Requires the exact persisted VNI, consistent single-pool ownership, and
+	// no remaining dependencies. Fails on missing, duplicate, or inconsistent
+	// allocations and never deletes dependencies.
+	ReleaseVpcOrphanedVni(context.Context, *VpcReleaseOrphanedVniRequest) (*VpcReleaseOrphanedVniResult, error)
 	UpdateVpcVirtualization(context.Context, *VpcUpdateVirtualizationRequest) (*VpcUpdateVirtualizationResult, error)
 	// Deletion does not release a retained VNI implicitly. Call
 	// ReleaseVpcInactiveVni after verifying convergence before deleting the VPC.
@@ -7329,6 +7350,9 @@ func (UnimplementedForgeServer) ChangeVpcRoutingProfile(context.Context, *VpcCha
 }
 func (UnimplementedForgeServer) ReleaseVpcInactiveVni(context.Context, *VpcReleaseInactiveVniRequest) (*VpcReleaseInactiveVniResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReleaseVpcInactiveVni not implemented")
+}
+func (UnimplementedForgeServer) ReleaseVpcOrphanedVni(context.Context, *VpcReleaseOrphanedVniRequest) (*VpcReleaseOrphanedVniResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseVpcOrphanedVni not implemented")
 }
 func (UnimplementedForgeServer) UpdateVpcVirtualization(context.Context, *VpcUpdateVirtualizationRequest) (*VpcUpdateVirtualizationResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpdateVpcVirtualization not implemented")
@@ -9020,6 +9044,24 @@ func _Forge_ReleaseVpcInactiveVni_Handler(srv interface{}, ctx context.Context, 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ForgeServer).ReleaseVpcInactiveVni(ctx, req.(*VpcReleaseInactiveVniRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_ReleaseVpcOrphanedVni_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(VpcReleaseOrphanedVniRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).ReleaseVpcOrphanedVni(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_ReleaseVpcOrphanedVni_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).ReleaseVpcOrphanedVni(ctx, req.(*VpcReleaseOrphanedVniRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -17711,6 +17753,10 @@ var Forge_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReleaseVpcInactiveVni",
 			Handler:    _Forge_ReleaseVpcInactiveVni_Handler,
+		},
+		{
+			MethodName: "ReleaseVpcOrphanedVni",
+			Handler:    _Forge_ReleaseVpcOrphanedVni_Handler,
 		},
 		{
 			MethodName: "UpdateVpcVirtualization",

@@ -587,13 +587,117 @@ async fn release_inactive_vpc_vni(
     Ok(inactive_vni)
 }
 
+pub(crate) async fn release_orphaned_vni(
+    api: &Api,
+    request: Request<rpc::VpcReleaseOrphanedVniRequest>,
+) -> Result<Response<rpc::VpcReleaseOrphanedVniResult>, Status> {
+    log_request_data(&request);
+    let request = request.into_inner();
+    let vpc_id = request.id.ok_or(CarbideError::MissingArgument("id"))?;
+    let version = request
+        .if_version_match
+        .ok_or(CarbideError::MissingArgument("if_version_match"))?;
+    let expected_version = version
+        .parse::<ConfigVersion>()
+        .map_err(|_| CarbideError::from(RpcDataConversionError::InvalidConfigVersion(version)))?;
+    let expected_vni = request
+        .expected_vni
+        .ok_or(CarbideError::MissingArgument("expected_vni"))?;
+    if !(1..=0x00ff_ffff).contains(&expected_vni) {
+        return Err(CarbideError::InvalidArgument(
+            "expected_vni must be between 1 and 16777215".to_string(),
+        )
+        .into());
+    }
+
+    let mut txn = api.txn_begin().await?;
+    let vpc = db::vpc::find_by_with_lock_including_deleted(
+        txn.as_mut(),
+        ObjectColumnFilter::One(vpc::IdColumn, &vpc_id),
+        db::vpc::VpcRowLock::Mutation,
+    )
+    .await?
+    .pop()
+    .ok_or_else(|| CarbideError::NotFoundError {
+        kind: "Vpc",
+        id: vpc_id.to_string(),
+    })?;
+
+    // Reclamation requires the VPC to be soft-deleted: a live VPC's
+    // allocation is owned by its normal lifecycle, and an inactive allocation
+    // on a live VPC is released through ReleaseVpcInactiveVni instead.
+    if vpc.deleted.is_none() {
+        return Err(CarbideError::FailedPrecondition(format!(
+            "VPC `{vpc_id}` is not deleted; use ReleaseVpcInactiveVni for a live VPC's inactive allocation"
+        ))
+        .into());
+    }
+
+    // Check the original version before inspecting allocations: repeating a
+    // committed request must not release a different allocation. A
+    // soft-deleted VPC's row version cannot advance (increment_vpc_version
+    // requires deleted IS NULL), so the guard relies on the deleted row lock
+    // held through commit and does not bump the version.
+    if vpc.version != expected_version {
+        return Err(
+            CarbideError::ConcurrentModificationError("vpc", expected_version.to_string()).into(),
+        );
+    }
+
+    let released_vni = release_orphaned_vpc_vni(api, &mut txn, &vpc, expected_vni)
+        .await?
+        .try_into()
+        .map_err(|_| {
+            CarbideError::internal(
+                "released VPC VNI cannot be represented by the RPC API".to_string(),
+            )
+        })?;
+
+    txn.commit().await?;
+
+    Ok(Response::new(rpc::VpcReleaseOrphanedVniResult {
+        id: Some(vpc_id),
+        released_vni,
+    }))
+}
+
+async fn release_orphaned_vpc_vni(
+    api: &Api,
+    txn: &mut PgConnection,
+    vpc: &model::vpc::Vpc,
+    expected_vni: u32,
+) -> Result<i32, CarbideError> {
+    // The ownership lookups hold the allocation rows' locks through commit, so
+    // releasing the checked value cannot free another owner's allocation.
+    let allocations = find_vpc_vni_allocations(api, txn, vpc).await?;
+    if allocations.inactive.is_some() {
+        return Err(CarbideError::FailedPrecondition(format!(
+            "VPC `{}` has allocations in both pools; reclaiming an orphaned allocation requires exactly one owned allocation",
+            vpc.id,
+        )));
+    }
+
+    if i64::from(allocations.active_vni) != i64::from(expected_vni) {
+        return Err(CarbideError::FailedPrecondition(format!(
+            "VPC `{}` has persisted VNI `{}`, not expected VNI `{expected_vni}`",
+            vpc.id, allocations.active_vni,
+        )));
+    }
+
+    db::vpc::has_live_dependencies(txn, vpc.id)
+        .await
+        .map_err(CarbideError::from)?;
+
+    db::resource_pool::release(allocations.active_pool, txn, allocations.active_vni).await?;
+
+    Ok(allocations.active_vni)
+}
+
 struct VpcVniAllocations<'a> {
     active_pool: &'a resource_pool::ResourcePool<i32>,
     active_vni: i32,
     inactive: Option<(&'a resource_pool::ResourcePool<i32>, i32)>,
-}
-
-// Callers hold the VPC mutation lock through these reads and any dependent
+} // Callers hold the VPC mutation lock through these reads and any dependent
 // writes. Read the internal pool first, matching deletion's lock order.
 async fn find_vpc_vni_allocations<'a>(
     api: &'a Api,
@@ -897,6 +1001,7 @@ fn vpc_routing_state(
         routing_profile_type: vpc.config.routing_profile_type,
         active_vni: to_rpc_vni(allocations.active_vni)?,
         retained_allocation,
+        deleted: vpc.deleted.is_some(),
     })
 }
 
