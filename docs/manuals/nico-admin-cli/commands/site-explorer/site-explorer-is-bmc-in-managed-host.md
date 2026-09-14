@@ -50,4 +50,4 @@ nico-admin-cli site-explorer is-bmc-in-managed-host 192.0.2.10
 
 ---
 
-**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../README.md)
+**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../index.md)

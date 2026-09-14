@@ -49,4 +49,4 @@ nico-admin-cli resource-pool grow --filename ./grow-pools.toml
 
 ---
 
-**See also:** [Network commands](../../network.md) · [CLI reference index](../../README.md)
+**See also:** [Network commands](../../network.md) · [CLI reference index](../../index.md)

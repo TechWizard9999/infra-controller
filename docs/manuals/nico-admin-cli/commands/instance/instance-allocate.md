@@ -121,4 +121,4 @@ nico-admin-cli instance allocate --prefix-name eth0 --vpc-prefix-id 12345678-123
 
 ---
 
-**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../README.md)
+**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../index.md)

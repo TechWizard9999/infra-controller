@@ -54,4 +54,4 @@ nico-admin-cli extension-service show-instances --service-id 12345678-1234-5678-
 
 ---
 
-**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../README.md)
+**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../index.md)

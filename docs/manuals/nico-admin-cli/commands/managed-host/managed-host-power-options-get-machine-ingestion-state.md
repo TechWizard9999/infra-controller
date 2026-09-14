@@ -50,4 +50,4 @@ nico-admin-cli managed-host power-options get-machine-ingestion-state --mac-addr
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

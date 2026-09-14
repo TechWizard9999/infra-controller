@@ -278,7 +278,7 @@ func TestGeneratedCommand_ReadOnlyUsesSessionClientScopeAndFetchesAll(t *testing
 	assert.Contains(t, output, "nicocli")
 	assert.Contains(t, output, "--site-id site-1")
 	assert.Contains(t, output, "--all")
-	assert.Contains(t, output, `"H100"`)
+	assert.Contains(t, output, "H100")
 }
 
 func TestGeneratedCommand_ExplicitPaginationIsNotOverridden(t *testing.T) {

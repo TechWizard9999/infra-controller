@@ -49,4 +49,4 @@ nico-admin-cli sku bulk-update-metadata ./sku-metadata.csv
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

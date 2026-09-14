@@ -56,4 +56,4 @@ nico-admin-cli nvl-domain health-report print-empty-template
 
 ---
 
-**See also:** [Network commands](../../network.md) · [CLI reference index](../../README.md)
+**See also:** [Network commands](../../network.md) · [CLI reference index](../../index.md)

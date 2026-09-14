@@ -49,4 +49,4 @@ nico-admin-cli nvlink-nmxc-endpoints update --chassis-serial 1234567890123 --end
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

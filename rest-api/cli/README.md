@@ -221,10 +221,12 @@ Output formatting and pagination flags live on individual commands, not on the r
 
 | Flag | Where | Description |
 |------|-------|-------------|
-| `--output` | every command | Output format: `json` (default), `yaml`, `table` |
+| `--output` | every command | Output format: `table` (default for list commands), `json` (default for other commands), `yaml` |
 | `--all` | list commands | Fetch every page instead of just the first |
 | `--data` | create/update commands | Request body as inline JSON |
 | `--data-file` | create/update commands | Path to a JSON file (use `-` for stdin) |
+
+List commands render a table by default, so `nicocli vpc-peering list` shows an `ID | VPC1 Name | VPC1 ID | VPC2 Name | VPC2 ID` table without extra flags. Pass `--output json` or `--output yaml` when a script needs structured output.
 
 Run `nicocli <command> --help` for the full per-command flag list, including spec-derived query parameters and body fields.
 

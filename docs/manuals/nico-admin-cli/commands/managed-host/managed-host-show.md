@@ -89,4 +89,4 @@ nico-admin-cli managed-host show --max-width "Machine IDs (H/D)=40"
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

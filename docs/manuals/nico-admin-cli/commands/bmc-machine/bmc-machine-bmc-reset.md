@@ -74,4 +74,4 @@ nico-admin-cli bmc-machine bmc-reset --machine fm100ht038bg3qsho433vkg684heguv28
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

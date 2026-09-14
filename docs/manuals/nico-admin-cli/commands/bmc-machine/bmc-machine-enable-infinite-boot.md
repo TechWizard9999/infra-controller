@@ -53,4 +53,4 @@ nico-admin-cli bmc-machine enable-infinite-boot --machine 12345678-1234-5678-90a
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

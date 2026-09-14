@@ -55,4 +55,4 @@ nico-admin-cli network-security-group detach --instance-id 12345678-1234-5678-90
 
 ---
 
-**See also:** [Network commands](../../network.md) · [CLI reference index](../../README.md)
+**See also:** [Network commands](../../network.md) · [CLI reference index](../../index.md)

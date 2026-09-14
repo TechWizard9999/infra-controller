@@ -54,4 +54,4 @@ nico-admin-cli set log-filter --filter carbide_api=trace,info --expiry 30min
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

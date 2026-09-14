@@ -50,4 +50,4 @@ nico-admin-cli attestation measured-boot site trusted-profile remove by-approval
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

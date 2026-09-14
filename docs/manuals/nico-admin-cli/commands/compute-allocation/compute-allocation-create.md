@@ -71,4 +71,4 @@ nico-admin-cli compute-allocation create --id 12345678-1234-5678-90ab-cdef012345
 
 ---
 
-**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../README.md)
+**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../index.md)

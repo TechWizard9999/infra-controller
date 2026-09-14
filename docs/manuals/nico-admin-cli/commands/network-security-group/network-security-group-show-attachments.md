@@ -55,4 +55,4 @@ nico-admin-cli network-security-group show-attachments --id 12345678-1234-5678-9
 
 ---
 
-**See also:** [Network commands](../../network.md) · [CLI reference index](../../README.md)
+**See also:** [Network commands](../../network.md) · [CLI reference index](../../index.md)

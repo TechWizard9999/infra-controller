@@ -73,4 +73,4 @@ nico-admin-cli dpa ensure 12345678-1234-5678-90ab-cdef01234567 00:11:22:33:44:55
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

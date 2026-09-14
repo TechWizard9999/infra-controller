@@ -49,4 +49,4 @@ nico-admin-cli browse redfish --uri /redfish/v1/Systems
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

@@ -59,4 +59,4 @@ nico-admin-cli component-manager get-firmware-update-status rack --rack-id 12345
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

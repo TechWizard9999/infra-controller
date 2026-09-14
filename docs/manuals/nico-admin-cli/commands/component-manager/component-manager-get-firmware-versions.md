@@ -59,4 +59,4 @@ nico-admin-cli component-manager get-firmware-versions rack --rack-id 12345678-1
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

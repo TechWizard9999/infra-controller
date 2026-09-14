@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"slices"
 	"sort"
@@ -589,10 +590,53 @@ func buildActionCommandWithOptions(spec *Spec, ro resolvedOp, subResource string
 
 	isList := isListAction(ro.action)
 	if isList {
+		// Default to table for list actions so nicocli <resource> list shows readable output
+		for i := range flags {
+			if sf, ok := flags[i].(*cli.StringFlag); ok && sf.Name == "output" {
+				sf.Value = "table"
+				break
+			}
+		}
+	}
+	if isList {
 		flags = append(flags, &cli.BoolFlag{
 			Name:  "all",
 			Usage: "Fetch all pages of results",
 		})
+	}
+
+	// tableRelationsByOperation maps OpenAPI operation IDs to the relation
+	// values the REST handler requires to populate the nested fields that the
+	// custom table columns extract. The handler only expands relations when
+	// the request carries includeRelation, and a default list response
+	// contains only the top-level fields (e.g. vpc1Id), so table rendering
+	// requests them automatically instead of rendering blank name columns.
+	tableRelationsByOperation := map[string][]string{
+		"get-all-vpc-peering": {"Vpc1", "Vpc2"},
+		"get-vpc-peering":     {"Vpc1", "Vpc2"},
+	}
+
+	// tableRelationQuery returns the includeRelation query values required to
+	// populate the custom table columns for the operation, or nil when the
+	// request does not need them: the format is not table, the operation has
+	// no registered relations, or the caller passed --include-relation
+	// explicitly and the user's choice is kept as-is.
+	tableRelationQuery := func(format, operationID string, queryParams map[string]string) url.Values {
+		if format != "table" {
+			return nil
+		}
+		if _, explicit := queryParams["includeRelation"]; explicit {
+			return nil
+		}
+		relations := tableRelationsByOperation[operationID]
+		if len(relations) == 0 {
+			return nil
+		}
+		q := url.Values{}
+		for _, relation := range relations {
+			q.Add("includeRelation", relation)
+		}
+		return q
 	}
 
 	var argParams []string
@@ -769,11 +813,19 @@ func buildActionCommandWithOptions(spec *Spec, ro resolvedOp, subResource string
 				}
 			}
 
+			extraQuery := tableRelationQuery(c.String("output"), ro.op.OperationID, queryParams)
+
 			if isList && c.Bool("all") {
-				return fetchAllPages(client, ro.method, ro.path, pathParams, queryParams, c.String("output"))
+				return fetchAllPages(client, ro.method, ro.path, pathParams, queryParams, c.String("output"), ro.op.OperationID, extraQuery)
 			}
 
-			respBody, respHeaders, err := ro.execute(client, pathParams, queryParams, body)
+			var respBody []byte
+			var respHeaders http.Header
+			if extraQuery == nil {
+				respBody, respHeaders, err = ro.execute(client, pathParams, queryParams, body)
+			} else {
+				respBody, respHeaders, err = client.doWithQueryValues(ro.method, ro.path, pathParams, mergeQueryValues(queryParams, extraQuery), body)
+			}
 			if err != nil {
 				return err
 			}
@@ -784,7 +836,7 @@ func buildActionCommandWithOptions(spec *Spec, ro resolvedOp, subResource string
 				return nil
 			}
 
-			return FormatOutput(respBody, c.String("output"))
+			return FormatOutputWithOperation(respBody, c.String("output"), ro.op.OperationID)
 		},
 	}
 
@@ -1121,7 +1173,12 @@ func printPaginationSummary(headers http.Header) {
 	}
 }
 
-func fetchAllPages(client *Client, method, path string, pathParams, queryParams map[string]string, outputFormat string) error {
+// fetchAllPages fetches every page of a list response and renders the merged
+// results with the requested output format. pageSize and pageNumber are
+// managed here; extraQuery carries additional repeatable query values (e.g.
+// the includeRelation values table rendering requires) that are attached to
+// every page request.
+func fetchAllPages(client *Client, method, path string, pathParams, queryParams map[string]string, outputFormat, operationID string, extraQuery url.Values) error {
 	const maxPageSize = 100
 	const maxPages = 1000
 	pageNumber := 1
@@ -1137,7 +1194,14 @@ func fetchAllPages(client *Client, method, path string, pathParams, queryParams 
 	for {
 		queryParams["pageNumber"] = strconv.Itoa(pageNumber)
 
-		respBody, respHeaders, err := client.Do(method, path, pathParams, queryParams, nil)
+		var respBody []byte
+		var respHeaders http.Header
+		var err error
+		if extraQuery == nil {
+			respBody, respHeaders, err = client.Do(method, path, pathParams, queryParams, nil)
+		} else {
+			respBody, respHeaders, err = client.doWithQueryValues(method, path, pathParams, mergeQueryValues(queryParams, extraQuery), nil)
+		}
 		if err != nil {
 			return err
 		}
@@ -1145,7 +1209,7 @@ func fetchAllPages(client *Client, method, path string, pathParams, queryParams 
 		var pageItems []json.RawMessage
 		if len(respBody) > 0 {
 			if err := json.Unmarshal(respBody, &pageItems); err != nil {
-				return FormatOutput(respBody, outputFormat)
+				return FormatOutputWithOperation(respBody, outputFormat, operationID)
 			}
 		}
 		allItems = append(allItems, pageItems...)
@@ -1179,7 +1243,7 @@ func fetchAllPages(client *Client, method, path string, pathParams, queryParams 
 	if err != nil {
 		return err
 	}
-	return FormatOutput(merged, outputFormat)
+	return FormatOutputWithOperation(merged, outputFormat, operationID)
 }
 
 func coerceValue(v string, schemaType SchemaType) (interface{}, error) {

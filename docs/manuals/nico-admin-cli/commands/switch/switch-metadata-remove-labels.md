@@ -52,4 +52,4 @@ nico-admin-cli switch metadata remove-labels 12345678-1234-5678-90ab-cdef0123456
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

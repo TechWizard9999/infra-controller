@@ -120,8 +120,18 @@ func (c *Client) rewriteAPIName(path string) string {
 
 // Do executes an HTTP request against the API.
 func (c *Client) Do(method, pathTemplate string, pathParams, queryParams map[string]string, body []byte) ([]byte, http.Header, error) {
+	return c.executeWithRetry(method, func(client *Client) ([]byte, http.Header, error) {
+		return client.do(method, pathTemplate, pathParams, queryParams, body)
+	})
+}
+
+// executeWithRetry wraps a single request builder with the CLI's retry
+// handling: the HTTP/2 INTERNAL_ERROR fallback for safe methods and the
+// auth-token refresh loop. The builder receives the client to execute
+// against so the fallback handling can swap it without touching callers.
+func (c *Client) executeWithRetry(method string, execute func(client *Client) ([]byte, http.Header, error)) ([]byte, http.Header, error) {
 	doClient := c
-	respBody, respHeader, err := doClient.do(method, pathTemplate, pathParams, queryParams, body)
+	respBody, respHeader, err := execute(doClient)
 	streamErr, isHTTP2StreamError := errors.AsType[http2StreamError](err)
 	if method == http.MethodGet && isHTTP2StreamError && streamErr.Code == http2InternalErrorCode {
 		var transport *http.Transport
@@ -145,7 +155,7 @@ func (c *Client) Do(method, pathTemplate string, pathParams, queryParams map[str
 			retryClient := *c
 			retryClient.HTTPClient = &httpClient
 			doClient = &retryClient
-			respBody, respHeader, err = doClient.do(method, pathTemplate, pathParams, queryParams, body)
+			respBody, respHeader, err = execute(doClient)
 		}
 	}
 	if isUnauthorizedError(err) && c.TokenRefresh != nil && !canReplayAfterAuthRefresh(method) {
@@ -189,7 +199,7 @@ func (c *Client) Do(method, pathTemplate string, pathParams, queryParams map[str
 			Status:      apiErr.Status,
 			Method:      method,
 		})
-		respBody, respHeader, err = doClient.do(method, pathTemplate, pathParams, queryParams, body)
+		respBody, respHeader, err = execute(doClient)
 	}
 	return respBody, respHeader, err
 }
@@ -216,7 +226,25 @@ func canReplayAfterAuthRefresh(method string) bool {
 	}
 }
 
+// do executes a single request with at-most-one-value query parameters.
 func (c *Client) do(method, pathTemplate string, pathParams, queryParams map[string]string, body []byte) ([]byte, http.Header, error) {
+	q := url.Values{}
+	for k, v := range queryParams {
+		q.Set(k, v)
+	}
+	return c.doQueryValues(method, pathTemplate, pathParams, q, body)
+}
+
+// doWithQueryValues wraps doQueryValues with the same retry handling as Do
+// for callers that need repeatable query parameter values.
+func (c *Client) doWithQueryValues(method, pathTemplate string, pathParams map[string]string, query url.Values, body []byte) ([]byte, http.Header, error) {
+	return c.executeWithRetry(method, func(client *Client) ([]byte, http.Header, error) {
+		return client.doQueryValues(method, pathTemplate, pathParams, query, body)
+	})
+}
+
+// doQueryValues executes a single request against the API.
+func (c *Client) doQueryValues(method, pathTemplate string, pathParams map[string]string, query url.Values, body []byte) ([]byte, http.Header, error) {
 	path := pathTemplate
 	path = strings.ReplaceAll(path, "{org}", url.PathEscape(c.Org))
 	for k, v := range pathParams {
@@ -225,12 +253,8 @@ func (c *Client) do(method, pathTemplate string, pathParams, queryParams map[str
 
 	path = c.rewriteAPIName(path)
 	reqURL := c.BaseURL + path
-	if len(queryParams) > 0 {
-		q := url.Values{}
-		for k, v := range queryParams {
-			q.Set(k, v)
-		}
-		reqURL += "?" + q.Encode()
+	if len(query) > 0 {
+		reqURL += "?" + query.Encode()
 	}
 
 	var bodyReader io.Reader
@@ -298,6 +322,22 @@ func (c *Client) do(method, pathTemplate string, pathParams, queryParams map[str
 	}
 
 	return respBody, resp.Header, nil
+}
+
+// mergeQueryValues combines single-value query parameters with repeatable
+// extra values into one set. The map is copied so callers can keep mutating
+// it (e.g. pagination fields) without affecting the returned set.
+func mergeQueryValues(queryParams map[string]string, extra url.Values) url.Values {
+	q := url.Values{}
+	for k, v := range queryParams {
+		q.Set(k, v)
+	}
+	for k, values := range extra {
+		for _, v := range values {
+			q.Add(k, v)
+		}
+	}
+	return q
 }
 
 func formatDebugBody(body []byte) string {

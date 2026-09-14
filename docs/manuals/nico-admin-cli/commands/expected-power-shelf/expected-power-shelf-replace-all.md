@@ -48,4 +48,4 @@ nico-admin-cli expected-power-shelf replace-all --filename ./power-shelves.json
 
 ---
 
-**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../README.md)
+**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../index.md)

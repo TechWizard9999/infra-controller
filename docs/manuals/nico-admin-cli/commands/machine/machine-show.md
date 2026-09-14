@@ -100,4 +100,4 @@ nico-admin-cli machine show --columns state,id,"attached dpus"
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

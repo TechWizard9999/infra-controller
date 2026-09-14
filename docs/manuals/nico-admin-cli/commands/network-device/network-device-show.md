@@ -53,4 +53,4 @@ nico-admin-cli network-device show mac=00:11:22:33:44:55
 
 ---
 
-**See also:** [Network commands](../../network.md) · [CLI reference index](../../README.md)
+**See also:** [Network commands](../../network.md) · [CLI reference index](../../index.md)

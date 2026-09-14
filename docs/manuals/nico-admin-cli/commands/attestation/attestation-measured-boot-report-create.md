@@ -54,4 +54,4 @@ nico-admin-cli attestation measured-boot report create 12345678-1234-5678-90ab-c
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

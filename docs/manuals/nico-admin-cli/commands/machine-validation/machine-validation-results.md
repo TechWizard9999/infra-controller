@@ -54,4 +54,4 @@ nico-admin-cli machine-validation results show --validation-id 12345678-1234-567
 
 ---
 
-**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../README.md)
+**See also:** [Hardware commands](../../hardware.md) · [CLI reference index](../../index.md)

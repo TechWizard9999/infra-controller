@@ -58,4 +58,4 @@ nico-admin-cli route-server replace 10.0.0.1,10.0.0.2,10.0.0.3
 
 ---
 
-**See also:** [Network commands](../../network.md) · [CLI reference index](../../README.md)
+**See also:** [Network commands](../../network.md) · [CLI reference index](../../index.md)

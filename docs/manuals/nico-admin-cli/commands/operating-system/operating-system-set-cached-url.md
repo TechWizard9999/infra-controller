@@ -54,4 +54,4 @@ nico-admin-cli operating-system set-cached-url 12345678-1234-5678-90ab-cdef01234
 
 ---
 
-**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../README.md)
+**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../index.md)

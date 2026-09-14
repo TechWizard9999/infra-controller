@@ -67,4 +67,4 @@ nico-admin-cli expected-rack add 12345678-1234-5678-90ab-cdef01234567 abcdef01-2
 
 ---
 
-**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../README.md)
+**See also:** [Tenant commands](../../tenant.md) · [CLI reference index](../../index.md)

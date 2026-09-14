@@ -19,6 +19,52 @@ import (
 // list deterministically.
 var allowedOutputFormats = []string{"json", "yaml", "table"}
 
+// tableColumnSpec defines a single table column with a header and a value extractor.
+type tableColumnSpec struct {
+	Header string
+	Get    func(item map[string]any) string
+}
+
+// tableColumnsByOperation maps OpenAPI operation IDs to their custom table columns.
+// Falls back to generic tableFields for unregistered operations.
+var tableColumnsByOperation = map[string][]tableColumnSpec{
+	"get-all-vpc-peering": {
+		{Header: "ID", Get: func(i map[string]any) string { return nestedString(i, "id") }},
+		{Header: "VPC1 Name", Get: func(i map[string]any) string { return nestedString(i, "vpc1", "name") }},
+		{Header: "VPC1 ID", Get: func(i map[string]any) string { return nestedString(i, "vpc1", "id") }},
+		{Header: "VPC2 Name", Get: func(i map[string]any) string { return nestedString(i, "vpc2", "name") }},
+		{Header: "VPC2 ID", Get: func(i map[string]any) string { return nestedString(i, "vpc2", "id") }},
+	},
+	"get-vpc-peering": {
+		{Header: "ID", Get: func(i map[string]any) string { return nestedString(i, "id") }},
+		{Header: "VPC1 Name", Get: func(i map[string]any) string { return nestedString(i, "vpc1", "name") }},
+		{Header: "VPC1 ID", Get: func(i map[string]any) string { return nestedString(i, "vpc1", "id") }},
+		{Header: "VPC2 Name", Get: func(i map[string]any) string { return nestedString(i, "vpc2", "name") }},
+		{Header: "VPC2 ID", Get: func(i map[string]any) string { return nestedString(i, "vpc2", "id") }},
+	},
+}
+
+// nestedString safely retrieves a nested string value using dot-separated path.
+// Returns empty string if any level is missing or not a map.
+func nestedString(item map[string]any, path ...string) string {
+	current := any(item)
+	for _, key := range path {
+		m, ok := current.(map[string]any)
+		if !ok {
+			return ""
+		}
+		v, ok := m[key]
+		if !ok {
+			return ""
+		}
+		current = v
+	}
+	if s, ok := current.(string); ok {
+		return s
+	}
+	return ""
+}
+
 // ValidateOutputFormat returns an error if format is outside the allowed set.
 // The empty string is treated as valid so the StringFlag default ("json") and
 // callers that pass an unset value continue to work.
@@ -50,24 +96,32 @@ func validateOutputFlag(_ *cli.Context, value string) error {
 	return ValidateOutputFormat(value)
 }
 
+// FormatOutput renders the response body in the requested format. Callers
+// that know the OpenAPI operation ID should use FormatOutputWithOperation so
+// operation-specific table columns apply.
 func FormatOutput(data []byte, format string) error {
+	return FormatOutputWithOperation(data, format, "")
+}
+
+// FormatOutputWithOperation renders the response body in the requested format,
+// selecting the custom table columns registered for the operation. Unregistered
+// operations fall back to the generic table columns; JSON and YAML output are
+// unchanged by the operation ID.
+func FormatOutputWithOperation(data []byte, format, operationID string) error {
 	switch format {
 	case "", "json":
 		return formatJSON(data)
 	case "yaml":
 		return formatYAML(data)
 	case "table":
-		return formatTable(data)
+		return formatTable(data, operationID)
 	default:
-		// Defense in depth -- the StringFlag Action validator should catch
-		// invalid values at flag-parse time, but if FormatOutput is ever
-		// called from a non-CLI code path with an unvalidated value, fail
-		// loudly instead of silently picking a format the caller didn't ask
-		// for.
 		return ValidateOutputFormat(format)
 	}
 }
 
+// formatJSON pretty-prints the response body as JSON, or writes it verbatim
+// when it is not valid JSON.
 func formatJSON(data []byte) error {
 	var v interface{}
 	if err := json.Unmarshal(data, &v); err != nil {
@@ -79,6 +133,8 @@ func formatJSON(data []byte) error {
 	return enc.Encode(v)
 }
 
+// formatYAML renders the response body as YAML, or writes it verbatim when
+// it is not valid JSON.
 func formatYAML(data []byte) error {
 	var v interface{}
 	if err := json.Unmarshal(data, &v); err != nil {
@@ -90,22 +146,26 @@ func formatYAML(data []byte) error {
 
 var tableFields = []string{"id", "name", "status", "created", "updated"}
 
-func formatTable(data []byte) error {
+// formatTable renders the response body as a tab-separated table. Registered
+// operations use their custom columns; unregistered ones fall back to the
+// generic tableFields columns for the fields present on the response, or to
+// JSON when none of them are.
+func formatTable(data []byte, operationID string) error {
 	var raw interface{}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		_, err = os.Stdout.Write(data)
 		return err
 	}
 
-	var items []map[string]interface{}
+	var items []map[string]any
 	switch v := raw.(type) {
 	case []interface{}:
 		for _, item := range v {
-			if m, ok := item.(map[string]interface{}); ok {
+			if m, ok := item.(map[string]any); ok {
 				items = append(items, m)
 			}
 		}
-	case map[string]interface{}:
+	case map[string]any:
 		items = append(items, v)
 	default:
 		return formatJSON(data)
@@ -116,31 +176,44 @@ func formatTable(data []byte) error {
 		return nil
 	}
 
-	var cols []string
-	for _, f := range tableFields {
-		if _, ok := items[0][f]; ok {
-			cols = append(cols, f)
+	// Use custom columns for registered operations, else fall back to generic
+	customCols := tableColumnsByOperation[operationID]
+	var cols []tableColumnSpec
+	if customCols != nil {
+		cols = customCols
+	} else {
+		for _, f := range tableFields {
+			if _, ok := items[0][f]; ok {
+				field := f
+				cols = append(cols, tableColumnSpec{
+					Header: field,
+					// Render with fmt.Sprint so numeric and boolean values keep
+					// the %v rendering the pre-table output path provided;
+					// nestedString is string-only and would collapse them.
+					Get: func(i map[string]any) string { return fmt.Sprint(i[field]) },
+				})
+			}
 		}
-	}
-	if len(cols) == 0 {
-		return formatJSON(data)
+		if len(cols) == 0 {
+			return formatJSON(data)
+		}
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	for i, c := range cols {
+	for i, col := range cols {
 		if i > 0 {
 			fmt.Fprint(w, "\t")
 		}
-		fmt.Fprint(w, c)
+		fmt.Fprint(w, col.Header)
 	}
 	fmt.Fprintln(w)
 
 	for _, item := range items {
-		for i, c := range cols {
+		for i, col := range cols {
 			if i > 0 {
 				fmt.Fprint(w, "\t")
 			}
-			fmt.Fprintf(w, "%v", item[c])
+			fmt.Fprintf(w, "%v", col.Get(item))
 		}
 		fmt.Fprintln(w)
 	}
