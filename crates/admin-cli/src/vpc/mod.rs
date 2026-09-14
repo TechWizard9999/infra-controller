@@ -39,6 +39,8 @@ pub(crate) enum Cmd {
     ChangeRoutingProfile(routing::ChangeProfile),
     #[clap(about = "Release the inactive VNI after independently verifying convergence")]
     ReleaseInactiveVni(routing::ReleaseInactiveVni),
+    #[clap(about = "Release the orphaned VNI owned by a soft-deleted VPC")]
+    ReleaseOrphanedVni(routing::ReleaseOrphanedVni),
     SetVirtualizer(set_virtualizer::Args),
 }
 
@@ -47,6 +49,7 @@ impl Cmd {
         match self {
             Self::ChangeRoutingProfile(command) => command.if_version_match.is_none(),
             Self::ReleaseInactiveVni(command) => command.if_version_match.is_none(),
+            Self::ReleaseOrphanedVni(command) => command.if_version_match.is_none(),
             _ => false,
         }
     }

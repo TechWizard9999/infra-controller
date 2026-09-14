@@ -23,7 +23,7 @@ use std::future::Future;
 use std::io::{BufRead, Write};
 use std::time::Duration;
 
-pub(crate) use args::{ChangeProfile, ReleaseInactiveVni, Show};
+pub(crate) use args::{ChangeProfile, ReleaseInactiveVni, ReleaseOrphanedVni, Show};
 use carbide_uuid::vpc::VpcId;
 use config_version::ConfigVersion;
 use eyre::{Context, ensure};
@@ -32,7 +32,8 @@ use prettytable::{Table, row};
 use rpc::admin_cli::OutputFormat;
 use rpc::forge::{
     VpcChangeRoutingProfileRequest, VpcReleaseInactiveVniRequest, VpcReleaseInactiveVniResult,
-    VpcRoutingState, VpcRoutingStateRequest,
+    VpcReleaseOrphanedVniRequest, VpcReleaseOrphanedVniResult, VpcRoutingState,
+    VpcRoutingStateRequest,
 };
 use serde::Serialize;
 use tonic::{Code, Status};
@@ -49,6 +50,7 @@ const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(300);
 
 trait RoutingClient {
     async fn routing_state(&self, id: VpcId) -> Result<VpcRoutingState, Status>;
+    async fn deleted_routing_state(&self, id: VpcId) -> Result<VpcRoutingState, Status>;
     async fn change_profile(
         &self,
         request: VpcChangeRoutingProfileRequest,
@@ -57,12 +59,28 @@ trait RoutingClient {
         &self,
         request: VpcReleaseInactiveVniRequest,
     ) -> Result<VpcReleaseInactiveVniResult, Status>;
+    async fn release_orphaned(
+        &self,
+        request: VpcReleaseOrphanedVniRequest,
+    ) -> Result<VpcReleaseOrphanedVniResult, Status>;
 }
 
 impl RoutingClient for ApiClient {
     async fn routing_state(&self, id: VpcId) -> Result<VpcRoutingState, Status> {
         self.0
-            .get_vpc_routing_state(VpcRoutingStateRequest { id: Some(id) })
+            .get_vpc_routing_state(VpcRoutingStateRequest {
+                id: Some(id),
+                include_deleted: None,
+            })
+            .await
+    }
+
+    async fn deleted_routing_state(&self, id: VpcId) -> Result<VpcRoutingState, Status> {
+        self.0
+            .get_vpc_routing_state(VpcRoutingStateRequest {
+                id: Some(id),
+                include_deleted: Some(true),
+            })
             .await
     }
 
@@ -78,6 +96,13 @@ impl RoutingClient for ApiClient {
         request: VpcReleaseInactiveVniRequest,
     ) -> Result<VpcReleaseInactiveVniResult, Status> {
         self.0.release_vpc_inactive_vni(request).await
+    }
+
+    async fn release_orphaned(
+        &self,
+        request: VpcReleaseOrphanedVniRequest,
+    ) -> Result<VpcReleaseOrphanedVniResult, Status> {
+        self.0.release_vpc_orphaned_vni(request).await
     }
 }
 
@@ -110,6 +135,21 @@ impl Run for ChangeProfile {
 }
 
 impl Run for ReleaseInactiveVni {
+    async fn run(self, ctx: &mut RuntimeContext) -> CarbideCliResult<()> {
+        ctx.assert_cloud_unsafe_op_message()?;
+        Ok(self
+            .execute(
+                &ctx.api_client,
+                ctx.config.request_timeout,
+                ctx.config.format,
+                &mut ctx.output_file,
+                confirm_interactively,
+            )
+            .await?)
+    }
+}
+
+impl Run for ReleaseOrphanedVni {
     async fn run(self, ctx: &mut RuntimeContext) -> CarbideCliResult<()> {
         ctx.assert_cloud_unsafe_op_message()?;
         Ok(self
@@ -324,6 +364,67 @@ impl ReleaseInactiveVni {
     }
 }
 
+impl ReleaseOrphanedVni {
+    async fn execute(
+        self,
+        client: &impl RoutingClient,
+        request_timeout: Option<Duration>,
+        format: OutputFormat,
+        output: &mut Box<dyn tokio::io::AsyncWrite + Unpin>,
+        confirm: impl AsyncFnOnce(&str) -> eyre::Result<()>,
+    ) -> eyre::Result<()> {
+        let before = read_deleted_state(client, self.id, request_timeout).await?;
+        ensure!(
+            before.deleted,
+            "VPC {} is not deleted; the orphaned-VNI recovery only applies to soft-deleted VPCs; {}",
+            self.id,
+            inspection(self.id)
+        );
+        ensure!(
+            before.active_vni == self.expected_vni,
+            "the observed allocation does not match VNI {}; {}",
+            self.expected_vni,
+            inspection(self.id)
+        );
+        let version = approve_version(
+            &before,
+            self.if_version_match,
+            &format!(
+                "Release orphaned VNI {} from deleted VPC {} at the displayed version. Core rejects the request while any dependency still references the VPC. The soft-deleted VPC's version does not advance; a repeated request with the same version fails safely.",
+                self.expected_vni, self.id
+            ),
+            confirm,
+        )
+        .await?;
+        let request = VpcReleaseOrphanedVniRequest {
+            id: Some(self.id),
+            if_version_match: Some(version.to_string()),
+            expected_vni: Some(self.expected_vni),
+        };
+        let result = rpc_attempt(client.release_orphaned(request), request_timeout)
+            .await
+            .map_err(|status| mutation_error(self.id, status))?;
+        ensure!(
+            result.id == Some(self.id),
+            "core acknowledged a different VPC"
+        );
+        ensure!(
+            result.released_vni == self.expected_vni,
+            "core acknowledged a different released VNI"
+        );
+        // The deleted VPC has no routing state after its allocation is
+        // released; render the release result only, not a live state.
+        write_orphaned_release(result.id, result.released_vni, format, output)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "core released the orphaned VNI but its result could not be written; {}",
+                    inspection(self.id)
+                )
+            })
+    }
+}
+
 async fn approve_version(
     state: &VpcRoutingState,
     requested: Option<ConfigVersion>,
@@ -413,6 +514,25 @@ async fn read_state(
     Ok(state)
 }
 
+async fn read_deleted_state(
+    client: &impl RoutingClient,
+    id: VpcId,
+    request_timeout: Option<Duration>,
+) -> eyre::Result<VpcRoutingState> {
+    let state = rpc_attempt(client.deleted_routing_state(id), request_timeout)
+        .await
+        .map_err(|status| {
+            let context = if status.code() == Code::Unimplemented {
+                "core does not support deleted-state inspection"
+            } else {
+                "could not inspect deleted VPC routing state"
+            };
+            eyre::Report::new(status).wrap_err(format!("{context} for {id}"))
+        })?;
+    validate_state(&state, id)?;
+    Ok(state)
+}
+
 fn validate_state(state: &VpcRoutingState, id: VpcId) -> eyre::Result<ConfigVersion> {
     ensure!(
         state.id == Some(id),
@@ -493,6 +613,45 @@ struct RoutingOutput<'a> {
     released_inactive_vni: Option<u32>,
 }
 
+// The deleted VPC has no routing state after its allocation is released, so
+// the recovery renders the release result only, not a live routing state.
+#[derive(Serialize)]
+struct OrphanedReleaseOutput {
+    id: Option<VpcId>,
+    deleted: bool,
+    released_vni: u32,
+}
+
+async fn write_orphaned_release(
+    id: Option<VpcId>,
+    released_vni: u32,
+    format: OutputFormat,
+    output: &mut Box<dyn tokio::io::AsyncWrite + Unpin>,
+) -> eyre::Result<()> {
+    let view = OrphanedReleaseOutput {
+        id,
+        deleted: true,
+        released_vni,
+    };
+    match format {
+        OutputFormat::Json => async_writeln!(output, "{}", serde_json::to_string_pretty(&view)?)?,
+        OutputFormat::Yaml => async_writeln!(output, "{}", serde_yaml::to_string(&view)?)?,
+        OutputFormat::AsciiTable => {
+            let mut table = Table::new();
+            table.set_titles(row!["Field", "Value"]);
+            table.add_row(row![
+                "VPC ID",
+                view.id.map(|id| id.to_string()).unwrap_or_default()
+            ]);
+            table.add_row(row!["Deleted", view.deleted]);
+            table.add_row(row!["Released VNI", view.released_vni]);
+            async_write!(output, "{table}")?;
+        }
+        OutputFormat::Csv => eyre::bail!("CSV output is not supported for VPC routing commands"),
+    }
+    Ok(())
+}
+
 async fn write_state(
     state: &VpcRoutingState,
     released_inactive_vni: Option<u32>,
@@ -519,6 +678,7 @@ async fn write_state(
                 state.routing_profile_type.as_deref().unwrap_or_default()
             ]);
             table.add_row(row!["Active VNI", state.active_vni]);
+            table.add_row(row!["Deleted", state.deleted]);
             table.add_row(row![
                 "Retained Pool",
                 state

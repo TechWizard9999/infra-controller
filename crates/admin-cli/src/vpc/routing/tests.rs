@@ -33,7 +33,8 @@ use hyper::{Response, header};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use prost::Message as _;
 use rpc::forge::{
-    BuildInfo, Vpc, VpcConfig, VpcRetainedVniAllocation, VpcRoutingStateRequest, VpcStatus,
+    BuildInfo, Vpc, VpcConfig, VpcReleaseOrphanedVniRequest, VpcReleaseOrphanedVniResult,
+    VpcRetainedVniAllocation, VpcRoutingStateRequest, VpcStatus,
 };
 use rpc::forge_api_client::ForgeApiClient;
 use rpc::forge_tls_client::{ApiConfig, ForgeClientConfig};
@@ -73,6 +74,16 @@ const INTERACTIVE_RELEASE: &[&str] = &[
     "4000",
     "--confirm-convergence",
 ];
+const RELEASE_ORPHANED: &[&str] = &[
+    "release-orphaned-vni",
+    ID,
+    "--if-version-match",
+    VERSION,
+    "--expected-vni",
+    "4000",
+];
+const INTERACTIVE_RELEASE_ORPHANED: &[&str] =
+    &["release-orphaned-vni", ID, "--expected-vni", "4000"];
 
 fn parse(args: &[&str]) -> Result<Cmd, clap::Error> {
     let argv: Vec<_> = ["nico-admin-cli", "vpc"]
@@ -111,6 +122,7 @@ async fn execute_with_confirmation(
             args.execute(client, None, format, output, confirm).await
         }
         Cmd::ReleaseInactiveVni(args) => args.execute(client, None, format, output, confirm).await,
+        Cmd::ReleaseOrphanedVni(args) => args.execute(client, None, format, output, confirm).await,
         _ => panic!("expected a routing command"),
     };
     (result, captured.into_bytes().await)
@@ -228,6 +240,7 @@ fn initial_state() -> VpcRoutingState {
         routing_profile_type: Some("INTERNAL".into()),
         active_vni: 4000,
         retained_allocation: None,
+        deleted: false,
     }
 }
 
@@ -269,6 +282,7 @@ enum Request {
     Read(VpcId),
     Change(VpcChangeRoutingProfileRequest),
     Release(VpcReleaseInactiveVniRequest),
+    ReleaseOrphaned(VpcReleaseOrphanedVniRequest),
 }
 
 #[derive(Default)]
@@ -277,11 +291,20 @@ struct RecordingClient {
     read_error: Option<Status>,
     change: Option<Result<VpcRoutingState, Status>>,
     release: Option<Result<VpcReleaseInactiveVniResult, Status>>,
+    release_orphaned: Option<Result<VpcReleaseOrphanedVniResult, Status>>,
     requests: RefCell<Vec<Request>>,
 }
 
 impl RoutingClient for RecordingClient {
     async fn routing_state(&self, id: VpcId) -> Result<VpcRoutingState, Status> {
+        self.requests.borrow_mut().push(Request::Read(id));
+        if let Some(error) = &self.read_error {
+            return Err(error.clone());
+        }
+        Ok(self.state.clone())
+    }
+
+    async fn deleted_routing_state(&self, id: VpcId) -> Result<VpcRoutingState, Status> {
         self.requests.borrow_mut().push(Request::Read(id));
         if let Some(error) = &self.read_error {
             return Err(error.clone());
@@ -308,6 +331,18 @@ impl RoutingClient for RecordingClient {
             .clone()
             .expect("unexpected inactive-VNI mutation")
     }
+
+    async fn release_orphaned(
+        &self,
+        request: VpcReleaseOrphanedVniRequest,
+    ) -> Result<VpcReleaseOrphanedVniResult, Status> {
+        self.requests
+            .borrow_mut()
+            .push(Request::ReleaseOrphaned(request));
+        self.release_orphaned
+            .clone()
+            .expect("unexpected orphaned-VNI mutation")
+    }
 }
 
 #[test]
@@ -316,10 +351,12 @@ fn only_mutations_without_explicit_versions_require_interactive_confirmation() {
         "scripted mutations" {
             CHANGE => false,
             RELEASE => false,
+            RELEASE_ORPHANED => false,
         }
         "interactive mutations" {
             &CHANGE[..3] => true,
             INTERACTIVE_RELEASE => true,
+            INTERACTIVE_RELEASE_ORPHANED => true,
         }
         "inspection" {
             &["routing-state", ID][..] => false,
@@ -356,9 +393,17 @@ async fn routing_state_command_renders_populated_and_absent_fields_without_losin
     for (state, values) in [
         (
             changed_state(),
-            [ID, NEXT_VERSION, "site/external", "7000", VPC_VNI, "4000"],
+            [
+                ID,
+                NEXT_VERSION,
+                "site/external",
+                "7000",
+                "false",
+                VPC_VNI,
+                "4000",
+            ],
         ),
-        (unnamed, [ID, VERSION, "", "0", "", ""]),
+        (unnamed, [ID, VERSION, "", "0", "false", "", ""]),
     ] {
         let client = RecordingClient {
             state,
@@ -376,6 +421,7 @@ async fn routing_state_command_renders_populated_and_absent_fields_without_losin
             "Version",
             "Routing Profile",
             "Active VNI",
+            "Deleted",
             "Retained Pool",
             "Retained VNI",
         ]
@@ -693,6 +739,9 @@ async fn mutation_failures_preserve_the_cause_and_never_retry() {
             Request::Release(request) => {
                 assert_eq!(request.if_version_match.as_deref(), Some(NEXT_VERSION))
             }
+            Request::ReleaseOrphaned(request) => {
+                assert_eq!(request.if_version_match.as_deref(), Some(VERSION))
+            }
             Request::Read(_) => panic!("mutation must use the first observed version"),
         }
         assert!(output.is_empty());
@@ -941,10 +990,18 @@ async fn mutation_run_paths_require_cloud_unsafe_acknowledgement_before_io() {
         },
         output_file: Box::new(tokio::io::sink()),
     };
-    for args in [CHANGE, RELEASE, &CHANGE[..3], INTERACTIVE_RELEASE] {
+    for args in [
+        CHANGE,
+        RELEASE,
+        RELEASE_ORPHANED,
+        &CHANGE[..3],
+        INTERACTIVE_RELEASE,
+        INTERACTIVE_RELEASE_ORPHANED,
+    ] {
         let error = match parse(args).unwrap() {
             Cmd::ChangeRoutingProfile(command) => command.run(&mut ctx).await.unwrap_err(),
             Cmd::ReleaseInactiveVni(command) => command.run(&mut ctx).await.unwrap_err(),
+            Cmd::ReleaseOrphanedVni(command) => command.run(&mut ctx).await.unwrap_err(),
             _ => panic!("mutation command"),
         };
         assert!(matches!(error, CarbideCliError::CloudUnsafeOp));
@@ -964,5 +1021,159 @@ async fn whole_rpc_attempt_uses_the_configured_timeout() {
             .unwrap_err();
         assert_eq!(error.code(), Code::DeadlineExceeded);
         assert_eq!(started.elapsed(), expected);
+    }
+}
+
+#[tokio::test]
+async fn orphaned_release_requires_the_deleted_state_and_exact_allocation() {
+    // A live VPC and a mismatched allocation are refused before any mutation.
+    for (state, advice) in [
+        (initial_state(), "is not deleted"),
+        (
+            VpcRoutingState {
+                deleted: true,
+                active_vni: 5000,
+                ..initial_state()
+            },
+            "does not match VNI 4000",
+        ),
+    ] {
+        let client = RecordingClient {
+            state,
+            ..Default::default()
+        };
+        let (result, output) = execute(RELEASE_ORPHANED, &client, OutputFormat::Json).await;
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains(advice), "{advice}: {error:#}");
+        assert!(output.is_empty(), "{advice}");
+        assert_eq!(
+            *client.requests.borrow(),
+            [Request::Read(ID.parse().unwrap())],
+            "{advice}"
+        );
+    }
+
+    // A deleted VPC with the exact allocation renders the release result only.
+    let client = RecordingClient {
+        state: VpcRoutingState {
+            deleted: true,
+            ..initial_state()
+        },
+        release_orphaned: Some(Ok(VpcReleaseOrphanedVniResult {
+            id: Some(ID.parse().unwrap()),
+            released_vni: 4000,
+        })),
+        ..Default::default()
+    };
+    let (result, output) = execute(RELEASE_ORPHANED, &client, OutputFormat::Json).await;
+    result.unwrap();
+    assert_eq!(
+        *client.requests.borrow(),
+        [
+            Request::Read(ID.parse().unwrap()),
+            Request::ReleaseOrphaned(VpcReleaseOrphanedVniRequest {
+                id: Some(ID.parse().unwrap()),
+                if_version_match: Some(VERSION.into()),
+                expected_vni: Some(4000),
+            })
+        ]
+    );
+    let expected = serde_json::json!({
+        "id": ID,
+        "deleted": true,
+        "released_vni": 4000,
+    });
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn orphaned_release_confirms_interactively_and_accepts_explicit_versions() {
+    for args in [RELEASE_ORPHANED, INTERACTIVE_RELEASE_ORPHANED] {
+        let client = RecordingClient {
+            state: VpcRoutingState {
+                deleted: true,
+                ..initial_state()
+            },
+            release_orphaned: Some(Ok(VpcReleaseOrphanedVniResult {
+                id: Some(ID.parse().unwrap()),
+                released_vni: 4000,
+            })),
+            ..Default::default()
+        };
+        let mut confirmed = false;
+        let (result, output) =
+            execute_with_confirmation(args, &client, OutputFormat::AsciiTable, async |prompt| {
+                assert_eq!(
+                    args, INTERACTIVE_RELEASE_ORPHANED,
+                    "explicit-version command prompted"
+                );
+                assert!(prompt.contains(&serde_json::to_string_pretty(&client.state).unwrap()));
+                assert!(prompt.contains("orphaned VNI 4000"));
+                assert!(prompt.contains("deleted VPC"));
+                assert!(prompt.contains("does not advance"));
+                tokio::task::yield_now().await;
+                confirmed = true;
+                Ok(())
+            })
+            .await;
+        result.unwrap();
+        assert_eq!(confirmed, args == INTERACTIVE_RELEASE_ORPHANED);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("VPC ID"), "{output}");
+        assert!(output.contains("Deleted"), "{output}");
+        assert!(output.contains("Released VNI"), "{output}");
+        assert!(output.contains("4000"), "{output}");
+    }
+}
+
+#[test]
+fn clap_validates_orphaned_release_inputs() {
+    scenarios!(run = |args: Vec<&str>| parse(&args).map(drop).map_err(|error| error.kind());
+        "release requires the expected VNI" {
+            vec![RELEASE_ORPHANED[0], ID, "--if-version-match", VERSION] => FailsWith(ErrorKind::MissingRequiredArgument),
+        }
+        "exact VNI stays within the recovery range" {
+            vec![RELEASE_ORPHANED[0], ID, "--expected-vni", "0", "--if-version-match", VERSION] => FailsWith(ErrorKind::ValueValidation),
+            vec![RELEASE_ORPHANED[0], ID, "--expected-vni", "16777216", "--if-version-match", VERSION] => FailsWith(ErrorKind::ValueValidation),
+        }
+    );
+}
+
+#[tokio::test]
+async fn failed_orphaned_releases_preserve_the_cause_and_never_retry() {
+    for (code, advice) in [
+        (Code::Unavailable, "may have committed"),
+        (Code::FailedPrecondition, "core rejected the request"),
+    ] {
+        let client = RecordingClient {
+            state: VpcRoutingState {
+                deleted: true,
+                ..initial_state()
+            },
+            release_orphaned: Some(Err(Status::new(code, "injected failure"))),
+            ..Default::default()
+        };
+        let (result, output) = execute(RELEASE_ORPHANED, &client, OutputFormat::Json).await;
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains(advice), "{advice}: {error:#}");
+        let cause = error
+            .downcast_ref::<Status>()
+            .expect("tonic cause is preserved");
+        assert_eq!(cause.code(), code);
+        assert!(output.is_empty());
+        assert_eq!(
+            *client.requests.borrow(),
+            [
+                Request::Read(ID.parse().unwrap()),
+                Request::ReleaseOrphaned(VpcReleaseOrphanedVniRequest {
+                    id: Some(ID.parse().unwrap()),
+                    if_version_match: Some(VERSION.into()),
+                    expected_vni: Some(4000),
+                })
+            ]
+        );
     }
 }

@@ -199,3 +199,60 @@ pub(crate) struct ReleaseInactiveVni {
     )]
     pub(super) confirm_convergence: bool,
 }
+
+#[derive(Parser, Debug)]
+#[command(
+    long_about = "\
+Release the one VNI allocation owned by an already soft-deleted VPC. Core \
+requires the VPC to be soft-deleted, the exact persisted VNI, and no \
+remaining dependencies, and fails on missing, duplicate, or inconsistent \
+allocations. The soft-deleted VPC's version does not advance.
+
+Requires --cloud-unsafe-op USERNAME before vpc. Before release, the CLI \
+reads the deleted VPC's persisted state and asks for fresh confirmation \
+that the displayed allocation matches the requested VNI. Both stdin and \
+stderr must be terminals. Scripts must supply --if-version-match. Each \
+invocation without a version approves a new action; it does not resume an \
+earlier attempt.
+
+Before mutation, the observed routing state is printed as JSON to stderr. \
+Each RPC attempt uses the client request timeout (300 seconds by default, \
+configurable with FORGE_CLIENT_REQUEST_TIMEOUT_SECS), including connection \
+setup and response reads. This command does not retry mutations. A \
+soft-deleted VPC's version does not advance, so a repeated request with the \
+same --if-version-match fails safely once the allocation is released.
+
+Use --format ascii-table (default), json, or yaml and --output PATH before vpc. \
+CSV output is unsupported.",
+    after_long_help = "\
+EXAMPLES:
+
+Inspect and confirm the reclaim interactively:
+    $ nico-admin-cli --cloud-unsafe-op admin vpc release-orphaned-vni \
+    12345678-1234-5678-90ab-cdef01234567 --expected-vni 7000
+
+Release the observed orphaned VNI with an explicit version:
+    $ nico-admin-cli --cloud-unsafe-op admin vpc release-orphaned-vni \
+    12345678-1234-5678-90ab-cdef01234567 --if-version-match V1-T1789080000000000 \
+    --expected-vni 7000
+
+"
+)]
+pub(crate) struct ReleaseOrphanedVni {
+    #[clap(help = "VPC ID whose orphaned allocation will be released")]
+    pub(super) id: VpcId,
+
+    #[clap(
+        long,
+        value_name = "VERSION",
+        help = "Version observed with the orphaned VNI; required for scripts, omitted for interactive confirmation; keep it unchanged when rerunning this request"
+    )]
+    pub(in crate::vpc) if_version_match: Option<ConfigVersion>,
+
+    #[clap(
+        long,
+        value_parser = clap::value_parser!(u32).range(1..=16_777_215),
+        help = "Exact orphaned VNI observed with this version (1..=16777215); keep it unchanged when rerunning this request"
+    )]
+    pub(super) expected_vni: u32,
+}
