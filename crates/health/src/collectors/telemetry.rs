@@ -270,6 +270,9 @@ impl<B: Bmc + 'static> TelemetryCollector<B> {
             let Ok(reading) = reading.trim().parse::<f64>() else {
                 continue;
             };
+            if !reading.is_finite() {
+                continue;
+            }
 
             let unit = units
                 .and_then(|units| units.get(&metric_id))
@@ -480,7 +483,7 @@ mod tests {
         check_cases_async(
             [Case {
                 scenario: "numeric readings publish with definition units, \
-                           stale and non-numeric values are dropped",
+                           stale, non-numeric and non-finite values are dropped",
                 input: fixture.bmc(),
                 expect: Yields(ObservedIteration {
                     entity_count: Some(3),
