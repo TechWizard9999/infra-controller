@@ -190,6 +190,8 @@ fn insert_telemetry_service(resources: &mut HashMap<String, MockResponse>) {
                 },
                 // No definition declares a unit for this one.
                 { "MetricId": "FanPWM", "MetricValue": "30" },
+                { "MetricId": "NonFinite", "MetricValue": "NaN" },
+                { "MetricId": "Infinite", "MetricValue": "inf" },
                 // Discrete state, so there is no gauge to publish.
                 { "MetricId": "PowerState", "MetricValue": "Enabled" },
                 // No id to name a series after.
