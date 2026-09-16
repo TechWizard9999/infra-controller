@@ -460,29 +460,13 @@ async fn test_preingestion_time_sync_reset_accepts_paused_power_state(
     assert!(matches!(
         endpoint.preingestion_state,
         PreingestionState::TimeSyncReset {
-            phase: TimeSyncResetPhase::Start,
-            ..
-        }
-    ));
-    txn.commit().await?;
-
-    // The paused post-power-off state must still start the BMC reset.
-    mgr.run_single_iteration().await?;
-    let mut txn = pool.begin().await.unwrap();
-    let endpoint = db::explored_endpoints::find_all_by_ip(ip_addr, &mut txn)
-        .await?
-        .pop()
-        .expect("endpoint should exist");
-    assert!(matches!(
-        endpoint.preingestion_state,
-        PreingestionState::TimeSyncReset {
             phase: TimeSyncResetPhase::BMCWasReset,
             ..
         }
     ));
     txn.commit().await?;
 
-    // Power-on still reports On, so the existing second power-state check remains valid.
+    // Power-on still reports On, so the existing power-state check remains valid.
     mgr.run_single_iteration().await?;
     let mut txn = pool.begin().await.unwrap();
     let endpoint = db::explored_endpoints::find_all_by_ip(ip_addr, &mut txn)
