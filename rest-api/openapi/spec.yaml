@@ -5164,7 +5164,6 @@ paths:
                 value:
                   siteId: f97df110-f4de-492e-8849-4a6af68026b0
                   rackId: rack-01
-                  rackProfileId: rp-standard-42u
                   name: Rack 01
                   description: Production rack in row A
                   labels:
@@ -5286,7 +5285,6 @@ paths:
                   expectedRacks:
                     - siteId: f97df110-f4de-492e-8849-4a6af68026b0
                       rackId: rack-01
-                      rackProfileId: rp-standard-42u
                       name: Rack 01
                       description: Production rack in row A
                       labels:
@@ -5297,7 +5295,6 @@ paths:
                         location.position: A1
                     - siteId: f97df110-f4de-492e-8849-4a6af68026b0
                       rackId: rack-02
-                      rackProfileId: rp-standard-42u
                       name: Rack 02
                       description: Production rack in row A
                       labels:
@@ -5427,7 +5424,6 @@ paths:
             examples:
               example-1:
                 value:
-                  rackProfileId: rp-standard-48u
                   name: Rack 01 (updated)
                   description: Production rack in row A, upgraded chassis
                   labels:
@@ -29200,7 +29196,7 @@ components:
       title: ExpectedRackCreateRequest
       type: object
       description: |-
-        Request data to create a new Expected Rack.
+        Request data to create a new Expected Rack. Core finds the unique ExpectedRackGroup containing rackId and derives the profile as UPPERCASE_TOPOLOGY_ComputeManufacturer_SwitchManufacturer_PowerShelfManufacturer. Manufacturer case is preserved; absent power shelves use NO_POWERSHELF. Compute and switch members are required, each type must have one manufacturer, and the generated ID must exist in Core rack profile configuration.
 
         The `rackId` is an operator-supplied string identifier (not a UUID) that must be unique within the Site. Chassis identity and physical location information are conveyed via well-known label keys in `labels`:
         - `chassis.manufacturer`, `chassis.serial-number`, `chassis.model`
@@ -29208,7 +29204,6 @@ components:
       examples:
         - siteId: f97df110-f4de-492e-8849-4a6af68026b0
           rackId: rack-01
-          rackProfileId: rp-standard-42u
           name: Rack 01
           description: Production rack in row A
           labels:
@@ -29230,8 +29225,8 @@ components:
           description: Operator-supplied identifier for the rack (string, not UUID). Must be non-empty and unique within the Site.
         rackProfileId:
           type: string
-          minLength: 1
-          description: Identifier of the Rack Profile this rack conforms to. Must be non-empty.
+          deprecated: true
+          description: Ignored compatibility field. Core derives the profile from the matching ExpectedRackGroup; omit this field.
         name:
           type:
             - string
@@ -29251,7 +29246,6 @@ components:
       required:
         - siteId
         - rackId
-        - rackProfileId
     ExpectedRackList:
       title: ExpectedRackList
       type: object
@@ -29262,7 +29256,6 @@ components:
           expectedRacks:
             - siteId: f97df110-f4de-492e-8849-4a6af68026b0
               rackId: rack-01
-              rackProfileId: rp-standard-42u
               name: Rack 01
               description: Production rack in row A
               labels:
@@ -29273,7 +29266,6 @@ components:
                 location.position: A1
             - siteId: f97df110-f4de-492e-8849-4a6af68026b0
               rackId: rack-02
-              rackProfileId: rp-standard-42u
               name: Rack 02
               description: Production rack in row A
               labels:
@@ -29312,8 +29304,7 @@ components:
         - `chassis.manufacturer`, `chassis.serial-number`, `chassis.model`
         - `location.region`, `location.datacenter`, `location.room`, `location.position`
       examples:
-        - rackProfileId: rp-standard-48u
-          name: Rack 01 (updated)
+        - name: Rack 01 (updated)
           description: Production rack in row A, upgraded chassis
           labels:
             chassis.manufacturer: NVIDIA
@@ -29343,8 +29334,8 @@ components:
           type:
             - string
             - 'null'
-          minLength: 1
-          description: Optional new Rack Profile identifier. If provided, must be non-empty.
+          deprecated: true
+          description: Ignored compatibility field. Metadata updates preserve the stored profile; this field alone is not a valid update.
         name:
           type:
             - string
