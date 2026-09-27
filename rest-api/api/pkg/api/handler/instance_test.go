@@ -7549,6 +7549,31 @@ func TestUpdateInstanceHandler_Handle(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "test Instance update with Deleting Ethernet interface and empty NVLinkInterfaces succeeds",
+			fields: fields{
+				dbSession: dbSession,
+				tc:        tc,
+				scp:       scp,
+				cfg:       cfg,
+			},
+			args: args{
+				reqData: &model.APIInstanceUpdateRequest{
+					IpxeScript:      os2.IpxeScript,
+					NVLinkInterfaces: []model.APIInstanceNVLinkInterfaceRequest{},
+				},
+				reqInstance:             inst13.ID.String(),
+				reqOrg:                  tnOrg1,
+				reqUser:                 tnu1,
+				respCode:                http.StatusOK,
+				respNoOfNVLinkInterfaces: cutil.GetPtr(0),
+				ethInterfacesToDelete: []cdbm.Interface{
+					*testInstanceBuildInstanceInterface(t, dbSession, inst13.ID, nil, &vpcPrefix1.ID, nil, cdbm.InterfaceStatusDeleting),
+				},
+			},
+			verifySiteControllerRequest: true,
+			verifyChildSpanner:          true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
