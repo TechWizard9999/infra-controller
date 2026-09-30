@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"testing"
@@ -412,11 +413,6 @@ func TestNewAPIInstance(t *testing.T) {
 			assert.Equal(t, tt.args.dbic.Created, got.Created)
 			assert.Equal(t, tt.args.dbic.Updated, got.Updated)
 
-			serialConsoleURL := fmt.Sprintf("ssh://%s@%s", tt.args.dbic.ControllerInstanceID.String(), *dbs.SerialConsoleHostname)
-
-			assert.Equal(t, serialConsoleURL, *got.SerialConsoleURL)
-
-			assert.Equal(t, serialConsoleURL, *got.SerialConsoleURL)
 			assert.Equal(t, len(tt.args.dbsds), len(got.StatusHistory))
 
 			assert.Equal(t, len(tt.args.dbis), len(got.Interfaces))
@@ -465,6 +461,32 @@ func TestNewAPIInstance(t *testing.T) {
 			var attrMap map[string]interface{}
 			err = json.Unmarshal(jsonResp, &attrMap)
 			assert.NoError(t, err)
+		})
+	}
+
+	controllerInstanceID := uuid.New()
+	urlPrefix := "ssh://" + controllerInstanceID.String() + "@"
+	serialConsoleTests := []struct {
+		name    string
+		host    string
+		wantURL string
+	}{
+		{name: "DNS", host: "test-hostname", wantURL: urlPrefix + "test-hostname"},
+		{name: "IPv4", host: "192.0.2.1", wantURL: urlPrefix + "192.0.2.1"},
+		{name: "IPv6", host: "2001:db8::1", wantURL: urlPrefix + "[2001:db8::1]"},
+	}
+	for _, tt := range serialConsoleTests {
+		t.Run("serial console URL/"+tt.name, func(t *testing.T) {
+			instance := &cdbm.Instance{ControllerInstanceID: &controllerInstanceID}
+			site := &cdbm.Site{SerialConsoleHostname: &tt.host}
+			got := NewAPIInstance(instance, site, nil, nil, nil, nil, nil, nil, nil)
+			require.NotNil(t, got.SerialConsoleURL)
+			assert.Equal(t, tt.wantURL, *got.SerialConsoleURL)
+
+			parsed, err := url.Parse(*got.SerialConsoleURL)
+			require.NoError(t, err)
+			assert.Equal(t, tt.host, parsed.Hostname())
+			assert.Empty(t, parsed.Port())
 		})
 	}
 }
@@ -2901,7 +2923,7 @@ func TestAPIInstanceUpdateRequest_ValidateAndSetOperatingSystemData_Phonehome(t 
 		ID:               uuid.New(),
 		Name:             "ab",
 		IpxeScript:       cutil.GetPtr("original ipxe"),
-		UserData:         cutil.GetPtr("#cloud-config\n{'hostname': 'd2def8d8-29b2-11ef-81e6-07a09293ef16'}"),
+		UserData:         cutil.GetPtr("{'hostname': 'd2def8d8-29b2-11ef-81e6-07a09293ef16'}"),
 		PhoneHomeEnabled: true,
 		IsActive:         true,
 		Status:           cdbm.OperatingSystemStatusReady,
@@ -2916,7 +2938,7 @@ func TestAPIInstanceUpdateRequest_ValidateAndSetOperatingSystemData_Phonehome(t 
 		IpxeScript:               cutil.GetPtr("#!ipxe 9ea0c946-29af-11ef-b798-df4626ad0292"),
 		AlwaysBootWithCustomIpxe: true,
 		PhoneHomeEnabled:         true,
-		UserData:                 cutil.GetPtr("#cloud-config\n{'hostname': '815f5bd8-29b2-11ef-b3b1-ab4be50a4e4d'}"),
+		UserData:                 cutil.GetPtr("{'hostname': '815f5bd8-29b2-11ef-b3b1-ab4be50a4e4d'}"),
 	}
 
 	// Instance with ipxe and user-data.
@@ -3117,11 +3139,12 @@ phone_home:
 				OperatingSystemID: cutil.GetPtr(uuid.NewString()),
 				UserData:          cutil.GetPtr(""),
 			},
-			wantErr:            false,
-			cfg:                cfg1,
-			instance:           instance1,
-			os:                 os1,
-			userDataExactMatch: cutil.GetPtr(fmt.Sprintf(SitePhoneHomeCloudInit, cfg1.GetSitePhoneHomeUrl())),
+			wantErr:  false,
+			cfg:      cfg1,
+			instance: instance1,
+			os:       os1,
+			userDataExactMatch: cutil.GetPtr("#cloud-config\nphone_home:\n  post: all\n  url: " +
+				cfg1.GetSitePhoneHomeUrl() + "\n"),
 		},
 		{
 			name: "PhoneHome enabled in instance and request updates only base OS",

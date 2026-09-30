@@ -28,7 +28,10 @@ use carbide_uuid::instance::InstanceId;
 use carbide_uuid::machine::{HostMachineId, MachineId};
 use carbide_uuid::network::NetworkSegmentId;
 use carbide_uuid::vpc::{VpcId, VpcPrefixId};
-use db::{DatabaseError, ObjectColumnFilter, WithTransaction, network_security_group};
+use db::instance::InstanceExtensionServicesNotCurrent;
+use db::{
+    ConditionalWrite, DatabaseError, ObjectColumnFilter, WithTransaction, network_security_group,
+};
 use futures_util::FutureExt;
 use health_report::{
     HealthAlertClassification, HealthProbeAlert, HealthProbeId, HealthReport, HealthReportApplyMode,
@@ -64,9 +67,11 @@ use crate::api::{Api, log_machine_id, log_request_data, log_tenant_organization_
 use crate::ethernet_virtualization::validate_instance_interface_routing_profiles;
 use crate::instance::{
     InstanceAllocationRequest, allocate_ib_port_guid, allocate_instance, allocate_network,
-    allocate_spx_port_mac, ib_memberships_from_config, load_extension_services,
-    load_ib_partition_pkeys, validate_ib_partition_ownership, validate_instance_extension_services,
-    validate_instance_vfs_against_dpf_topology, validate_os_definition_usable,
+    allocate_spx_port_mac, assign_implicit_instance_vfs_from_effective_dpu_inventory,
+    expected_machine_declares_cx9, ib_memberships_from_config, instance_vf_inventory_source,
+    load_extension_services, load_ib_partition_pkeys, requests_implicit_vf_allocation,
+    validate_ib_partition_ownership, validate_instance_extension_services,
+    validate_instance_vfs_against_effective_dpu_inventory, validate_os_definition_usable,
     validate_spx_partition_ownership,
 };
 use crate::{CarbideError, CarbideResult};
@@ -1321,6 +1326,11 @@ pub(crate) async fn update_instance_config(
             network.auto && network.auto_config.is_none() && network.interfaces.is_empty()
         });
 
+    let implicit_vf_allocation = request
+        .config
+        .as_ref()
+        .is_some_and(requests_implicit_vf_allocation);
+
     let mut config: InstanceConfig = match request.config {
         None => return Err(CarbideError::MissingArgument("config").into()),
         Some(config) => config.try_into().map_err(CarbideError::from)?,
@@ -1382,6 +1392,21 @@ pub(crate) async fn update_instance_config(
         kind: "machine",
         id: machine_id.to_string(),
     })?;
+    // Resolve the persisted CX9 declaration used by DPF provisioning before validating VFs.
+    let expected_machine = if mh_snapshot.host_snapshot.config.dpf.used_for_ingestion {
+        match mh_snapshot.host_snapshot.status.bmc_info.mac {
+            Some(bmc_mac) => {
+                db::expected_machine::find_by_bmc_mac_address(&mut txn, bmc_mac).await?
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let vf_inventory_source = instance_vf_inventory_source(
+        &mh_snapshot,
+        expected_machine_declares_cx9(expected_machine.as_ref()),
+    );
     // This first snapshot establishes the request's comparison baseline.
     // An overlap wait reloads it before resource validation; an IB change
     // later rereads it after locking the Instance and Machine.
@@ -1435,6 +1460,15 @@ pub(crate) async fn update_instance_config(
         config.network.auto_config = Some(auto_config);
     }
 
+    // Resolve legacy omitted VF IDs before deciding whether the network expands.
+    if implicit_vf_allocation {
+        assign_implicit_instance_vfs_from_effective_dpu_inventory(
+            &mut config.network,
+            &api.runtime_config,
+            vf_inventory_source,
+        )?;
+    }
+
     // Check whether the update is allowed
     initial_instance
         .config
@@ -1449,9 +1483,9 @@ pub(crate) async fn update_instance_config(
         &initial_instance.config.network,
         &config.network,
     );
-    let needs_overlap_check = mh_snapshot.has_managed_dpus()
-        && (initial_instance.config.network_security_group_id != config.network_security_group_id
-            || network_expands);
+    // NSG changes cannot override FNN null routes; only added routing visibility
+    // requires overlap admission here.
+    let needs_overlap_check = mh_snapshot.has_managed_dpus() && network_expands;
     if needs_overlap_check {
         db::tenant_prefix_overlap::lock_checks(txn.as_mut()).await?;
         // No resource locks precede this wait. Reload the retained networks,
@@ -1538,9 +1572,9 @@ pub(crate) async fn update_instance_config(
         initial_instance,
         &mut config,
         &mh_snapshot,
+        vf_inventory_source,
         &mut txn,
         needs_overlap_check,
-        network_expands,
     )
     .await?;
 
@@ -1654,9 +1688,9 @@ async fn update_instance_network_config(
     instance: &InstanceSnapshot,
     config: &mut InstanceConfig,
     mh_snapshot: &ManagedHostStateSnapshot,
+    vf_inventory_source: crate::instance::InstanceVfInventorySource,
     txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     needs_overlap_check: bool,
-    network_expands: bool,
 ) -> Result<(), CarbideError> {
     if instance.update_network_config_request.is_some() {
         return Err(ConfigValidationError::InstanceNetworkConfigUpdateAlreadyInProgress.into());
@@ -1733,14 +1767,8 @@ async fn update_instance_network_config(
             config
                 .network
                 .copy_existing_resources(&instance.config.network);
-            tenant_prefix_overlap::validate_instance_network(
-                api,
-                txn,
-                config,
-                Some(instance),
-                network_expands,
-            )
-            .await?;
+            tenant_prefix_overlap::validate_instance_network(api, txn, config, Some(instance))
+                .await?;
         }
         return Ok(());
     }
@@ -1784,18 +1812,15 @@ async fn update_instance_network_config(
                 .unwrap_or(true),
         )
         .map_err(CarbideError::from)?;
-    validate_instance_vfs_against_dpf_topology(network, runtime_config)?;
+    validate_instance_vfs_against_effective_dpu_inventory(
+        network,
+        runtime_config,
+        vf_inventory_source,
+    )?;
     validate_instance_interface_routing_profiles(txn, network, runtime_config.fnn.as_ref()).await?;
 
     if needs_overlap_check {
-        tenant_prefix_overlap::validate_instance_network(
-            api,
-            txn,
-            config,
-            Some(instance),
-            network_expands,
-        )
-        .await?;
+        tenant_prefix_overlap::validate_instance_network(api, txn, config, Some(instance)).await?;
     }
     let network = &mut config.network;
 
@@ -2053,7 +2078,7 @@ async fn update_instance_extension_services_config(
     // A service being detached remains durably represented with `removed:
     // true`, so the merged config references every service the instance is
     // attached to before and after this update.
-    let new_extension_services_config =
+    let mut new_extension_services_config =
         current.calculate_new_extension_services_config(extension_services);
     let service_ids = new_extension_services_config
         .service_configs
@@ -2064,6 +2089,11 @@ async fn update_instance_extension_services_config(
 
     // Resolve the services while holding the service and version row locks.
     let (services, versions) = load_extension_services(txn, &service_ids).await?;
+    for config in &mut new_extension_services_config.service_configs {
+        if let Some(service) = services.get(&config.service_id) {
+            config.dpu_target = service.dpu_target;
+        }
+    }
     let existing_active_service_ids = current
         .active_services()
         .into_iter()
@@ -2073,22 +2103,39 @@ async fn update_instance_extension_services_config(
     validate_instance_extension_services(
         mh_snapshot.host_snapshot.id,
         mh_snapshot.host_snapshot.config.dpf.used_for_ingestion,
+        mh_snapshot
+            .host_snapshot
+            .primary_attached_dpu_machine_id()
+            .is_some_and(|primary_dpu| {
+                mh_snapshot
+                    .dpu_snapshots
+                    .iter()
+                    .any(|dpu| dpu.id == primary_dpu)
+            }),
         &new_extension_services_config,
         &services,
         &versions,
         &existing_active_service_ids,
     )?;
 
-    db::instance::update_extension_services_config(
+    match db::instance::update_extension_services_config(
         txn,
         instance.id,
         instance.extension_services_config_version,
+        current,
         &new_extension_services_config,
         true,
     )
-    .await?;
-
-    Ok(())
+    .await?
+    {
+        ConditionalWrite::Applied(()) => Ok(()),
+        ConditionalWrite::NotApplied(InstanceExtensionServicesNotCurrent) => {
+            Err(CarbideError::FailedPrecondition(format!(
+                "extension-service attachments for instance {} changed or the instance no longer exists; read the instance again before updating",
+                instance.id,
+            )))
+        }
+    }
 }
 
 /// Extracts the RPC representation of Instances from a ManagedHost snapshot

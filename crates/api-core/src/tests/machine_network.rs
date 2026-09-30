@@ -119,6 +119,7 @@ async fn record_dpu_network_status(
             dpu_extension_service_version: None,
             dpu_extension_services: vec![],
             astra_config_status: None,
+            lldp: None,
         }))
         .await
         .unwrap();
@@ -207,11 +208,16 @@ async fn test_clear_use_admin_network_changed_requires_pending_version(pool: sql
 }
 
 #[crate::sqlx_test]
-// This test verifies parity between `addresses` and the compatibility fields.
+// This test verifies parity between `addresses` and the compatibility fields,
+// plus presence-bearing site policy carried in the same response.
 #[allow(deprecated)]
 async fn test_managed_host_network_config(pool: sqlx::PgPool) {
     // The default fixture omits `lo-ip-v6`, which must preserve the existing IPv4-only response.
-    let env = api_fixtures::create_test_env(pool).await;
+    let mut config = api_fixtures::get_config();
+    config.dhcpv6_server_preference = Some(0);
+    let env =
+        api_fixtures::create_test_env_with_overrides(pool, TestEnvOverrides::with_config(config))
+            .await;
     let host_config = env.managed_host_config();
     let mh = dpu::create_dpu_machine_in_waiting_for_network_install(&env, &host_config).await;
     let dpu_machine_id = mh.dpu().id;
@@ -235,6 +241,7 @@ async fn test_managed_host_network_config(pool: sqlx::PgPool) {
             .is_none(),
         "sites without lo-ip-v6 must remain IPv4-only"
     );
+    assert_eq!(response.dhcpv6_server_preference, Some(0));
 
     let admin_interface = response.admin_interface.expect("admin interface");
     assert_eq!(
@@ -306,6 +313,61 @@ async fn test_record_dpu_network_status_clears_use_admin_network_changed_for_mat
         use_admin_network_changed(&env, dpu_machine_id).await,
         Some(false)
     );
+}
+
+#[crate::sqlx_test]
+async fn test_rejected_network_observation_does_not_acknowledge_admin_network_change(
+    pool: sqlx::PgPool,
+) {
+    let env = api_fixtures::create_test_env(pool).await;
+    let mh = create_managed_host(&env).await;
+    let dpu_machine_id = mh.dpu().id;
+    record_dpu_network_status(&env, dpu_machine_id, None).await;
+    set_use_admin_network_changed(&env, dpu_machine_id, true).await;
+    let response = env
+        .api
+        .get_managed_host_network_config(tonic::Request::new(ManagedHostNetworkConfigRequest {
+            dpu_machine_id: Some(dpu_machine_id),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let before: serde_json::Value =
+        sqlx::query_scalar("SELECT network_status_observation FROM machines WHERE id = $1")
+            .bind(dpu_machine_id)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+
+    // The configuration version matches, but this report is older than the
+    // persisted observation. It must not acknowledge the network change.
+    let error = env
+        .api
+        .record_dpu_network_status(tonic::Request::new(DpuNetworkStatus {
+            dpu_machine_id: Some(dpu_machine_id),
+            network_config_version: Some(response.managed_host_config_version),
+            observed_at: Some(SystemTime::UNIX_EPOCH.into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Internal);
+    assert!(
+        error
+            .message()
+            .contains("update machine status observation")
+    );
+    assert_eq!(
+        use_admin_network_changed(&env, dpu_machine_id).await,
+        Some(true)
+    );
+    let after: serde_json::Value =
+        sqlx::query_scalar("SELECT network_status_observation FROM machines WHERE id = $1")
+            .bind(dpu_machine_id)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    assert_eq!(after, before);
 }
 
 #[crate::sqlx_test]
@@ -920,7 +982,7 @@ async fn test_managed_host_network_config_omits_admin_fnn_vrf_loopback_by_defaul
     let env = api_fixtures::create_test_env_with_overrides(pool, overrides).await;
 
     // Attach the FNN admin VPC because test env setup does not run production setup hooks.
-    crate::db_init::create_admin_vpc(&env.pool, Some(10000))
+    crate::db_init::create_admin_vpc(&env.api, Some(10000))
         .await
         .unwrap();
     crate::db_init::update_network_segments_svi_ip(&env.pool)
@@ -1037,7 +1099,7 @@ async fn test_managed_host_network_config_multi_dpu_fnn_ipv6_loopbacks(pool: sql
         routing_profile: FnnRoutingProfileConfig::default(),
     });
     let env = api_fixtures::create_test_env_with_overrides(pool, overrides).await;
-    crate::db_init::create_admin_vpc(&env.pool, Some(10000))
+    crate::db_init::create_admin_vpc(&env.api, Some(10000))
         .await
         .unwrap();
     crate::db_init::update_network_segments_svi_ip(&env.pool)
@@ -1256,6 +1318,7 @@ async fn test_managed_host_network_config_with_extension_services(pool: sqlx::Pg
     let extension_service1 = env
         .api
         .create_dpu_extension_service(tonic::Request::new(CreateDpuExtensionServiceRequest {
+            dpu_target: None,
             service_id: None,
             service_name: "test1".to_string(),
             service_type: DpuExtensionServiceType::KubernetesPod as i32,
@@ -1278,6 +1341,7 @@ async fn test_managed_host_network_config_with_extension_services(pool: sqlx::Pg
     let extension_service2 = env
         .api
         .create_dpu_extension_service(tonic::Request::new(CreateDpuExtensionServiceRequest {
+            dpu_target: None,
             service_id: None,
             service_name: "test2".to_string(),
             service_type: DpuExtensionServiceType::KubernetesPod as i32,
@@ -1411,6 +1475,7 @@ async fn test_dpu_health_is_required(pool: sqlx::PgPool) {
             dpu_extension_service_version: Some("V1-T1".to_string()),
             dpu_extension_services: vec![],
             astra_config_status: None,
+            lldp: None,
         }))
         .await
         .expect_err("Should fail");

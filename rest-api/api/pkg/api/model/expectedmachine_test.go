@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 func TestAPIExpectedMachineCreateRequest_Validate(t *testing.T) {
@@ -325,14 +326,19 @@ func TestAPIExpectedMachineCreateRequest_Validate(t *testing.T) {
 
 func TestNewAPIExpectedMachine(t *testing.T) {
 	tests := []struct {
-		desc            string
-		labels          cdbm.Labels
-		dpuSerials      []string
-		wantLabelsJSON  string
-		wantSerialsJSON string
+		desc                 string
+		isDpfEnabled         *bool
+		hostLifecycleProfile cdbm.HostLifecycleProfile
+		wantDpfJSON          string
+		wantProfile          *APIHostLifecycleProfile
+		labels               cdbm.Labels
+		dpuSerials           []string
+		wantLabelsJSON       string
+		wantSerialsJSON      string
 	}{
 		{
-			desc:            "nil collections serialize as empty",
+			desc:            "nil collections serialize as empty and unset DPF defaults to true",
+			wantDpfJSON:     "true",
 			wantLabelsJSON:  `{}`,
 			wantSerialsJSON: `[]`,
 		},
@@ -350,6 +356,26 @@ func TestNewAPIExpectedMachine(t *testing.T) {
 			wantLabelsJSON:  `{"env":"test","zone":"us-west-1"}`,
 			wantSerialsJSON: `["DPU002","DPU001"]`,
 		},
+		{
+			desc:         "stored DPF false is returned",
+			isDpfEnabled: cutil.GetPtr(false),
+			wantDpfJSON:  "false",
+		},
+		{
+			desc:         "stored DPF true is returned",
+			isDpfEnabled: cutil.GetPtr(true),
+			wantDpfJSON:  "true",
+		},
+		{
+			desc:                 "disableLockdown true round-trips",
+			hostLifecycleProfile: cdbm.HostLifecycleProfile{DisableLockdown: cutil.GetPtr(true)},
+			wantProfile:          &APIHostLifecycleProfile{DisableLockdown: cutil.GetPtr(true)},
+		},
+		{
+			desc:                 "disableLockdown false round-trips",
+			hostLifecycleProfile: cdbm.HostLifecycleProfile{DisableLockdown: cutil.GetPtr(false)},
+			wantProfile:          &APIHostLifecycleProfile{DisableLockdown: cutil.GetPtr(false)},
+		},
 	}
 
 	for _, tc := range tests {
@@ -359,6 +385,8 @@ func TestNewAPIExpectedMachine(t *testing.T) {
 				ChassisSerialNumber:      "CHASSIS123",
 				FallbackDpuSerialNumbers: tc.dpuSerials,
 				Labels:                   tc.labels,
+				IsDpfEnabled:             tc.isDpfEnabled,
+				HostLifecycleProfile:     tc.hostLifecycleProfile,
 				Created:                  cdb.GetCurTime(),
 				Updated:                  cdb.GetCurTime(),
 			}
@@ -370,14 +398,20 @@ func TestNewAPIExpectedMachine(t *testing.T) {
 			assert.Equal(t, dbEM.ChassisSerialNumber, got.ChassisSerialNumber)
 			assert.Equal(t, dbEM.Created, got.Created)
 			assert.Equal(t, dbEM.Updated, got.Updated)
+			assert.Equal(t, tc.wantProfile, got.HostLifecycleProfile)
 			assert.Equal(t, stored, *dbEM, "response conversion must preserve stored nil values")
 
 			raw, err := json.Marshal(got)
 			require.NoError(t, err)
 			var fields map[string]json.RawMessage
 			require.NoError(t, json.Unmarshal(raw, &fields))
-			assert.JSONEq(t, tc.wantLabelsJSON, string(fields["labels"]))
-			assert.JSONEq(t, tc.wantSerialsJSON, string(fields["fallbackDPUSerialNumbers"]))
+			if tc.wantLabelsJSON != "" {
+				assert.JSONEq(t, tc.wantLabelsJSON, string(fields["labels"]))
+				assert.JSONEq(t, tc.wantSerialsJSON, string(fields["fallbackDPUSerialNumbers"]))
+			}
+			if tc.wantDpfJSON != "" {
+				assert.Equal(t, tc.wantDpfJSON, string(fields["isDpfEnabled"]))
+			}
 		})
 	}
 }
@@ -420,40 +454,6 @@ func TestAPIHostLifecycleProfile_Conversions(t *testing.T) {
 	})
 }
 
-func TestNewAPIExpectedMachine_HostLifecycleProfile(t *testing.T) {
-	tests := []struct {
-		desc     string
-		stored   cdbm.HostLifecycleProfile
-		wantNil  bool
-		wantBool *bool
-	}{
-		{desc: "disableLockdown true round-trips", stored: cdbm.HostLifecycleProfile{DisableLockdown: cutil.GetPtr(true)}, wantBool: cutil.GetPtr(true)},
-		{desc: "disableLockdown false round-trips", stored: cdbm.HostLifecycleProfile{DisableLockdown: cutil.GetPtr(false)}, wantBool: cutil.GetPtr(false)},
-		{desc: "unset profile omitted from response", stored: cdbm.HostLifecycleProfile{}, wantNil: true},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.desc, func(t *testing.T) {
-			dbEM := &cdbm.ExpectedMachine{
-				BmcMacAddress:        "00:11:22:33:44:55",
-				ChassisSerialNumber:  "CHASSIS123",
-				HostLifecycleProfile: tc.stored,
-				Created:              time.Now(),
-				Updated:              time.Now(),
-			}
-
-			got := NewAPIExpectedMachine(dbEM)
-			if tc.wantNil {
-				assert.Nil(t, got.HostLifecycleProfile)
-				return
-			}
-			if assert.NotNil(t, got.HostLifecycleProfile) {
-				assert.Equal(t, *tc.wantBool, *got.HostLifecycleProfile.DisableLockdown)
-			}
-		})
-	}
-}
-
 func TestAPIExpectedMachine_HostLifecycleProfile_JSONRoundTrip(t *testing.T) {
 	t.Run("disableLockdown true survives marshal/unmarshal", func(t *testing.T) {
 		orig := &APIExpectedMachine{
@@ -480,28 +480,6 @@ func TestAPIExpectedMachine_HostLifecycleProfile_JSONRoundTrip(t *testing.T) {
 		})
 		assert.NoError(t, err)
 		assert.NotContains(t, string(raw), "hostLifecycleProfile")
-	})
-}
-
-func TestNewAPIExpectedMachine_DpfEnabled(t *testing.T) {
-	t.Run("nil stored value defaults to true", func(t *testing.T) {
-		got := NewAPIExpectedMachine(&cdbm.ExpectedMachine{})
-		assert.Nil(t, got.IsDpfEnabled)
-	})
-
-	t.Run("stored false is returned", func(t *testing.T) {
-		got := NewAPIExpectedMachine(&cdbm.ExpectedMachine{
-			IsDpfEnabled: cutil.GetPtr(false),
-		})
-		assert.False(t, *got.IsDpfEnabled)
-	})
-
-	t.Run("stored true is returned", func(t *testing.T) {
-		got := NewAPIExpectedMachine(&cdbm.ExpectedMachine{
-			IsDpfEnabled: cutil.GetPtr(true),
-		})
-		assert.True(t, *got.IsDpfEnabled)
-
 	})
 }
 
@@ -677,6 +655,7 @@ func TestAPIExpectedMachineUpdateRequest_Validate(t *testing.T) {
 			obj: APIExpectedMachineUpdateRequest{
 				ChassisSerialNumber: &validChassisSerial,
 				DefaultBmcUsername:  &emptyString,
+				DefaultBmcPassword:  &validPassword,
 				Labels:              map[string]string{"env": "test"},
 			},
 			expectErr: true,
@@ -686,6 +665,7 @@ func TestAPIExpectedMachineUpdateRequest_Validate(t *testing.T) {
 			obj: APIExpectedMachineUpdateRequest{
 				ChassisSerialNumber: &validChassisSerial,
 				DefaultBmcPassword:  &emptyString,
+				DefaultBmcUsername:  &validUsername,
 				Labels:              map[string]string{"env": "test"},
 			},
 			expectErr: true,
@@ -1364,6 +1344,54 @@ func TestNewAPIExpectedMachineWithSkuComponents(t *testing.T) {
 
 			// Run custom validation
 			tc.validate(t, apiEM)
+		})
+	}
+}
+
+func TestAPIExpectedMachineUpdateRequest_ToProto(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		wantPaths []string
+	}{
+		{name: "omitted fields preserve Core state", body: `{}`},
+		{name: "null fields preserve Core state", body: `{"defaultBmcUsername":null,"defaultBmcPassword":null,"labels":null,"slotId":null,"bmcIpAddress":null}`},
+		{name: "explicit zero and empty values remain selected", body: `{"slotId":0,"labels":{},"fallbackDPUSerialNumbers":[],"isDpfEnabled":false,"hostLifecycleProfile":{"disableLockdown":false},"bmcIpAddress":""}`, wantPaths: []string{"bmc_ip_address", "metadata.labels", "fallback_dpu_serial_numbers", "is_dpf_enabled", "host_lifecycle_profile.disable_lockdown"}},
+		{name: "BMC address selects automatic allocation", body: `{"bmcIpAddress":"192.0.2.31"}`, wantPaths: []string{"bmc_ip_address", "bmc_ip_allocation"}},
+		{name: "slot ID alone selects derived labels", body: `{"slotId":0}`, wantPaths: []string{"metadata.labels"}},
+		{name: "BMC username leaves the password unselected", body: `{"defaultBmcUsername":"admin","defaultBmcPassword":null}`, wantPaths: []string{"bmc_username"}},
+		{name: "BMC password leaves the username unselected", body: `{"defaultBmcPassword":"secret"}`, wantPaths: []string{"bmc_password"}},
+		{name: "BMC pair is selected together", body: `{"defaultBmcUsername":"admin","defaultBmcPassword":"secret"}`, wantPaths: []string{"bmc_username", "bmc_password"}},
+		{name: "empty lifecycle profile preserves policy", body: `{"hostLifecycleProfile":{}}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var request APIExpectedMachineUpdateRequest
+			require.NoError(t, json.Unmarshal([]byte(test.body), &request))
+			require.NoError(t, request.Validate())
+			patch := request.ToProto(&cdbm.ExpectedMachine{SlotID: cutil.GetPtr(int32(0)), IsDpfEnabled: cutil.GetPtr(false), HostLifecycleProfile: cdbm.HostLifecycleProfile{DisableLockdown: cutil.GetPtr(false)}})
+			encoded, err := protojson.Marshal(patch)
+			require.NoError(t, err)
+			var decoded corev1.PatchExpectedMachineRequest
+			require.NoError(t, protojson.Unmarshal(encoded, &decoded))
+			require.NotNil(t, decoded.UpdateMask)
+			assert.Equal(t, test.wantPaths, decoded.GetUpdateMask().GetPaths())
+			if request.SlotID != nil {
+				labels := decoded.GetExpectedMachine().GetMetadata().GetLabels()
+				require.Len(t, labels, 1)
+				assert.Equal(t, "slot_id", labels[0].GetKey())
+				assert.Equal(t, "0", labels[0].GetValue())
+			}
+			if request.DefaultBmcUsername != nil {
+				assert.Equal(t, *request.DefaultBmcUsername, decoded.GetExpectedMachine().GetBmcUsername())
+			}
+			if request.DefaultBmcPassword != nil {
+				assert.Equal(t, *request.DefaultBmcPassword, decoded.GetExpectedMachine().GetBmcPassword())
+			}
+			assert.Equal(t, request.BmcIpAddress, decoded.GetExpectedMachine().BmcIpAddress)
+			if request.BmcIpAddress != nil && *request.BmcIpAddress != "" {
+				assert.Equal(t, corev1.BmcIpAllocationType_BMC_IP_ALLOCATION_TYPE_AUTO, decoded.GetExpectedMachine().GetBmcIpAllocation())
+			}
 		})
 	}
 }

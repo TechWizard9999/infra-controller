@@ -554,12 +554,13 @@ where
     .into_group_map())
 }
 
-/// `find_by_machine_id_for_update` locks one host's non-BMC interface rows in
+/// `find_by_machine_id_for_update` locks one machine's non-BMC interface rows in
 /// ID order and returns their current snapshots.
 ///
-/// Primary-interface writers call this after taking the network-segment
-/// advisory locks. The stable row order keeps concurrent interface mutations
-/// from acquiring the same set of row locks in different orders.
+/// Callers must acquire any network-segment advisory locks their transaction
+/// needs before taking these row locks. The stable row order keeps concurrent
+/// interface mutations from acquiring the same set of row locks in different
+/// orders.
 pub async fn find_by_machine_id_for_update(
     txn: &mut PgConnection,
     machine_id: &MachineId,
@@ -2000,7 +2001,7 @@ async fn create_static_path(
         if existing.mac_address == *macaddr {
             return Ok(existing);
         }
-        return Err(AddressAlreadyInUseError(
+        return Err(AddressAlreadyInUseError::active(
             address,
             existing.mac_address,
             existing.segment_id,
@@ -3609,6 +3610,11 @@ pub async fn update_segment_id(
 ///   alone -- the operator's static assignment takes priority over DHCP.
 /// - If the interface is on a different managed segment, error -- this
 ///   is a real network mismatch (wrong VLAN/port).
+///
+/// Before moving an addressless static interface, lock it and reread its
+/// segment and addresses. Callers must keep a transaction open through this
+/// function so the lock covers the reread and segment update. Callers that
+/// allocate from a pool must acquire their segment locks first.
 async fn reconcile_interface_segment(
     txn: &mut PgConnection,
     existing_interface: &mut MachineInterfaceSnapshot,
@@ -3649,11 +3655,23 @@ async fn reconcile_interface_segment(
         return Ok(());
     }
 
-    let on_static_assignments = existing_interface.segment_id
-        == crate::network_segment::static_assignments(txn)
-            .await
-            .map(|s| s.id)
-            .unwrap_or_default();
+    let static_segment_id = crate::network_segment::static_assignments(txn)
+        .await
+        .map(|s| s.id)
+        .unwrap_or_default();
+
+    if existing_interface.segment_id == static_segment_id && existing_interface.addresses.is_empty()
+    {
+        // Static assignment locks the interface before inserting an address.
+        // Wait for that writer, then refresh both the segment and addresses so
+        // an old addressless snapshot cannot move its new static allocation.
+        lock_for_address_assignment(txn, existing_interface.id).await?;
+        *existing_interface = find_one(&mut *txn, existing_interface.id).await?;
+        if authoritative_segment_ids.contains(&existing_interface.segment_id) {
+            return Ok(());
+        }
+    }
+    let on_static_assignments = existing_interface.segment_id == static_segment_id;
 
     // If the interface is on static-assignments with no addresses (as in
     // the static address was removed), move it to the relay's segment
@@ -3808,12 +3826,26 @@ pub async fn update_last_dhcp(
     Ok(())
 }
 
+/// Delete an interface.
+///
+/// When `release_reserved_addresses` is `false` (the default teardown for
+/// `DeleteInterface` and non-wipe force deletion), any address the interface
+/// marked for preservation is parked as a reservation owned by its MAC so the
+/// same MAC can reclaim it on re-ingestion. Set it to `true` for an intentional
+/// permanent wipe, which deletes those addresses too.
 pub async fn delete(
     interface_id: &MachineInterfaceId,
     txn: &mut PgConnection,
+    release_reserved_addresses: bool,
 ) -> Result<(), DatabaseError> {
     let query =
         "DELETE FROM machine_interfaces WHERE id=$1 RETURNING mac_address, boot_interface_id";
+    // Park marked addresses before the row delete below removes the rest. A
+    // parked row clears its interface_id, so the delete's interface-scoped
+    // predicate no longer matches it. A wipe skips this so every address goes.
+    if !release_reserved_addresses {
+        crate::machine_interface_address::park_reserved(txn, *interface_id).await?;
+    }
     crate::machine_interface_address::delete(txn, interface_id).await?;
     crate::dhcp_entry::delete(txn, interface_id).await?;
     // `machine_boot_override` references this row with no ON DELETE CASCADE, so a
@@ -3848,18 +3880,6 @@ pub async fn record_deletion(txn: &mut PgConnection) -> Result<(), DatabaseError
         .await
         .map(|_| ())
         .map_err(|error| DatabaseError::query(QUERY, error))
-}
-
-pub async fn delete_by_ip(txn: &mut PgConnection, ip: IpAddr) -> Result<Option<()>, DatabaseError> {
-    let interface = find_by_ip(&mut *txn, ip).await?;
-
-    let Some(interface) = interface else {
-        return Ok(None);
-    };
-
-    delete(&interface.id, txn).await?;
-
-    Ok(Some(()))
 }
 
 /// Find all machine interface IDs associated with a switch.

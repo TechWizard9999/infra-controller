@@ -48,6 +48,7 @@ pub async fn create(
     version: ConfigVersion,
     service_id: &ExtensionServiceId,
     service_type: &ExtensionServiceType,
+    dpu_target: Option<model::extension_service::DpuTarget>,
     service_name: &str,
     tenant_organization_id: &TenantOrganizationId,
     description: Option<&str>,
@@ -67,10 +68,10 @@ pub async fn create(
     // First create the extension service record
     let service_query = "INSERT INTO extension_services
             (id, type, name, description, tenant_organization_id, version_ctr,
-             controller_state, controller_state_version)
+             controller_state, controller_state_version, dpu_target)
             VALUES ($1, $2::varchar, $3::varchar, $4::varchar, $5::varchar, $6::integer,
-                    $7::jsonb, $8::varchar)
-            RETURNING id, type, name, description, tenant_organization_id, version_ctr,
+                    $7::jsonb, $8::varchar, $9)
+            RETURNING id, type, dpu_target, name, description, tenant_organization_id, version_ctr,
                       controller_state, controller_state_version, controller_state_outcome,
                       created, updated, deleted";
 
@@ -83,6 +84,7 @@ pub async fn create(
         .bind(initial_version_ctr)
         .bind(sqlx::types::Json(initial_controller_state))
         .bind(initial_controller_state_version)
+        .bind(dpu_target)
         .fetch_one(&mut *txn)
         .await
     {
@@ -145,6 +147,11 @@ pub async fn create(
 /// - Inserts a new version with the next version number (1 + current latest version)
 /// - Sets `has_credential` on the new version as provided
 ///
+/// If the version check rejects the update, a locking read in `txn` determines
+/// the error: an active service returns `ConcurrentModificationError` with the
+/// caller's expected version counter; a missing or soft-deleted service returns
+/// `NotFoundError`. Neither rejection creates a version.
+///
 /// # Parameters
 /// * `txn`                    - A reference to an active DB transaction
 /// * `service_id`             - The id of the extension service to insert new version for
@@ -187,7 +194,7 @@ pub async fn update(
         .push(" AND version_ctr = ")
         .push_bind(config_version_change.current.version_nr().cast_signed());
     builder.push(" AND deleted IS NULL");
-    builder.push(" RETURNING id, type, name, description, tenant_organization_id, version_ctr, controller_state, controller_state_version, controller_state_outcome, created, updated, deleted");
+    builder.push(" RETURNING id, type, dpu_target, name, description, tenant_organization_id, version_ctr, controller_state, controller_state_version, controller_state_outcome, created, updated, deleted");
 
     let updated_service = match builder
         .build_query_as::<ExtensionService>()
@@ -196,6 +203,15 @@ pub async fn update(
     {
         Ok(service) => service,
         Err(sqlx::Error::RowNotFound) => {
+            if !find_by_ids(txn, &[service_id], false, true)
+                .await?
+                .is_empty()
+            {
+                return Err(DatabaseError::ConcurrentModificationError(
+                    "ExtensionService",
+                    config_version_change.current.version_nr().to_string(),
+                ));
+            }
             return Err(DatabaseError::NotFoundError {
                 kind: "extension_service",
                 id: service_id.to_string(),
@@ -261,7 +277,7 @@ pub async fn update_metadata(
     builder.push(" WHERE id = ");
     builder.push_bind(service_id);
     builder.push(" AND deleted IS NULL");
-    builder.push(" RETURNING id, type, name, description, tenant_organization_id, version_ctr, controller_state, controller_state_version, controller_state_outcome, created, updated, deleted");
+    builder.push(" RETURNING id, type, dpu_target, name, description, tenant_organization_id, version_ctr, controller_state, controller_state_version, controller_state_outcome, created, updated, deleted");
 
     let updated_service = match builder
         .build_query_as::<ExtensionService>()
@@ -343,7 +359,7 @@ pub async fn update_dpf_helm_chart_in_place(
     builder.push(" AND controller_state = ");
     builder.push_bind(sqlx::types::Json(ExtensionServiceLifecycleState::Ready));
     builder.push(
-        " RETURNING id, type, name, description, tenant_organization_id, version_ctr, \
+        " RETURNING id, type, dpu_target, name, description, tenant_organization_id, version_ctr, \
           controller_state, controller_state_version, controller_state_outcome, created, updated, deleted",
     );
 
@@ -597,7 +613,7 @@ pub async fn find_by_ids(
     }
 
     let mut builder = sqlx::QueryBuilder::new(
-        "SELECT id, type, name, description, tenant_organization_id, version_ctr,
+        "SELECT id, type, dpu_target, name, description, tenant_organization_id, version_ctr,
          controller_state, controller_state_version, controller_state_outcome, created, updated, deleted FROM
          extension_services WHERE id = ANY(",
     );
@@ -643,6 +659,7 @@ pub async fn find_snapshots_by_ids(
         s.id AS service_id,
         s.name AS service_name,
         s.type AS service_type,
+        s.dpu_target,
         s.version_ctr AS version_ctr,
         s.description AS description,
         s.tenant_organization_id AS tenant_organization_id,
@@ -1075,7 +1092,9 @@ mod test_batched_lookups {
     use carbide_test_support::query_counter::count_queries;
     use config_version::ConfigVersion;
     use model::controller_outcome::PersistentStateHandlerOutcome;
-    use model::extension_service::{ExtensionServiceLifecycleState, ExtensionServiceType};
+    use model::extension_service::{
+        DpuTarget, ExtensionServiceLifecycleState, ExtensionServiceType,
+    };
     use model::metadata::Metadata;
     use model::tenant::TenantOrganizationId;
 
@@ -1115,6 +1134,7 @@ mod test_batched_lookups {
                 version,
                 &service_id,
                 &ExtensionServiceType::KubernetesPod,
+                None,
                 &format!("svc-{i}"),
                 &tenant,
                 Some("test service"),
@@ -1128,6 +1148,165 @@ mod test_batched_lookups {
         }
         txn.commit().await.expect("commit");
         seeded
+    }
+
+    #[crate::sqlx_test]
+    async fn update_rejects_stale_missing_and_deleted_services(pool: sqlx::PgPool) {
+        let seeded = seed_services(&pool, 2).await;
+        let (active_service_id, initial_version) = seeded[0];
+        let (deleted_service_id, _) = seeded[1];
+        let missing_service_id = ExtensionServiceId::new();
+        let mut txn = pool.begin().await.expect("begin winning updates");
+        for (service_id, version) in seeded {
+            let (service, _) = update(
+                &mut txn,
+                service_id,
+                Some(&format!("winner-{service_id}")),
+                Some("winning description"),
+                "winning data",
+                None,
+                false,
+                version.incremental_change(),
+            )
+            .await
+            .expect("write a newer configuration");
+            if service_id == deleted_service_id {
+                assert_eq!(
+                    soft_delete_service(
+                        &mut txn,
+                        service_id,
+                        service.status.controller_state.version,
+                    )
+                    .await
+                    .expect("soft delete service"),
+                    Some(service_id)
+                );
+            }
+        }
+        txn.commit().await.expect("commit winning updates");
+
+        struct Case {
+            scenario: &'static str,
+            service_id: ExtensionServiceId,
+            expected_error: DatabaseError,
+        }
+        let cases = [
+            Case {
+                scenario: "active service with a stale counter",
+                service_id: active_service_id,
+                expected_error: DatabaseError::ConcurrentModificationError(
+                    "ExtensionService",
+                    "1".to_string(),
+                ),
+            },
+            Case {
+                scenario: "missing service",
+                service_id: missing_service_id,
+                expected_error: DatabaseError::NotFoundError {
+                    kind: "extension_service",
+                    id: missing_service_id.to_string(),
+                },
+            },
+            Case {
+                scenario: "soft-deleted service with a stale counter",
+                service_id: deleted_service_id,
+                expected_error: DatabaseError::NotFoundError {
+                    kind: "extension_service",
+                    id: deleted_service_id.to_string(),
+                },
+            },
+        ];
+        for Case {
+            scenario,
+            service_id,
+            expected_error,
+        } in cases
+        {
+            let mut txn = pool.begin().await.expect("begin stale update");
+            let before = find_by_ids(&mut txn, &[service_id], true, false)
+                .await
+                .expect("load parent before rejected update");
+            let versions_before = find_versions_info(&mut txn, &service_id, None)
+                .await
+                .expect("load versions before rejected update");
+
+            let error = update(
+                &mut txn,
+                service_id,
+                Some("stale name"),
+                Some("stale description"),
+                "stale data",
+                None,
+                true,
+                initial_version.incremental_change(),
+            )
+            .await
+            .expect_err(scenario);
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&expected_error),
+                "{scenario}: error variant"
+            );
+            assert_eq!(
+                error.to_string(),
+                expected_error.to_string(),
+                "{scenario}: error details"
+            );
+            // Commit to prove rejection didn't leave any database changes.
+            txn.commit().await.expect("commit rejected update");
+
+            let mut txn = pool.begin().await.expect("begin persistence check");
+            let after = find_by_ids(&mut txn, &[service_id], true, false)
+                .await
+                .expect("reload parent after rejected update");
+            let versions_after = find_versions_info(&mut txn, &service_id, None)
+                .await
+                .expect("reload versions after rejected update");
+            assert_eq!(after.len(), before.len(), "{scenario}: parent count");
+            assert_eq!(
+                after.first().map(|service| (
+                    &service.name,
+                    &service.description,
+                    service.version_ctr,
+                    service.updated,
+                    service.deleted,
+                )),
+                before.first().map(|service| (
+                    &service.name,
+                    &service.description,
+                    service.version_ctr,
+                    service.updated,
+                    service.deleted,
+                )),
+                "{scenario}: parent fields must not change"
+            );
+            assert_eq!(
+                versions_after
+                    .iter()
+                    .map(|version| (
+                        version.version,
+                        &version.data,
+                        &version.observability,
+                        version.has_credential,
+                        version.created,
+                        version.deleted,
+                    ))
+                    .collect::<Vec<_>>(),
+                versions_before
+                    .iter()
+                    .map(|version| (
+                        version.version,
+                        &version.data,
+                        &version.observability,
+                        version.has_credential,
+                        version.created,
+                        version.deleted,
+                    ))
+                    .collect::<Vec<_>>(),
+                "{scenario}: version rows must not change"
+            );
+            txn.commit().await.expect("commit persistence check");
+        }
     }
 
     #[crate::sqlx_test]
@@ -1153,6 +1332,7 @@ mod test_batched_lookups {
             ConfigVersion::initial(),
             &service_id,
             &ExtensionServiceType::DpfHelmChart,
+            Some(DpuTarget::AllActive),
             "dpf-service",
             &tenant,
             Some("DPF Helm chart service"),
