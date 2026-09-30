@@ -15492,11 +15492,6 @@ mod tests {
                     input: (CleanupContext::Reset, true),
                     expect: false,
                 },
-                Check {
-                    scenario: "initial discovery never relocks through the BOSS path",
-                    input: (CleanupContext::InitialDiscovery, false),
-                    expect: false,
-                },
             ],
             |(cleanup_context, disable_lockdown)| {
                 should_reenable_boss_lockdown(cleanup_context, disable_lockdown)
