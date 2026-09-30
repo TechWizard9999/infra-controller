@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"os"
 	"time"
@@ -72,7 +71,9 @@ import (
 	expectedPowerShelfWorkflow "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/workflow/expectedpowershelf"
 
 	expectedRackActivity "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/activity/expectedrack"
+	expectedRackGroupActivity "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/activity/expectedrackgroup"
 	expectedRackWorkflow "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/workflow/expectedrack"
+	expectedRackGroupWorkflow "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/workflow/expectedrackgroup"
 
 	expectedSwitchActivity "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/activity/expectedswitch"
 	expectedSwitchWorkflow "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/workflow/expectedswitch"
@@ -208,7 +209,7 @@ func main() {
 	}
 
 	tc, err = tsdkClient.NewLazyClient(tsdkClient.Options{
-		HostPort:  fmt.Sprintf("%v:%v", tcfg.Host, tcfg.Port),
+		HostPort:  tcfg.GetHostPort(),
 		Namespace: tcfg.Namespace,
 		ConnectionOptions: tsdkClient.ConnectionOptions{
 			TLS: tcfg.ClientTLSCfg,
@@ -331,6 +332,7 @@ func main() {
 
 		// ExpectedRack workflow
 		w.RegisterWorkflow(expectedRackWorkflow.UpdateExpectedRackInventory)
+		w.RegisterWorkflow(expectedRackGroupWorkflow.UpdateExpectedRackGroupInventory)
 
 		// ExpectedSwitch workflow
 		w.RegisterWorkflow(expectedSwitchWorkflow.UpdateExpectedSwitchInventory)
@@ -443,6 +445,8 @@ func main() {
 	// ExpectedRack activities
 	expectedRackManager := expectedRackActivity.NewManageExpectedRack(dbSession, siteClientPool)
 	w.RegisterActivity(&expectedRackManager)
+	expectedRackGroupManager := expectedRackGroupActivity.NewManageExpectedRackGroup(dbSession, siteClientPool)
+	w.RegisterActivity(&expectedRackGroupManager)
 
 	// ExpectedSwitch activities
 	expectedSwitchManager := expectedSwitchActivity.NewManageExpectedSwitch(dbSession, siteClientPool)

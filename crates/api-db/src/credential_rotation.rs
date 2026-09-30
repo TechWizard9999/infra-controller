@@ -4,6 +4,10 @@
 //! last confirmed version of the site-wide credential applied on the hardware --
 //! the convergence marker the rotation engine drives toward
 //! `sitewide_credential_rotation.target_version`.
+//! A retained BMC password with no known site version is enrolled with NULL
+//! `current_version`; rotation authenticates using its stored per-device secret.
+//! Completed host UEFI jobs saved before version tracking also enroll with NULL,
+//! but have no per-device secret to identify their old password for rotation.
 //!
 //! Already-ingested devices are populated once by the
 //! `*_credential_rotation_backfill` data migration. This module records the
@@ -12,14 +16,14 @@
 //! as new sites and new hardware are adopted. The migration handles "before the
 //! upgrade"; these hooks handle "ever after".
 //!
-//! Ingestion hooks wired today (calling [`record_device_converged`]) record the
+//! Ingestion hooks wired today (calling [`record_device_enrolled`]) record the
 //! fact at the moment NICo writes the credential, not when the device row is
 //! later persisted:
 //!
 //! * `bmc` -- at `site-explorer` `BmcEndpointExplorer::set_bmc_root_credentials`,
 //!   the single point where every host, DPU, switch, and power-shelf BMC is
-//!   moved onto (or confirmed on) the site-wide root and its per-device secret
-//!   is written.
+//!   moved onto (or confirmed on) the site-wide root, or its retained password
+//!   is stored without claiming a site version.
 //! * `host_uefi` -- when the host UEFI password is set on the device
 //!   (`api-core` `set_host_uefi_password` and the machine-controller UEFI-setup
 //!   state, alongside stamping `machines.bios_password_set_time`).
@@ -37,7 +41,8 @@
 //!   (`card_state.lockmode == Locked`) it promotes that exact value to
 //!   `current_version` via [`promote_rotating_to_current`]. A card with no staged
 //!   marker (locked before this flow shipped, already at v0 from the backfill)
-//!   falls back to [`record_device_converged`] at the site-wide target. The lock
+//!   keeps its existing convergence record; observing Locked alone cannot tell
+//!   us which IKM version was used. The lock
 //!   command derives from the staged site-wide target when lockdown rotation is
 //!   enabled (otherwise from the card's current tracked version, so a staged
 //!   target does not migrate cards until the cutover flip); the staged
@@ -114,59 +119,23 @@ pub enum CredentialRotationType {
     DpuBmcService,
 }
 
-/// Records that `device_mac` now carries the current site-wide `credential_type`
-/// credential, i.e. it has converged to the active `target_version`.
-///
-/// Call this right after NICo sets the credential on the device (the factory ->
-/// site-wide step at ingestion). The recorded `current_version` is the
-/// credential type's current site-wide `target_version`, so a device ingested
-/// during or after a rotation is recorded at the version it actually received.
-///
-/// Requires a `sitewide_credential_rotation` row for `credential_type` to
-/// already exist; the backfill migration seeds one for every active type. If it
-/// is absent this returns [`DatabaseError::MissingSitewideRotationTarget`]
-/// rather than guessing a version -- see the body for why guessing is unsafe.
+/// `record_device_enrolled` tracks a device's credential after enrollment.
+/// `Some(version)` is the version selected with the applied credential, before
+/// external work started. The site-wide target may have changed since then.
+/// `None` records an unknown site version: a retained BMC password or a completed
+/// host UEFI job saved before version tracking. BMC rotation can authenticate
+/// with its per-device secret; UEFI rotation cannot infer an unknown old password.
+/// A supplied version must be nonnegative, as enforced by the database constraint.
 ///
 /// Idempotent: an existing row (re-ingestion, retry, or the backfill migration)
 /// is left untouched, so this never clobbers a version the rotation engine is
 /// tracking -- the engine owns all subsequent version transitions.
-pub async fn record_device_converged(
+pub async fn record_device_enrolled(
     conn: &mut PgConnection,
     device_mac: MacAddress,
     credential_type: CredentialRotationType,
+    applied_version: Option<i32>,
 ) -> Result<(), DatabaseError> {
-    // Resolve the site-wide target up front and fail loudly if it is missing.
-    //
-    // For every credential type wired today (bmc, host_uefi, dpu_uefi,
-    // lockdown_ikm) the backfill data migration unconditionally seeds a
-    // `sitewide_credential_rotation` row, so an absent row is never a normal
-    // condition -- it is a corrupted invariant. The previous COALESCE(..., 0)
-    // masked that: it recorded `current_version = 0`, which may be the wrong
-    // convergence version (the device actually received whatever the live
-    // target was), and the `ON CONFLICT DO NOTHING` below then froze that wrong
-    // value forever (the engine owns transitions and never clobbers it). Once
-    // the site-wide row was restored the engine would see `0 < target` and
-    // drive a spurious rotation of a security credential. Erroring instead
-    // surfaces the broken state and lets it self-heal once the row exists.
-    //
-    // Resolving the target here and recording it is correct only when the
-    // device is known to carry the *current* site-wide credential -- i.e. NICo
-    // just set factory -> site-wide. A caller that locked/derived against a
-    // specific version it captured earlier must instead stage that version with
-    // [`mark_device_rotating_to_version`] and promote it on confirmation with
-    // [`promote_rotating_to_current`], so a target advancing between derivation
-    // and confirmation cannot mis-record the convergence version.
-    let select = "SELECT target_version FROM sitewide_credential_rotation \
-                  WHERE credential_type = $1";
-    let target_version: i32 = sqlx::query_scalar(select)
-        .bind(credential_type)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(|e| DatabaseError::query(select, e))?
-        .ok_or(DatabaseError::MissingSitewideRotationTarget(
-            credential_type,
-        ))?;
-
     // Idempotent: an existing row (re-ingestion, retry, or the backfill
     // migration) is left untouched, so we never clobber a version the rotation
     // engine is tracking -- the engine owns all subsequent transitions.
@@ -177,7 +146,7 @@ pub async fn record_device_converged(
     sqlx::query(insert)
         .bind(device_mac)
         .bind(credential_type)
-        .bind(target_version)
+        .bind(applied_version)
         .execute(&mut *conn)
         .await
         .map(|_| ())
@@ -225,10 +194,16 @@ pub async fn mark_device_rotating_to_version(
         .map_err(|e| DatabaseError::query(query, e))
 }
 
+/// `NoStagedCredentialRotation` means the device row is missing or has no
+/// `rotating_to_version` to promote. Both cases share the caller's fallback
+/// policy; this does not describe the hardware's credential state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoStagedCredentialRotation;
+
 /// Completes an in-flight rotation: promotes a staged `rotating_to_version` to
 /// `current_version` for `(device_mac, credential_type)` and clears the in-flight
-/// marker. Returns `true` if a staged rotation was promoted, `false` if there was
-/// nothing to promote (no row, or `rotating_to_version` already NULL).
+/// marker. Returns `Applied(())` if a staged rotation was promoted, or
+/// `NotApplied(NoStagedCredentialRotation)` if there was nothing to promote.
 ///
 /// Phase two of the flow started by [`mark_device_rotating_to_version`]: called
 /// when the hardware confirms the new credential. Because the promoted value is
@@ -237,8 +212,11 @@ pub async fn mark_device_rotating_to_version(
 ///
 /// Idempotent: a second call (e.g. a re-observed lock) finds `rotating_to_version`
 /// already cleared and is a no-op, leaving the promoted `current_version` intact.
-/// A `false` return lets the caller fall back to [`record_device_converged`] for
-/// devices that were converged before this staged flow shipped (no marker).
+/// A `NotApplied` return does not establish which credential the device uses.
+/// Only a caller with the version actually applied can record enrollment with
+/// [`record_device_enrolled`]; other callers must preserve the existing record.
+/// The query does not compare the staged value against the completed external
+/// operation's target; callers must not interpret promotion as that check.
 ///
 /// Promotion also clears the failure bookkeeping ([`increment_rotate_attempt`]
 /// writes `rotate_attempts`, `rotate_quarantined_until`, and
@@ -250,7 +228,7 @@ pub async fn promote_rotating_to_current(
     conn: &mut PgConnection,
     device_mac: MacAddress,
     credential_type: CredentialRotationType,
-) -> Result<bool, DatabaseError> {
+) -> Result<ConditionalWrite<(), NoStagedCredentialRotation>, DatabaseError> {
     let query = "UPDATE device_credential_rotation \
                  SET current_version = rotating_to_version, \
                      rotating_to_version = NULL, \
@@ -266,7 +244,11 @@ pub async fn promote_rotating_to_current(
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
 
-    Ok(result.rows_affected() > 0)
+    Ok(if result.rows_affected() > 0 {
+        ConditionalWrite::Applied(())
+    } else {
+        ConditionalWrite::NotApplied(NoStagedCredentialRotation)
+    })
 }
 
 /// Records that `device_mac` is now *unlocked* for `credential_type`: NULLs
@@ -1152,14 +1134,15 @@ mod tests {
     use sqlx::{PgConnection, PgPool};
 
     use super::{
-        BACKOFF_CAP_SECS, CredentialRotationType, RotationAttemptNotEligible,
-        RotationStartNotEligible, RotationTargetNotCurrent, backoff_until, current_target_version,
-        delete_device_converged, device_rotation_operation_state, device_rotation_status,
-        increment_rotate_attempt, mark_device_rotating_to_version, promote_rotating_to_current,
-        record_device_converged, record_device_rotation_failed,
-        record_device_rotation_retry_started, record_device_rotation_started,
-        record_device_rotation_submitted, record_device_rotation_succeeded, record_device_unlocked,
-        rotation_status, set_initial_target_version, set_next_target_version,
+        BACKOFF_CAP_SECS, CredentialRotationType, NoStagedCredentialRotation,
+        RotationAttemptNotEligible, RotationStartNotEligible, RotationTargetNotCurrent,
+        backoff_until, current_target_version, delete_device_converged,
+        device_rotation_operation_state, device_rotation_status, increment_rotate_attempt,
+        mark_device_rotating_to_version, promote_rotating_to_current, record_device_enrolled,
+        record_device_rotation_failed, record_device_rotation_retry_started,
+        record_device_rotation_started, record_device_rotation_submitted,
+        record_device_rotation_succeeded, record_device_unlocked, rotation_status,
+        set_initial_target_version, set_next_target_version,
     };
     use crate::ConditionalWrite::{Applied, NotApplied};
 
@@ -1276,14 +1259,14 @@ mod tests {
     }
 
     #[crate::sqlx_test]
-    async fn records_current_target_and_is_idempotent(pool: PgPool) {
+    async fn records_applied_version_and_preserves_existing_rotation(pool: PgPool) {
         let mac1: MacAddress = "02:00:00:00:00:01".parse().unwrap();
         let mac2: MacAddress = "02:00:00:00:00:02".parse().unwrap();
         let mut conn = pool.acquire().await.unwrap();
 
         // The backfill migration seeds the bmc site-wide target at version 0, so
         // a device recorded now converges at 0.
-        record_device_converged(&mut conn, mac1, CredentialRotationType::Bmc)
+        record_device_enrolled(&mut conn, mac1, CredentialRotationType::Bmc, Some(0))
             .await
             .unwrap();
         assert_eq!(
@@ -1300,7 +1283,13 @@ mod tests {
         .execute(&mut *conn)
         .await
         .unwrap();
-        record_device_converged(&mut conn, mac1, CredentialRotationType::Bmc)
+        mark_device_rotating_to_version(&mut conn, mac1, CredentialRotationType::Bmc, 3)
+            .await
+            .unwrap();
+        record_device_enrolled(&mut conn, mac1, CredentialRotationType::Bmc, Some(2))
+            .await
+            .unwrap();
+        record_device_enrolled(&mut conn, mac1, CredentialRotationType::Bmc, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1309,14 +1298,20 @@ mod tests {
             "existing row must be preserved on re-ingestion"
         );
 
-        // A device first seen after the bump records the current target (3).
-        record_device_converged(&mut conn, mac2, CredentialRotationType::Bmc)
+        assert_eq!(
+            rotating_version_of(&mut conn, "02:00:00:00:00:01", "bmc").await,
+            Some(3),
+            "enrollment must not replace another staged rotation"
+        );
+
+        // This enrollment applied v2 while the target advanced to v3.
+        record_device_enrolled(&mut conn, mac2, CredentialRotationType::Bmc, Some(2))
             .await
             .unwrap();
         assert_eq!(
             version_of(&mut conn, "02:00:00:00:00:02", "bmc").await,
-            Some(3),
-            "a newly ingested device records the current site-wide target"
+            Some(2),
+            "a newly ingested device records the version actually applied"
         );
     }
 
@@ -1361,7 +1356,11 @@ mod tests {
             promote_rotating_to_current(&mut conn, mac, CredentialRotationType::LockdownIkm)
                 .await
                 .unwrap();
-        assert!(promoted, "a staged rotation must report as promoted");
+        assert_eq!(
+            promoted,
+            Applied(()),
+            "a staged rotation must report as promoted"
+        );
         assert_eq!(
             version_of(&mut conn, "02:00:00:00:00:0a", "lockdown_ikm").await,
             Some(2),
@@ -1379,8 +1378,9 @@ mod tests {
             promote_rotating_to_current(&mut conn, mac, CredentialRotationType::LockdownIkm)
                 .await
                 .unwrap();
-        assert!(
-            !promoted_again,
+        assert_eq!(
+            promoted_again,
+            NotApplied(NoStagedCredentialRotation),
             "a second promotion with nothing staged must report no-op"
         );
         assert_eq!(
@@ -1420,7 +1420,7 @@ mod tests {
 
         // A device under management already carries a convergence row (bmc is
         // seeded at target 0), behind which we model a failing rotation.
-        record_device_converged(&mut conn, mac, CredentialRotationType::Bmc)
+        record_device_enrolled(&mut conn, mac, CredentialRotationType::Bmc, Some(0))
             .await
             .unwrap();
         sqlx::query(
@@ -1533,7 +1533,11 @@ mod tests {
         let promoted = promote_rotating_to_current(&mut conn, mac, CredentialRotationType::Bmc)
             .await
             .unwrap();
-        assert!(promoted, "a staged rotation must report as promoted");
+        assert_eq!(
+            promoted,
+            Applied(()),
+            "a staged rotation must report as promoted"
+        );
 
         let status = device_rotation_status(
             &mut conn,
@@ -2008,11 +2012,11 @@ mod tests {
         let mac: MacAddress = "02:00:00:00:00:01".parse().unwrap();
         let mut conn = pool.acquire().await.unwrap();
 
-        record_device_converged(&mut conn, mac, CredentialRotationType::Bmc)
+        record_device_enrolled(&mut conn, mac, CredentialRotationType::Bmc, Some(0))
             .await
             .unwrap();
 
-        record_device_converged(&mut conn, mac, CredentialRotationType::HostUefi)
+        record_device_enrolled(&mut conn, mac, CredentialRotationType::HostUefi, Some(0))
             .await
             .unwrap();
 

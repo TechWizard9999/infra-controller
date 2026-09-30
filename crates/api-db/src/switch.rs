@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+use std::collections::HashSet;
 use std::net::IpAddr;
 
 use carbide_uuid::nvlink::NvLinkDomainId;
@@ -36,7 +37,8 @@ use sqlx::PgConnection;
 
 use crate::db_read::DbReader;
 use crate::{
-    ColumnInfo, DatabaseError, DatabaseResult, FilterableQueryBuilder, ObjectColumnFilter,
+    ColumnInfo, ConditionalWrite, ControllerStateNotCurrent, DatabaseError, DatabaseResult,
+    FilterableQueryBuilder, ObjectColumnFilter,
 };
 
 #[cfg(test)]
@@ -198,6 +200,19 @@ pub async fn find_by_bmc_mac_address(
     Ok(switches.into_iter().next())
 }
 
+/// BMC MAC addresses of every switch record, deleted ones included, so the
+/// result matches `find_by_bmc_mac_address` for each address.
+pub async fn find_all_bmc_mac_addresses(
+    txn: impl DbReader<'_>,
+) -> DatabaseResult<HashSet<MacAddress>> {
+    let query = "SELECT bmc_mac_address FROM switches WHERE bmc_mac_address IS NOT NULL";
+    let mac_addresses: Vec<MacAddress> = sqlx::query_scalar(query)
+        .fetch_all(txn)
+        .await
+        .map_err(|e| DatabaseError::new("switch::find_all_bmc_mac_addresses", e))?;
+    Ok(mac_addresses.into_iter().collect())
+}
+
 pub async fn find_ids(
     txn: impl DbReader<'_>,
     filter: model::switch::SwitchSearchFilter,
@@ -333,13 +348,20 @@ pub async fn find_by<'a, C: ColumnInfo<'a, TableType = Switch>>(
         .map_err(|e| DatabaseError::new(query.sql(), e))
 }
 
+/// `try_update_controller_state` writes the switch state and `new_version`
+/// when the version matches `expected_version`.
+///
+/// A missing switch or changed version returns
+/// `NotApplied(ControllerStateNotCurrent)`.
+/// `Applied(())` leaves the write in the caller's transaction; database failures
+/// remain errors.
 pub async fn try_update_controller_state(
     txn: &mut PgConnection,
     switch_id: SwitchId,
     expected_version: ConfigVersion,
     new_version: ConfigVersion,
     new_state: &SwitchControllerState,
-) -> DatabaseResult<bool> {
+) -> DatabaseResult<ConditionalWrite<(), ControllerStateNotCurrent>> {
     let query_result = sqlx::query_as::<_, SwitchId>(
             "UPDATE switches SET controller_state = $1, controller_state_version = $2 WHERE id = $3 AND controller_state_version = $4 RETURNING id",
         )
@@ -351,7 +373,10 @@ pub async fn try_update_controller_state(
             .await
             .map_err(|e| DatabaseError::new( "try_update_controller_state", e))?;
 
-    Ok(query_result.is_some())
+    Ok(match query_result {
+        Some(_) => ConditionalWrite::Applied(()),
+        None => ConditionalWrite::NotApplied(ControllerStateNotCurrent),
+    })
 }
 
 pub async fn update_controller_state_outcome(
@@ -489,18 +514,24 @@ pub async fn set_switch_maintenance_requested(
     Ok(())
 }
 
+/// Clears only the maintenance request that the controller completed.
+/// A missing switch or a different pending request returns `NotApplied`.
 pub async fn clear_switch_maintenance_requested(
     txn: &mut PgConnection,
     switch_id: SwitchId,
-) -> DatabaseResult<()> {
-    let query =
-        "UPDATE switches SET switch_maintenance_requested = NULL WHERE id = $1 RETURNING id";
-    sqlx::query_as::<_, SwitchId>(query)
+    request: &SwitchMaintenanceRequest,
+) -> DatabaseResult<crate::ConditionalWrite<(), crate::MaintenanceRequestNotCurrent>> {
+    let query = "UPDATE switches SET switch_maintenance_requested = NULL WHERE id = $1 AND switch_maintenance_requested = $2 RETURNING id";
+    let cleared = sqlx::query_as::<_, SwitchId>(query)
         .bind(switch_id)
-        .fetch_one(txn)
+        .bind(sqlx::types::Json(request))
+        .fetch_optional(txn)
         .await
         .map_err(|e| DatabaseError::new("clear_switch_maintenance_requested", e))?;
-    Ok(())
+    Ok(match cleared {
+        Some(_) => crate::ConditionalWrite::Applied(()),
+        None => crate::ConditionalWrite::NotApplied(crate::MaintenanceRequestNotCurrent),
+    })
 }
 
 /// Sets firmware_upgrade_status on the switch. Call from any state machine or service to report
@@ -760,6 +791,43 @@ pub struct SwitchEndpointRow {
     pub nvos_hostname: Option<String>,
 }
 
+/// Persisted switch identity and one possible NVOS certificate endpoint.
+///
+/// A switch may produce multiple rows when inventory contains multiple NVOS
+/// interfaces or addresses. Nullable fields preserve switches with incomplete
+/// inventory so the caller can report the missing data.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use carbide_uuid::rack::RackId;
+/// # async fn load(pool: &sqlx::PgPool, rack_id: &RackId) -> Result<(), db::DatabaseError> {
+/// let rows =
+///     db::switch::find_switch_certificate_endpoint_candidates_by_rack_id(pool, rack_id).await?;
+/// for row in rows {
+///     println!("{}: {:?}", row.switch_id, row.nvos_ip);
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, sqlx::FromRow)]
+pub struct SwitchCertificateEndpointCandidateRow {
+    /// Persisted switch identifier.
+    pub switch_id: SwitchId,
+
+    /// BMC MAC used as the persisted switch identity.
+    pub bmc_mac: Option<MacAddress>,
+
+    /// NVOS management interface MAC, when inventory contains one.
+    pub nvos_mac: Option<MacAddress>,
+
+    /// NVOS management address, when the interface has one.
+    pub nvos_ip: Option<IpAddr>,
+
+    /// Fully qualified NVOS hostname used for TLS SNI, when configured.
+    pub nvos_hostname: Option<String>,
+}
+
 /// Ready switch endpoint selected for NMX-C rack-level operations.
 #[derive(Debug, sqlx::FromRow)]
 pub struct ReadyControlPlaneSwitchEndpointRow {
@@ -822,6 +890,58 @@ pub async fn find_switch_endpoints_by_ids(
         .fetch_all(db)
         .await
         .map_err(|err| DatabaseError::new("switch::find_switch_endpoints_by_ids", err))
+}
+
+/// Resolves all non-deleted switches in a rack to possible NVOS certificate endpoints.
+///
+/// The query returns every distinct NVOS interface and address candidate. Each
+/// switch appears at least once, with nullable fields when its persisted identity
+/// or NVOS endpoint data is incomplete. BMC interface and address data are not
+/// required. Rows are ordered by switch ID so each switch's candidates are
+/// contiguous.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError`] when the database query fails.
+pub async fn find_switch_certificate_endpoint_candidates_by_rack_id(
+    db: impl crate::db_read::DbReader<'_>,
+    rack_id: &RackId,
+) -> DatabaseResult<Vec<SwitchCertificateEndpointCandidateRow>> {
+    let sql = r#"
+        SELECT DISTINCT
+            s.id                 AS switch_id,
+            s.bmc_mac_address    AS bmc_mac,
+            nvos_mi.mac_address  AS nvos_mac,
+            nvos_mia.address     AS nvos_ip,
+            CASE
+                WHEN nvos_d.name IS NOT NULL AND nvos_d.name <> '' THEN
+                    nvos_mi.hostname || '.' || nvos_d.name
+                ELSE nvos_mi.hostname
+            END                  AS nvos_hostname
+        FROM switches s
+        LEFT JOIN expected_switches es
+            ON es.bmc_mac_address = s.bmc_mac_address
+        LEFT JOIN machine_interfaces nvos_mi
+            ON nvos_mi.mac_address = ANY(es.nvos_mac_addresses)
+        LEFT JOIN machine_interface_addresses nvos_mia
+            ON nvos_mia.interface_id = nvos_mi.id
+        LEFT JOIN domains nvos_d
+            ON nvos_d.id = nvos_mi.domain_id
+        WHERE s.rack_id = $1
+          AND s.deleted IS NULL
+        ORDER BY s.id, nvos_mi.mac_address NULLS LAST, nvos_mia.address NULLS LAST
+    "#;
+
+    sqlx::query_as(sql)
+        .bind(rack_id)
+        .fetch_all(db)
+        .await
+        .map_err(|err| {
+            DatabaseError::new(
+                "switch::find_switch_certificate_endpoint_candidates_by_rack_id",
+                err,
+            )
+        })
 }
 
 /// Endpoint info for a pre-ingestion switch, resolved by BMC MAC without a
@@ -1058,11 +1178,12 @@ mod tests {
     use carbide_uuid::machine::MachineInterfaceId;
     use carbide_uuid::network::NetworkSegmentId;
     use carbide_uuid::rack::{RackId, RackProfileId};
+    use carbide_uuid::switch::{SwitchIdSource, SwitchType};
     use model::allocation_type::AllocationType;
     use model::rack::RackConfig;
     use model::switch::{
         CONTROL_PLANE_STATE_CONFIGURED, FabricManagerState, FabricManagerStatus, NewSwitch,
-        SwitchConfig, SwitchControllerState,
+        SwitchConfig, SwitchControllerState, switch_id,
     };
 
     use super::*;
@@ -1326,8 +1447,9 @@ mod tests {
                 &SwitchControllerState::Ready,
             )
             .await?;
-            assert!(
+            assert_eq!(
                 updated,
+                ConditionalWrite::Applied(()),
                 "setup should update switch controller state with the current version"
             );
 
@@ -1401,8 +1523,9 @@ mod tests {
                 &SwitchControllerState::Ready,
             )
             .await?;
-            assert!(
+            assert_eq!(
                 updated,
+                ConditionalWrite::Applied(()),
                 "setup should update switch controller state with the current version"
             );
 
@@ -1620,6 +1743,61 @@ mod tests {
             endpoint.nvos_hostname.as_deref(),
             Some("nvos-a.example.com")
         );
+
+        txn.rollback().await?;
+        Ok(())
+    }
+
+    /// `create_switches` skips a switch only when its BMC MAC is in this set,
+    /// so membership must match `find_by_bmc_mac_address`, deleted switches
+    /// included, and a switch without a BMC MAC contributes nothing.
+    #[crate::sqlx_test]
+    async fn find_all_bmc_mac_addresses_matches_single_lookup(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut txn = pool.begin().await?;
+        let live = create_seeded_discovered(txn.as_mut(), 31, "live switch").await?;
+        let mut deleted = create_seeded_discovered(txn.as_mut(), 32, "deleted switch").await?;
+        mark_as_deleted(&mut deleted, txn.as_mut()).await?;
+        create(
+            txn.as_mut(),
+            &NewSwitch {
+                id: switch_id::from_hardware_info(
+                    "SW-SN-NO-BMC-MAC",
+                    "NVIDIA",
+                    "Switch",
+                    SwitchIdSource::ProductBoardChassisSerial,
+                    SwitchType::NvLink,
+                )?,
+                config: SwitchConfig {
+                    name: "switch without BMC MAC".to_string(),
+                    enable_nmxc: false,
+                    fabric_manager_config: None,
+                },
+                bmc_mac_address: None,
+                metadata: None,
+                rack_id: None,
+                slot_number: None,
+                tray_index: None,
+            },
+        )
+        .await?;
+
+        let batch = find_all_bmc_mac_addresses(txn.as_mut()).await?;
+
+        for switch in [&live, &deleted] {
+            let mac = switch
+                .bmc_mac_address
+                .expect("seeded switches carry a BMC MAC");
+            let single = find_by_bmc_mac_address(txn.as_mut(), mac).await?;
+            assert_eq!(
+                batch.contains(&mac),
+                single.is_some(),
+                "batch and single lookup disagree for {mac}"
+            );
+        }
+        // Guard against both sides agreeing only because both are empty.
+        assert_eq!(batch.len(), 2);
 
         txn.rollback().await?;
         Ok(())
