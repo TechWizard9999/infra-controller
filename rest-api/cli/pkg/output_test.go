@@ -42,6 +42,11 @@ func TestValidateOutputFormat(t *testing.T) {
 	}
 }
 
+func TestDefaultOutputFormat(t *testing.T) {
+	assert.Equal(t, "table", defaultOutputFormat(vpcPeeringListOperationID))
+	assert.Equal(t, "json", defaultOutputFormat("get-all-site"))
+}
+
 func TestFormatOutput_RejectsUnknownFormatAsDefenseInDepth(t *testing.T) {
 	// FormatOutput is called from generated commands and from the --all
 	// pagination path; if a future code path forgets to attach the

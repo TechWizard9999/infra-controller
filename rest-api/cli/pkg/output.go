@@ -19,6 +19,30 @@ import (
 // list deterministically.
 var allowedOutputFormats = []string{"json", "yaml", "table"}
 
+const vpcPeeringListOperationID = "get-all-vpc-peering"
+
+type tableColumn struct {
+	header string
+	path   string
+}
+
+var tableColumnsByOperation = map[string][]tableColumn{
+	vpcPeeringListOperationID: {
+		{header: "ID", path: "id"},
+		{header: "VPC1 Name", path: "vpc1.name"},
+		{header: "VPC1 ID", path: "vpc1Id"},
+		{header: "VPC2 Name", path: "vpc2.name"},
+		{header: "VPC2 ID", path: "vpc2Id"},
+	},
+}
+
+func defaultOutputFormat(operationID string) string {
+	if operationID == vpcPeeringListOperationID {
+		return "table"
+	}
+	return "json"
+}
+
 // ValidateOutputFormat returns an error if format is outside the allowed set.
 // The empty string is treated as valid so the StringFlag default ("json") and
 // callers that pass an unset value continue to work.
@@ -68,6 +92,15 @@ func FormatOutput(data []byte, format string) error {
 	}
 }
 
+func formatOutputWithOperation(data []byte, format, operationID string) error {
+	if format == "table" {
+		if columns, ok := tableColumnsByOperation[operationID]; ok {
+			return formatTableWithColumns(data, columns)
+		}
+	}
+	return FormatOutput(data, format)
+}
+
 func formatJSON(data []byte) error {
 	var v interface{}
 	if err := json.Unmarshal(data, &v); err != nil {
@@ -91,6 +124,10 @@ func formatYAML(data []byte) error {
 var tableFields = []string{"id", "name", "status", "created", "updated"}
 
 func formatTable(data []byte) error {
+	return formatTableWithColumns(data, nil)
+}
+
+func formatTableWithColumns(data []byte, customColumns []tableColumn) error {
 	var raw interface{}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		_, err = os.Stdout.Write(data)
@@ -114,6 +151,29 @@ func formatTable(data []byte) error {
 	if len(items) == 0 {
 		fmt.Println("(no results)")
 		return nil
+	}
+
+	if len(customColumns) > 0 {
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		for i, column := range customColumns {
+			if i > 0 {
+				fmt.Fprint(w, "\t")
+			}
+			fmt.Fprint(w, column.header)
+		}
+		fmt.Fprintln(w)
+
+		for _, item := range items {
+			for i, column := range customColumns {
+				if i > 0 {
+					fmt.Fprint(w, "\t")
+				}
+				fmt.Fprint(w, nestedString(item, column.path))
+			}
+			fmt.Fprintln(w)
+		}
+
+		return w.Flush()
 	}
 
 	var cols []string
@@ -146,4 +206,20 @@ func formatTable(data []byte) error {
 	}
 
 	return w.Flush()
+}
+
+func nestedString(item map[string]interface{}, path string) string {
+	var value interface{} = item
+	for _, field := range strings.Split(path, ".") {
+		fields, ok := value.(map[string]interface{})
+		if !ok {
+			return ""
+		}
+		value, ok = fields[field]
+		if !ok {
+			return ""
+		}
+	}
+	result, _ := value.(string)
+	return result
 }
