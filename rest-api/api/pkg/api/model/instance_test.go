@@ -177,6 +177,7 @@ func TestNewAPIInstance(t *testing.T) {
 		IsPhysical:  true,
 		MacAddress:  cutil.GetPtr("test-mac-address"),
 		IPAddresses: []string{"12.70.0.1"},
+		IPPrefixes:  []string{"12.70.0.0/24", "2001:db8::/64"},
 		Status:      cdbm.InterfaceStatusPending,
 		Created:     time.Now(),
 		Updated:     time.Now(),
@@ -424,6 +425,7 @@ func TestNewAPIInstance(t *testing.T) {
 				assert.Equal(t, *tt.args.dbis[0].MacAddress, *got.Interfaces[0].MacAddress)
 			}
 			assert.Equal(t, tt.args.dbis[0].IPAddresses, got.Interfaces[0].IPAddresses)
+			assert.Equal(t, append([]string{}, tt.args.dbis[0].IPPrefixes...), got.Interfaces[0].IPPrefixes)
 			assert.Equal(t, tt.args.dbis[0].Status, got.Interfaces[0].Status)
 			assert.Equal(t, tt.args.dbis[0].Created, got.Interfaces[0].Created)
 			assert.Equal(t, tt.args.dbis[0].Updated, got.Interfaces[0].Updated)
@@ -2483,6 +2485,7 @@ func TestAPIInstanceUpdateRequest_Validate(t *testing.T) {
 						Device:               "NVIDIA BlueField-3 B3140L E-Series FHHL SuperNIC",
 						DeviceInstance:       cutil.GetPtr(0),
 						AttachmentType:       cdbm.SpectrumXAttachmentTypeOVS,
+						BridgeName:           cutil.GetPtr("br-spx0"),
 					},
 				},
 			},
@@ -3723,13 +3726,19 @@ func TestValidateInfiniBandRequestForMachineCapability(t *testing.T) {
 func TestValidateSpectrumXAttachments(t *testing.T) {
 	device := "NVIDIA BlueField-3 B3140L E-Series FHHL SuperNIC"
 	attachment := func(deviceInstance int, attachmentType cdbm.SpectrumXAttachmentType, virtualFunctionID *int) APISpectrumXAttachmentCreateOrUpdateRequest {
-		return APISpectrumXAttachmentCreateOrUpdateRequest{
+		req := APISpectrumXAttachmentCreateOrUpdateRequest{
 			SpectrumXPartitionID: uuid.NewString(),
 			Device:               device,
 			DeviceInstance:       cutil.GetPtr(deviceInstance),
 			AttachmentType:       attachmentType,
 			VirtualFunctionID:    virtualFunctionID,
 		}
+		// bridgeName is required for OVS, so a helper-built OVS attachment carries one to
+		// isolate these cases from the per-attachment OVS validation.
+		if attachmentType == cdbm.SpectrumXAttachmentTypeOVS {
+			req.BridgeName = cutil.GetPtr("br-spx0")
+		}
+		return req
 	}
 	overCap := make([]APISpectrumXAttachmentCreateOrUpdateRequest, 0, MaxSpectrumXAttachmentCount+1)
 	for i := range MaxSpectrumXAttachmentCount + 1 {
