@@ -231,7 +231,7 @@ test-site-workflow:
 	cd site-workflow && go test -p 1 ./... -count=1
 
 test-cli:
-	cd cli && go test -p 1 ./pkg -count=1
+	cd cli && go test -p 1 ./... -count=1
 
 test-flow:
 	$(MAKE) ensure-postgres

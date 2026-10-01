@@ -603,8 +603,12 @@ func isListAction(action string) bool {
 	return action == "list" || strings.HasPrefix(action, "list-")
 }
 
-func addVpcPeeringTableRelations(queryParams url.Values) {
-	for _, relation := range []string{"Vpc1", "Vpc2"} {
+var defaultTableRelationsByOperation = map[string][]string{
+	vpcPeeringListOperationID: {"Vpc1", "Vpc2"},
+}
+
+func addDefaultTableRelations(queryParams url.Values, operationID string) {
+	for _, relation := range defaultTableRelationsByOperation[operationID] {
 		if !slices.Contains(queryParams["includeRelation"], relation) {
 			queryParams.Add("includeRelation", relation)
 		}
@@ -802,8 +806,8 @@ func buildActionCommandWithOptions(spec *Spec, ro resolvedOp, subResource string
 				}
 			}
 
-			if ro.op.OperationID == vpcPeeringListOperationID && c.String("output") == "table" {
-				addVpcPeeringTableRelations(queryParams)
+			if c.String("output") == "table" {
+				addDefaultTableRelations(queryParams, ro.op.OperationID)
 			}
 
 			var body []byte

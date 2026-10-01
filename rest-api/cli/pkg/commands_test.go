@@ -1606,12 +1606,33 @@ func TestNewApp_VpcPeeringListOutputAndRelationRequests(t *testing.T) {
 	}
 }
 
-func TestAddVpcPeeringTableRelationsPreservesRequestedRelations(t *testing.T) {
-	queryParams := url.Values{"includeRelation": {"Site", "Vpc1"}}
+func TestAddDefaultTableRelations(t *testing.T) {
+	tests := []struct {
+		name        string
+		operationID string
+		queryParams url.Values
+		want        []string
+	}{
+		{
+			name:        "adds mapped relations without duplicates",
+			operationID: vpcPeeringListOperationID,
+			queryParams: url.Values{"includeRelation": {"Site", "Vpc1"}},
+			want:        []string{"Site", "Vpc1", "Vpc2"},
+		},
+		{
+			name:        "leaves operations without relation defaults unchanged",
+			operationID: "get-all-site",
+			queryParams: url.Values{"includeRelation": {"Tenant"}},
+			want:        []string{"Tenant"},
+		},
+	}
 
-	addVpcPeeringTableRelations(queryParams)
-
-	assert.Equal(t, []string{"Site", "Vpc1", "Vpc2"}, queryParams["includeRelation"])
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			addDefaultTableRelations(test.queryParams, test.operationID)
+			assert.Equal(t, test.want, test.queryParams["includeRelation"])
+		})
+	}
 }
 
 func TestNewApp_VpcPeeringListAllKeepsRelationsAcrossPages(t *testing.T) {

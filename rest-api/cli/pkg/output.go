@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 
@@ -24,14 +25,15 @@ const vpcPeeringListOperationID = "get-all-vpc-peering"
 type tableColumn struct {
 	header string
 	path   string
+	nested bool
 }
 
 var tableColumnsByOperation = map[string][]tableColumn{
 	vpcPeeringListOperationID: {
 		{header: "ID", path: "id"},
-		{header: "VPC1 Name", path: "vpc1.name"},
+		{header: "VPC1 Name", path: "vpc1.name", nested: true},
 		{header: "VPC1 ID", path: "vpc1Id"},
-		{header: "VPC2 Name", path: "vpc2.name"},
+		{header: "VPC2 Name", path: "vpc2.name", nested: true},
 		{header: "VPC2 ID", path: "vpc2Id"},
 	},
 }
@@ -153,59 +155,47 @@ func formatTableWithColumns(data []byte, customColumns []tableColumn) error {
 		return nil
 	}
 
-	if len(customColumns) > 0 {
-		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		for i, column := range customColumns {
-			if i > 0 {
-				fmt.Fprint(w, "\t")
+	columns := customColumns
+	if len(columns) == 0 {
+		for _, field := range tableFields {
+			if _, ok := items[0][field]; ok {
+				columns = append(columns, tableColumn{header: field, path: field})
 			}
-			fmt.Fprint(w, column.header)
 		}
-		fmt.Fprintln(w)
-
-		for _, item := range items {
-			for i, column := range customColumns {
-				if i > 0 {
-					fmt.Fprint(w, "\t")
-				}
-				fmt.Fprint(w, nestedString(item, column.path))
-			}
-			fmt.Fprintln(w)
+		if len(columns) == 0 {
+			return formatJSON(data)
 		}
-
-		return w.Flush()
-	}
-
-	var cols []string
-	for _, f := range tableFields {
-		if _, ok := items[0][f]; ok {
-			cols = append(cols, f)
-		}
-	}
-	if len(cols) == 0 {
-		return formatJSON(data)
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	for i, c := range cols {
+	for i, column := range columns {
 		if i > 0 {
 			fmt.Fprint(w, "\t")
 		}
-		fmt.Fprint(w, c)
+		fmt.Fprint(w, column.header)
 	}
 	fmt.Fprintln(w)
 
 	for _, item := range items {
-		for i, c := range cols {
+		for i, column := range columns {
 			if i > 0 {
 				fmt.Fprint(w, "\t")
 			}
-			fmt.Fprintf(w, "%v", item[c])
+			value := fmt.Sprint(item[column.path])
+			if column.nested {
+				value = nestedString(item, column.path)
+			}
+			fmt.Fprint(w, escapeTableCell(value))
 		}
 		fmt.Fprintln(w)
 	}
 
 	return w.Flush()
+}
+
+func escapeTableCell(value string) string {
+	quoted := strconv.Quote(value)
+	return quoted[1 : len(quoted)-1]
 }
 
 func nestedString(item map[string]interface{}, path string) string {
