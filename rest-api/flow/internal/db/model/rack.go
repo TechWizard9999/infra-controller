@@ -55,6 +55,7 @@ type Rack struct {
 	// ingestion-gRPC rows on first run).
 	ExternalID    *string             `bun:"external_id"`
 	RackProfileID *string             `bun:"rack_profile_id"`
+	RackGroupID   *string             `bun:"rack_group_id"`
 	Status        RackStatus          `bun:"status,type:varchar(16),default:'new'"`
 	Health        *types.HealthReport `bun:"health,type:jsonb,nullzero"`
 	CreatedAt     time.Time           `bun:"created_at,nullzero,notnull,default:current_timestamp"`
@@ -227,6 +228,7 @@ func GetListOfRacks(
 	pagination *dbquery.Pagination,
 	orderBy *dbquery.OrderBy,
 	withComponents bool,
+	withExternalIDOnly bool,
 ) ([]Rack, int32, error) {
 	var racks []Rack
 	conf := &dbquery.Config{
@@ -242,6 +244,11 @@ func GetListOfRacks(
 
 	// Build filterables list from all provided filters
 	filterables := make([]dbquery.Filterable, 0)
+	if withExternalIDOnly {
+		filterables = append(filterables, &dbquery.Filter{
+			Column: "external_id", Operator: dbquery.OperatorNotEqual, Value: "",
+		})
+	}
 
 	if filterable := info.ToFilterable("name"); filterable != nil {
 		filterables = append(filterables, filterable)
@@ -321,9 +328,13 @@ func GetRacksForNVLDomain(
 	ctx context.Context,
 	idb bun.IDB,
 	nvlDomainID uuid.UUID,
+	withComponents bool,
 ) ([]Rack, error) {
 	var racks []Rack
 	q := idb.NewSelect().Model(&racks).Where("nvldomain_id = ?", nvlDomainID)
+	if withComponents {
+		q = q.Relation("Components").Relation("Components.BMCs")
+	}
 
 	if err := q.Scan(ctx); err != nil {
 		return nil, err

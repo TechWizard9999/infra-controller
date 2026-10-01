@@ -38,6 +38,7 @@ import (
 	identifier "github.com/NVIDIA/infra-controller/rest-api/flow/pkg/common/Identifier"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/pkg/common/devicetypes"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/pkg/inventoryobjects/component"
+	"github.com/NVIDIA/infra-controller/rest-api/flow/pkg/inventoryobjects/nvldomain"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/pkg/inventoryobjects/rack"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/pkg/metadata"
 	pb "github.com/NVIDIA/infra-controller/rest-api/flow/pkg/proto/v1"
@@ -161,6 +162,59 @@ func (rs *FlowServerImpl) GetRackInfoByID(
 		return nil, err
 	}
 	return &pb.GetRackInfoResponse{Rack: result}, nil
+}
+
+// GetNVLinkDomain retrieves domain inventory by external ID.
+func (rs *FlowServerImpl) GetNVLinkDomain(ctx context.Context, req *pb.GetNVLinkDomainRequest) (*pb.GetNVLinkDomainResponse, error) {
+	if strings.TrimSpace(req.GetId()) == "" {
+		return nil, status.Error(codes.InvalidArgument, "domain identifier is required")
+	}
+	domain, err := rs.inventoryManager.GetNVLDomain(ctx, identifier.Identifier{ExternalID: req.GetId()})
+	if err != nil {
+		return nil, err
+	}
+	racks, err := rs.inventoryManager.GetRacksForNVLDomain(ctx, identifier.Identifier{ID: domain.ID()}, req.GetWithComponents())
+	if err != nil {
+		return nil, err
+	}
+	return &pb.GetNVLinkDomainResponse{Domain: protobuf.NVLinkDomainFromInventory(domain, racks)}, nil
+}
+
+// GetListOfNVLinkDomains retrieves paginated domain inventory.
+func (rs *FlowServerImpl) GetListOfNVLinkDomains(ctx context.Context, req *pb.GetListOfNVLinkDomainsRequest) (*pb.GetListOfNVLinkDomainsResponse, error) {
+	direction := "ASC"
+	switch req.GetOrderBy() {
+	case "", "NAME_ASC":
+	case "NAME_DESC":
+		direction = "DESC"
+	default:
+		return nil, status.Error(codes.InvalidArgument, "order_by must be NAME_ASC or NAME_DESC")
+	}
+	page := protobuf.PaginationFrom(req.GetPagination())
+	if err := page.Validate(); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	info := dbquery.StringQueryInfo{}
+	if req.GetInfo() != nil {
+		info = *protobuf.StringQueryInfoFrom(req.GetInfo())
+	}
+	rows, total, err := rs.inventoryManager.GetListOfNVLDomains(ctx, info, page, nvldomain.ListOptions{ExternalOnly: true, Descending: direction == "DESC"})
+	if err != nil {
+		return nil, err
+	}
+	domains := make([]*pb.NVLinkDomain, 0, len(rows))
+	domainIDs := make([]uuid.UUID, 0, len(rows))
+	for _, domain := range rows {
+		domainIDs = append(domainIDs, domain.ID())
+	}
+	members, err := rs.inventoryManager.GetRacksForNVLDomains(ctx, domainIDs, req.GetWithComponents())
+	if err != nil {
+		return nil, err
+	}
+	for _, domain := range rows {
+		domains = append(domains, protobuf.NVLinkDomainFromInventory(domain, members[domain.ID()]))
+	}
+	return &pb.GetListOfNVLinkDomainsResponse{Domains: domains, Total: total}, nil
 }
 
 func externalRackIdentifier(rawID string) identifier.Identifier {
@@ -622,6 +676,7 @@ func (rs *FlowServerImpl) GetListOfRacks(
 		pg,
 		orderBy,
 		req.GetWithComponents(),
+		req.GetWithExternalIdOnly(),
 	)
 	if err != nil {
 		return nil, err
@@ -743,6 +798,7 @@ func (rs *FlowServerImpl) GetRacksForNVLDomain(
 	racks, err := rs.inventoryManager.GetRacksForNVLDomain(
 		ctx,
 		*protobuf.IdentifierFrom(req.GetNvlDomainIdentifier()),
+		true,
 	)
 
 	results := make([]*pb.Rack, 0, len(racks))

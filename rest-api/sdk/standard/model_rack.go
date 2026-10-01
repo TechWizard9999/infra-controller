@@ -38,7 +38,7 @@ type Rack struct {
 	Description *string `json:"description,omitempty"`
 	// Operability phase aggregated from tray operationStatus values.
 	OperationStatus string `json:"operationStatus"`
-	// IDs of the NVLink Domains containing this Rack. Empty when the Rack is not assigned to an NVLink Domain.
+	// Domain external IDs (rack group IDs) containing this Rack. Empty when no rack-group Domain is assigned.
 	NvLinkDomainIds []string `json:"nvLinkDomainIds"`
 	// Physical or logical location of the Rack
 	Location *RackLocation `json:"location,omitempty"`
