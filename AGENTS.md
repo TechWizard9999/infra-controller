@@ -223,6 +223,11 @@ Agents may carry out user-requested work throughout the repository under the
 applicable guidelines. Agents may not change any `AGENTS.md` file or
 `STYLE_GUIDE.md` unless the user specifically requests changes to those files.
 
+### Git and PR Practices
+
+- **Always create a fresh branch from `main` (or the target base branch) when starting work on a new issue or PR.** Do not reuse existing branches that may contain unrelated commits. This prevents accidentally including out-of-scope changes in the PR.
+- Verify `git status` and `git log --oneline -5` before committing to confirm only intended changes are present.
+
 ## Coding Conventions
 
 Follow the shared [Engineering Guidelines](CONTRIBUTING.md#engineering-guidelines)
