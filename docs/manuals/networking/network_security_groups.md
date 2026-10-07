@@ -278,6 +278,8 @@ This ordering gives the operator a reliable place to:
   contradicts an operator override, because the override is evaluated
   first and decides the packet.
 
+> **Warning:** Override rules are evaluated statelessly. A one-way `Permit` override will not allow return traffic; you must write the matching opposite-direction rule manually.
+
 Each entry follows the same JSON / TOML structure as a tenant rule. A
 worked example:
 
@@ -344,6 +346,13 @@ worth knowing before designing rule sets:
 - **Updates require version-token agreement.** An NSG update takes the
   NSG's `version` and fails if it has been concurrently modified. This is
   the standard NICo optimistic-concurrency pattern.
+- **`policy_overrides` are always stateless.** Unlike tenant NSGs, operator
+  override rules never participate in connection tracking, even when
+  `stateful_acls_enabled = true`. Every permit override that expects a
+  reply must include an explicit opposite-direction rule (with the port
+  field on the correct side — e.g., an Ingress permit to `dst_port=6443`
+  needs an Egress permit with `src_port=6443`). No validation warns about
+  missing return legs.
 
 ---
 
@@ -429,3 +438,4 @@ For a given tenant configuration, confirm:
 | NSG rule change made, but `configs_synced.ethernet` / instance `Ready` never reacted | Expected: NSG changes do not feed `configs_synced`. Track rollout via `networkSecurityGroupPropagationDetails` instead |
 | NSG propagation status stuck `Synchronizing` (`unpropagatedInstanceIds` non-empty) | DPUs on the listed instances have not yet applied the current NSG version; check DPU health and the per-interface config push |
 | NSG propagation status `Error` | A DPU rejected the rule set (for example, expanded size over the DPU ceiling); inspect the propagation `details` string |
+| One-way override permit works but connection hangs | `policy_overrides` are stateless; add explicit return-leg rule in opposite direction |
