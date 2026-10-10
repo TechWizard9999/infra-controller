@@ -535,9 +535,7 @@ async fn test_preingestion_time_sync_reset_accepts_paused_power_state_for_dpu(
         .actions_since(&timepoint)
         .for_host(&dpu_ip.to_string());
     assert!(
-        !actions
-            .iter()
-            .any(|action| *action == RedfishSimAction::Power(SystemPowerControl::On)),
+        !actions.contains(&RedfishSimAction::Power(SystemPowerControl::On)),
         "host must not power on while the BMC reset is still in progress"
     );
 
@@ -632,9 +630,7 @@ async fn test_preingestion_time_sync_reset_rejects_paused_power_state_for_non_dp
         .actions_since(&timepoint)
         .for_host(&non_dpu_ip.to_string());
     assert!(
-        actions
-            .iter()
-            .any(|action| *action == RedfishSimAction::Power(SystemPowerControl::ForceOff)),
+        actions.contains(&RedfishSimAction::Power(SystemPowerControl::ForceOff)),
         "recovery should request power-off before checking the resulting state"
     );
     assert!(
