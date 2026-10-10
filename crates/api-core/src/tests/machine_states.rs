@@ -1356,8 +1356,6 @@ async fn test_dell_boss_initial_discovery_skips_lockdown_states(pool: sqlx::PgPo
 #[crate::sqlx_test]
 async fn test_dell_boss_deprovision_lockhost_honors_disable_lockdown(pool: sqlx::PgPool) {
     let env = create_test_env(pool).await;
-    env.redfish_sim
-        .set_boss_controller_id(Some("RAID.Slot.1".to_string()));
 
     for disable_lockdown in [false, true] {
         let mut expected_machine_data = ExpectedMachineData::default();
@@ -1370,6 +1368,9 @@ async fn test_dell_boss_deprovision_lockhost_honors_disable_lockdown(pool: sqlx:
         )
         .await;
 
+        // BOSS cleanup unlocks the host before reaching LockHost.
+        env.redfish_sim
+            .set_lockdown(libredfish::EnabledDisabled::Disabled);
         let platform_action_count = env.redfish_sim.platform_actions().len();
         let enabled_lockdown_count = env
             .redfish_sim
@@ -1435,19 +1436,16 @@ async fn test_dell_boss_deprovision_lockhost_honors_disable_lockdown(pool: sqlx:
         let mut txn = env.db_txn().await;
         let host = mh.host().db_machine(&mut txn).await;
         assert!(
-            !matches!(
+            matches!(
                 host.current_state(),
-                ManagedHostState::WaitingForCleanup {
-                    cleanup_state: CleanupState::CreateBossVolume {
-                        create_boss_volume_context: CreateBossVolumeContext {
-                            create_boss_volume_state: CreateBossVolumeState::LockHost,
-                            ..
-                        }
-                    },
-                    cleanup_context: CleanupContext::Deprovision,
+                ManagedHostState::BomValidating {
+                    bom_validating_state: BomValidating::UpdatingInventory(BomValidatingContext {
+                        machine_validation_context: Some(MachineValidationContext::Cleanup),
+                        ..
+                    }),
                 }
             ),
-            "LockHost should advance after applying the lockdown policy",
+            "LockHost should advance to cleanup inventory validation after applying the lockdown policy",
         );
     }
 }
