@@ -34,12 +34,17 @@ use rpc::forge::{ManagedHostResetListRequest, ManagedHostResetRequest, UpdateIni
 use tokio::time::timeout;
 use tonic::{Code, Request};
 
-use crate::tests::common::api_fixtures::test_managed_host::TestManagedHost;
+use crate::tests::common::api_fixtures::host::ManagedHostConfig;
+use crate::tests::common::api_fixtures::site_explorer::new_dpu_in_network_install;
+use crate::tests::common::api_fixtures::test_managed_host::{
+    TestManagedHost, TestPredictedManagedHost,
+};
 use crate::tests::common::api_fixtures::{
     TestEnv, TestEnvOverrides, create_managed_host, create_managed_host_with_dpf,
     create_managed_host_with_dpf_multi, create_test_env, create_test_env_with_overrides,
     get_config, network_configured_with_health,
 };
+use model::machine::{FailureCause, FailureDetails, FailureSource};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -883,4 +888,97 @@ async fn reset_retains_instance_until_every_dpu_acknowledges_admin(pool: sqlx::P
             .await;
         }
     }
+}
+
+/// A predicted host in Failed/DpfProvisioning with dpf.used_for_ingestion=true
+/// and the HostUpdateInProgress alert can be reset.
+#[crate::sqlx_test]
+async fn reset_set_accepts_predicted_host_after_dpf_failure(pool: sqlx::PgPool) {
+    let env = dpf_test_env(pool).await;
+    // Create a predicted host (not yet discovered to stable host ID)
+    let config = ManagedHostConfig::default();
+    let predicted_host = new_dpu_in_network_install(&env, config)
+        .await
+        .expect("predicted host creation failed");
+    let predicted_host_id: MachineId = predicted_host.id.into();
+
+    // Park the predicted host in Failed/DpfProvisioning with dpf.used_for_ingestion=true
+    env.run_machine_state_controller_iteration_until_state_matches(
+        &predicted_host_id,
+        1,
+        ManagedHostState::Failed {
+            details: FailureDetails {
+                cause: FailureCause::DpfProvisioning {
+                    err: "test failure".to_string(),
+                },
+                failed_at: chrono::Utc::now(),
+                source: FailureSource::DpfOperator,
+            },
+            machine_id: predicted_host_id,
+            retry_count: 0,
+        },
+    )
+    .await;
+
+    // Apply the required HostUpdateInProgress health alert
+    predicted_host.mark_machine_for_updates().await;
+
+    // Reset should now be accepted for the predicted host
+    env.api
+        .trigger_managed_host_reset(reset_request(predicted_host_id, Mode::Set))
+        .await
+        .unwrap();
+
+    // Verify the reset request is persisted with started_at: None
+    let mut txn = env.db_txn().await;
+    let request = predicted_host
+        .host()
+        .db_machine(&mut txn)
+        .await
+        .reset_requested
+        .expect("the reset request should persist on the host row");
+    assert_eq!(request.initiator, UpdateInitiator::AdminCli.as_str_name());
+    assert!(request.started_at.is_none(), "a fresh request is unstarted");
+
+    // Verify it's listed by reset list
+    let listed = env
+        .api
+        .list_managed_hosts_waiting_for_reset(Request::new(ManagedHostResetListRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.hosts.len(), 1);
+    assert_eq!(listed.hosts[0].id, Some(predicted_host_id));
+    assert_eq!(
+        listed.hosts[0].initiator,
+        UpdateInitiator::AdminCli.as_str_name()
+    );
+    assert!(listed.hosts[0].requested_at.is_some());
+    assert!(
+        listed.hosts[0].started_at.is_none(),
+        "the operator reads an absent Started At as 'the controller has not picked this up'"
+    );
+    drop(txn);
+
+    // Run controller iteration - it should pick up the reset and stamp started_at
+    env.run_machine_state_controller_iteration_until_state_matches(
+        &predicted_host_id,
+        3,
+        ManagedHostState::Reset {
+            reset_state: ResetState::DeletingCrs,
+        },
+    )
+    .await;
+
+    let mut txn = env.db_txn().await;
+    let snapshot = predicted_host.snapshot(&mut txn).await;
+    assert!(
+        snapshot
+            .host_snapshot
+            .reset_requested
+            .as_ref()
+            .unwrap()
+            .started_at
+            .is_some()
+    );
 }

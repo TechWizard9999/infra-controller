@@ -75,11 +75,7 @@ async fn apply_health_report(
                 )));
             }
         }
-        _ => {
-            return Err(CarbideCliError::GenericError(format!(
-                "Invalid machine ID for reprovisioning, only Hosts and DPUs are supported: {id}"
-            )));
-        }
+        MachineType::PredictedHost => Some(id),
     };
 
     // Check host must not already have a host-update health report entry
