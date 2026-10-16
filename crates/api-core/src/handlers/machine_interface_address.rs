@@ -299,8 +299,12 @@ fn emit_preallocation_error(
     result
 }
 
-/// Assign one address family, rejecting segment moves that would strand a retained
-/// sibling-family allocation. A rejected request leaves allocations and interface metadata unchanged.
+/// Assign a static IP address to a machine interface.
+///
+/// Changing IPv4 keeps existing IPv6 addresses, and vice versa. If the new
+/// address moves the interface to another network segment, those retained
+/// addresses must also belong to that segment. Otherwise, reject the request
+/// without changing any addresses or interface settings.
 pub(crate) async fn assign_static_address(
     api: &Api,
     request: Request<rpc::AssignStaticAddressRequest>,
