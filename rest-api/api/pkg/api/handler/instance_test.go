@@ -8030,6 +8030,13 @@ func TestUpdateInstanceHandler_Handle(t *testing.T) {
 				respCode:                         http.StatusOK,
 				expectedRespNVLinkInterfaceCount: cutil.GetPtr(0),
 				ethInterfacesToDelete:            []cdbm.Interface{*deletingEthIfcForEmptyNVLinkUpdate},
+				beforeHandle: func(t *testing.T) {
+					originalClient := scp.IDClientMap[st2.ID.String()]
+					scp.IDClientMap[st2.ID.String()] = tsc
+					t.Cleanup(func() {
+						scp.IDClientMap[st2.ID.String()] = originalClient
+					})
+				},
 				afterHandle: func(t *testing.T) {
 					deletingInterface, err := ifcDAO.GetByID(ctx, nil, deletingEthIfcForEmptyNVLinkUpdate.ID, nil)
 					require.NoError(t, err)
