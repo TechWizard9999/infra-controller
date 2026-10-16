@@ -28,7 +28,7 @@ use carbide_network::virtualization::VpcVirtualizationType;
 use carbide_secrets::credentials::{BgpCredentialType, CredentialKey, Credentials};
 use carbide_utils::arch::CpuArchitecture;
 use carbide_uuid::instance::InstanceId;
-use carbide_uuid::machine::{DpuMachineId, HostOrDpuId, MachineId, MachineIdSubtype};
+use carbide_uuid::machine::{DpuMachineId, MachineId, MachineIdSubtype};
 use db::machine::{AdminNetworkChangeNotPending, ExtensionServiceObservationNotCurrent};
 use db::vpc_prefix::VpcId;
 use db::{
@@ -1776,8 +1776,8 @@ pub(crate) async fn trigger_dpu_reprovisioning(
         }
         Mode::Restart => {
             // Restart case.
-            // Restart is valid only for host_id (including predicted hosts).
-            if !matches!(machine_id.host_or_dpu_id(), HostOrDpuId::Host(_)) {
+            // Restart is valid only for host_id.
+            if !machine_id.machine_type().is_host() {
                 return Err(CarbideError::InvalidArgument("A restart has to be triggered for all DPUs together. only host_id is accepted for restart operation".to_string()).into());
             }
 

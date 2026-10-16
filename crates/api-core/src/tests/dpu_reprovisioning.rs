@@ -20,8 +20,7 @@ use std::collections::HashMap;
 use carbide_machine_controller::handler::MachineStateHandlerBuilder;
 use carbide_redfish::libredfish::test_support::RedfishSimAction;
 use carbide_uuid::machine::{
-    DpuMachineId, HostMachineIdSubtypeTrait, MachineId, MachineIdSource, MachineIdSubtypeTrait,
-    MachineType, PredictedHostMachineId,
+    DpuMachineId, HostMachineIdSubtypeTrait, MachineId, MachineIdSubtypeTrait,
 };
 use chrono::Utc;
 use common::api_fixtures::{
@@ -47,9 +46,7 @@ use crate::tests::common::api_fixtures::dpu::create_dpu_machine_in_waiting_for_n
 use crate::tests::common::api_fixtures::instance::TestInstance;
 use crate::tests::common::api_fixtures::rpc_instance::RpcInstance;
 use crate::tests::common::api_fixtures::test_machine::TestMachineInterface;
-use crate::tests::common::api_fixtures::test_managed_host::{
-    TestAnyManagedHost, TestPredictedManagedHost,
-};
+use crate::tests::common::api_fixtures::test_managed_host::TestAnyManagedHost;
 use crate::tests::common::api_fixtures::{
     TestEnv, TestMachine, TestManagedHost, create_managed_host, forge_agent_control,
     update_time_params,
@@ -2247,65 +2244,6 @@ async fn test_dpu_for_reprovisioning_cannot_restart_if_not_started(pool: sqlx::P
             assert!(matches!(e.code(), tonic::Code::InvalidArgument));
         }
     }
-}
-
-/// Restart updates an existing DPU request even before the host has its stable identity.
-#[crate::sqlx_test]
-async fn restart_accepts_predicted_host(pool: sqlx::PgPool) {
-    let env = create_test_env(pool).await;
-    let managed_host = create_managed_host(&env).await;
-    let predicted_id: PredictedHostMachineId = MachineId::new(
-        MachineIdSource::ProductBoardChassisSerial,
-        [0xAD; 32],
-        MachineType::PredictedHost,
-    )
-    .try_into()
-    .unwrap();
-    let mut txn = env.db_txn().await;
-    let renamed = sqlx::query("UPDATE machines SET id = $1 WHERE id = $2")
-        .bind(predicted_id)
-        .bind(managed_host.id)
-        .execute(&mut *txn)
-        .await
-        .unwrap();
-    assert_eq!(renamed.rows_affected(), 1);
-    let predicted_host = TestPredictedManagedHost {
-        id: predicted_id,
-        dpu_ids: managed_host.dpu_ids,
-        api: env.api.clone(),
-    };
-    let dpu_id = predicted_host.dpu().id;
-    db::machine::trigger_dpu_reprovisioning_request(&dpu_id, &mut txn, "AdminCli", false)
-        .await
-        .unwrap();
-    let started_at = Utc::now() - chrono::Duration::minutes(1);
-    db::machine::update_dpu_reprovision_explicit_start_time(&dpu_id, started_at, &mut txn)
-        .await
-        .unwrap();
-    let before = predicted_host
-        .dpu()
-        .db_machine(&mut txn)
-        .await
-        .reprovision_requested
-        .unwrap();
-    txn.commit().await.unwrap();
-    predicted_host.mark_machine_for_updates().await;
-
-    predicted_host
-        .host()
-        .trigger_dpu_reprovisioning(Mode::Restart, true)
-        .await;
-
-    let mut txn = env.db_txn().await;
-    let after = predicted_host
-        .dpu()
-        .db_machine(&mut txn)
-        .await
-        .reprovision_requested
-        .unwrap();
-    assert!(after.restart_reprovision_requested_at > before.restart_reprovision_requested_at);
-    assert_eq!(after.started_at, Some(started_at));
-    assert!(after.update_firmware);
 }
 
 impl<ID: HostMachineIdSubtypeTrait> TestAnyManagedHost<ID> {
