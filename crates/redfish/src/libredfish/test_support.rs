@@ -445,6 +445,8 @@ impl RedfishSim {
     }
 
     /// Make powered-off hosts report `Paused`, matching BlueField-3.
+    /// `On` leaves this state unchanged, modeling a DPU stuck in the UEFI shell;
+    /// a restart is required to boot again.
     pub fn set_paused_when_off(&self, paused: bool) {
         self.state.lock().unwrap().paused_when_off = paused;
     }
@@ -842,8 +844,14 @@ impl Redfish for RedfishSimClient {
                     .push(RedfishSimAction::PowerFailed(action));
                 return Err(RedfishError::GenericError { error });
             }
+            let paused_when_off = state.paused_when_off;
             let host_state = state.hosts.get_mut(&self._host).unwrap();
-            host_state.power = power_state;
+            if !(paused_when_off
+                && host_state.power == PowerState::Off
+                && action == SystemPowerControl::On)
+            {
+                host_state.power = power_state;
+            }
             host_state.actions.push(RedfishSimAction::Power(action));
             Ok(())
         })

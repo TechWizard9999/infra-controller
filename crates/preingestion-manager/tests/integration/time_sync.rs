@@ -470,9 +470,10 @@ async fn test_preingestion_time_sync_reset_flow(
     Ok(())
 }
 
-/// A BlueField-3 reports stable StandbyOffline as Paused after powering off.
-/// The no-NTP recovery waits for the BMC reset, powers the DPU back on, and
-/// completes the time-sync recovery.
+/// A BlueField-3 can report Paused after ForceOff.
+/// A DPU in the UEFI shell also reports Paused, and On does not restart boot.
+/// The no-NTP recovery waits for the BMC reset, force-restarts the paused DPU,
+/// and completes the time-sync recovery.
 #[sqlx_test]
 async fn test_preingestion_time_sync_reset_accepts_paused_power_state_for_dpu(
     pool: PgPool,
@@ -535,11 +536,36 @@ async fn test_preingestion_time_sync_reset_accepts_paused_power_state_for_dpu(
         .actions_since(&timepoint)
         .for_host(&dpu_ip.to_string());
     assert!(
-        !actions.contains(&RedfishSimAction::Power(SystemPowerControl::On)),
+        !actions.iter().any(|action| matches!(
+            action,
+            RedfishSimAction::Power(SystemPowerControl::On | SystemPowerControl::ForceRestart)
+        )),
         "host must not power on while the BMC reset is still in progress"
     );
 
-    // Once the reset task query succeeds, power the DPU on and advance the phase.
+    // A failed restart must leave recovery retryable, not advance past Paused.
+    redfish_sim.fail_next_power_action(
+        SystemPowerControl::ForceRestart,
+        "transient restart failure",
+    );
+    mgr.run_single_iteration().await?;
+    assert!(matches!(
+        preingestion_state(&pool, dpu_ip).await?,
+        PreingestionState::TimeSyncReset {
+            phase: TimeSyncResetPhase::BMCWasReset,
+            ..
+        }
+    ));
+    assert!(
+        redfish_sim
+            .actions_since(&timepoint)
+            .for_host(&dpu_ip.to_string())
+            .contains(&RedfishSimAction::PowerFailed(
+                SystemPowerControl::ForceRestart
+            ))
+    );
+
+    // Retry On, then restart the still-paused DPU to resume boot.
     mgr.run_single_iteration().await?;
     let state = preingestion_state(&pool, dpu_ip).await?;
     assert!(matches!(
@@ -564,7 +590,11 @@ async fn test_preingestion_time_sync_reset_accepts_paused_power_state_for_dpu(
         .iter()
         .position(|action| *action == RedfishSimAction::Power(SystemPowerControl::On))
         .expect("DPU should be powered on after the BMC reset is ready");
-    assert!(power_off < bmc_reset && bmc_reset < power_on);
+    let restart = actions
+        .iter()
+        .position(|action| *action == RedfishSimAction::Power(SystemPowerControl::ForceRestart))
+        .expect("paused DPU should be restarted after the BMC reset is ready");
+    assert!(power_off < bmc_reset && bmc_reset < power_on && power_on < restart);
 
     let mut txn = pool.begin().await?;
     db::explored_endpoints::pregestion_hostboot_time_test(dpu_ip, &mut txn).await?;
@@ -636,7 +666,10 @@ async fn test_preingestion_time_sync_reset_rejects_paused_power_state_for_non_dp
     assert!(
         actions.iter().all(|action| !matches!(
             action,
-            RedfishSimAction::BmcReset(_) | RedfishSimAction::Power(SystemPowerControl::On)
+            RedfishSimAction::BmcReset(_)
+                | RedfishSimAction::Power(
+                    SystemPowerControl::On | SystemPowerControl::ForceRestart
+                )
         )),
         "a non-DPU reporting Paused must not be reset or powered on"
     );
