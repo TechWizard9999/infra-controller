@@ -28,7 +28,7 @@ use carbide_test_harness::prelude::*;
 use carbide_test_harness::test_support::fixture_config::{
     DpuConfigExt as _, FixtureDefault as _, ManagedHostConfigExt as _,
 };
-use carbide_uuid::machine::{DpuMachineId, MachineId};
+use carbide_uuid::machine::{DpuMachineId, HostMachineId, MachineId, StableHostMachineId};
 use carbide_uuid::rack::{RackId, RackProfileId};
 use component_manager::{MachineLocationObservation, TestMachineInfoProvider};
 use db::ObjectFilter;
@@ -36,6 +36,7 @@ use mac_address::MacAddress;
 use model::expected_machine::{ExpectedMachine, ExpectedMachineData, HostDpuPolicy};
 use model::expected_rack::ExpectedRack;
 use model::machine::machine_search_config::MachineSearchConfig;
+use model::machine_boot_interface::{MachineBootInterface, MachineBootInterfaceTarget};
 use model::rack::RackConfig;
 use model::rack_type::{RackProfile, RackProfileConfig};
 use model::site_explorer::{EndpointExplorationReport, ExploredDpu, ExploredManagedHost};
@@ -177,6 +178,7 @@ async fn test_machine_creator_reconciles_machine_location_without_overwriting_ex
     let creator = machine_creator_with_info_provider(&env, provider.clone());
     let rack_id = RackId::new(uuid::Uuid::new_v4().to_string());
     let expected_rack = ExpectedRack {
+        rack_group_id: None,
         rack_id: rack_id.clone(),
         rack_profile_id: RackProfileId::new(TEST_MACHINE_INFO_RACK_PROFILE_ID),
         metadata: Default::default(),
@@ -265,6 +267,7 @@ async fn test_machine_creator_retries_machine_location_enrichment_after_failure(
     let creator = machine_creator_with_info_provider(&env, provider.clone());
     let rack_id = RackId::new(uuid::Uuid::new_v4().to_string());
     let expected_rack = ExpectedRack {
+        rack_group_id: None,
         rack_id: rack_id.clone(),
         rack_profile_id: RackProfileId::new(TEST_MACHINE_INFO_RACK_PROFILE_ID),
         metadata: Default::default(),
@@ -379,6 +382,7 @@ async fn test_site_explorer_retries_machine_location_after_request_deadline(
         txn.as_mut(),
         &ExpectedRack {
             rack_id,
+            rack_group_id: None,
             rack_profile_id: RackProfileId::new(TEST_MACHINE_INFO_RACK_PROFILE_ID),
             metadata: Default::default(),
         },
@@ -625,6 +629,112 @@ async fn explored_host_fixture(env: &Env, managed_host: &ManagedHostConfig) -> E
 }
 
 #[sqlx_test]
+async fn test_zero_dpu_rediscovery_after_stable_registration(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let test_harness = TestHarness::builder(pool.clone()).build().await;
+    let domain = test_harness.test_domain().await;
+    let network_controller = test_harness.network_controller();
+    let underlay_segment = network_controller.create_underlay_segment(&domain).await;
+    let host_inband_segment = network_controller.create_host_inband_segment(&domain).await;
+    let env = Env {
+        pool,
+        underlay_segment,
+        test_harness,
+    };
+    let creator = machine_creator(&env, machine_creator_config());
+    let mock_host = ManagedHostConfig {
+        dpus: vec![],
+        expected_machine_data: Some(ExpectedMachineData {
+            dpu_policy: HostDpuPolicy::Ignore,
+            ..Default::default()
+        }),
+        ..ManagedHostConfig::default()
+    };
+    let inband_mac = mock_host.dhcp_mac_address();
+    let expected = expected_machine(&mock_host);
+    let mut fixture = explored_host_fixture(&env, &mock_host).await;
+    assert!(
+        creator
+            .create_managed_host(
+                &fixture.host,
+                &mut fixture.host_report,
+                Some(&expected),
+                &env.pool,
+            )
+            .await?
+    );
+    let dhcp_response = env
+        .api()
+        .discover_dhcp(
+            rpc::forge::DhcpDiscovery::builder(inband_mac, host_inband_segment.relay_address)
+                .vendor_string("Bluefield")
+                .tonic_request(),
+        )
+        .await?
+        .into_inner();
+    let predicted_id = dhcp_response.machine_id.expect("host prediction promoted");
+    let stable_id = StableHostMachineId::try_from(model::machine::machine_id::from_hardware_info(
+        &model::hardware_info::HardwareInfo::from(&mock_host),
+    )?)?;
+    let mut txn = env.pool.begin().await?;
+    db::machine::try_sync_stable_id_with_current_machine_id_for_host(
+        txn.as_mut(),
+        Some(predicted_id.try_into()?),
+        &stable_id,
+    )
+    .await?;
+    assert_eq!(
+        db::machine_topology::find_machine_id_by_bmc_mac::<HostMachineId>(
+            txn.as_mut(),
+            mock_host.bmc_mac_address,
+        )
+        .await?,
+        Some(stable_id.into()),
+    );
+    // Model an ingested host without boot metadata so rediscovery must persist reconciliation.
+    sqlx::query("DELETE FROM machine_boot_interfaces WHERE machine_id = $1")
+        .bind(stable_id)
+        .execute(txn.as_mut())
+        .await?;
+    txn.commit().await?;
+
+    assert!(
+        !creator
+            .create_managed_host(
+                &fixture.host,
+                &mut fixture.host_report,
+                Some(&expected),
+                &env.pool,
+            )
+            .await?,
+        "rediscovery must reuse the stable host",
+    );
+    let desired = db::machine_desired_boot_interface::get(&env.pool, &stable_id)
+        .await?
+        .expect("rediscovery should initialize the stable host's boot target");
+    assert_eq!(
+        desired.value,
+        MachineBootInterfaceTarget::Pair(MachineBootInterface {
+            mac_address: inband_mac,
+            interface_id: "NIC.Embedded.1-1-1".to_string(),
+        }),
+    );
+    let machines = db::machine::find(
+        &env.pool,
+        ObjectFilter::<MachineId>::All,
+        MachineSearchConfig {
+            include_predicted_host: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert_eq!(machines.len(), 1);
+    assert_eq!(machines[0].id, stable_id.into());
+    Ok(())
+}
+
+#[sqlx_test]
 async fn test_mi_attach_dpu_if_mi_exists_during_machine_creation(
     pool: PgPool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -808,6 +918,138 @@ async fn test_dpu_interface_predictions_apply_when_dhcp_follows_multi_dpu_machin
     }
     txn.commit().await?;
 
+    Ok(())
+}
+
+/// `create_machines` must skip a host whose BMCs all belong to machines unless
+/// the host was explored this run or a BMC lost its machine. The DPU OOB
+/// interface is the witness: only the per-host steady-state transaction
+/// re-links it.
+#[sqlx_test]
+async fn test_site_explorer_skips_ingested_hosts_not_explored_this_run(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = Env::new(pool).await;
+    let hosts = [ManagedHostConfig::default(), ManagedHostConfig::default()].map(|host| {
+        let serial_number = host.serial.clone();
+        host.with_expected_machine_data(ExpectedMachineData {
+            serial_number,
+            ..Default::default()
+        })
+    });
+    let [host_a, host_b] = &hosts;
+    let oob_mac_a = host_a.get_and_assert_single_dpu().oob_mac_address;
+    let oob_mac_b = host_b.get_and_assert_single_dpu().oob_mac_address;
+
+    let mut fixtures = Vec::new();
+    for host in &hosts {
+        // The OOB interface exists before creation, so creation links it.
+        let dpu = host.get_and_assert_single_dpu();
+        dhcp_discover_dpu_oob_iface(env.api(), env.underlay_segment, dpu.oob_mac_address).await;
+        fixtures.push(explored_host_fixture(&env, host).await);
+    }
+
+    let mut endpoints = Vec::new();
+    let mut txn = env.pool.begin().await?;
+    for (host, fixture) in hosts.iter().zip(&fixtures) {
+        db::expected_machine::create(txn.as_mut(), expected_machine(host)).await?;
+        endpoints.push((fixture.host.host_bmc_ip, fixture.host_report.clone()));
+        for dpu in &fixture.host.dpus {
+            endpoints.push((dpu.bmc_ip, (*dpu.report).clone()));
+        }
+    }
+    for (ip, report) in &endpoints {
+        db::explored_endpoints::insert(*ip, report, false, txn.as_mut()).await?;
+        db::explored_endpoints::set_preingestion_complete(*ip, txn.as_mut()).await?;
+    }
+    txn.commit().await?;
+
+    // Nothing is explored unless requested, so `explored_this_run` holds
+    // exactly the requested hosts.
+    let explorer = super::env::test_site_explorer(
+        &env.test_harness,
+        SiteExplorerConfig {
+            explorations_per_run: 0,
+            create_machines: Arc::new(true.into()),
+            ..Default::default()
+        },
+    );
+    explorer.insert_endpoints(endpoints);
+
+    // Neither host has a machine yet, so both enter the transaction.
+    explorer.run_single_iteration().await?;
+    assert!(interface_machine_id(&env.pool, oob_mac_a).await?.is_some());
+    assert!(interface_machine_id(&env.pool, oob_mac_b).await?.is_some());
+
+    unlink_machine_interface(&env.pool, oob_mac_a).await?;
+    unlink_machine_interface(&env.pool, oob_mac_b).await?;
+    let host_a_bmc_ip = fixtures[0].host.host_bmc_ip;
+    let mut txn = env.pool.begin().await?;
+    db::explored_endpoints::request_exploration_for_addresses(&[host_a_bmc_ip], txn.as_mut())
+        .await?;
+    txn.commit().await?;
+
+    explorer.run_single_iteration().await?;
+    assert_eq!(
+        explorer
+            .endpoint_explorer()
+            .explore_endpoint_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| call.ip_address)
+            .collect::<Vec<_>>(),
+        vec![host_a_bmc_ip],
+        "only the requested host BMC must be explored"
+    );
+    assert!(
+        interface_machine_id(&env.pool, oob_mac_a).await?.is_some(),
+        "a host explored this run must re-enter the steady-state transaction"
+    );
+    assert!(
+        interface_machine_id(&env.pool, oob_mac_b).await?.is_none(),
+        "a host with every BMC linked to a machine and not explored this run must be skipped"
+    );
+
+    // A BMC without a machine readmits the host without an exploration.
+    unlink_machine_interface(
+        &env.pool,
+        host_b.get_and_assert_single_dpu().bmc_mac_address,
+    )
+    .await?;
+    explorer.run_single_iteration().await?;
+    assert!(
+        interface_machine_id(&env.pool, oob_mac_b).await?.is_some(),
+        "a host whose DPU BMC lost its machine must enter the transaction unexplored"
+    );
+
+    Ok(())
+}
+
+async fn interface_machine_id(
+    pool: &PgPool,
+    mac_address: MacAddress,
+) -> Result<Option<MachineId>, Box<dyn std::error::Error>> {
+    let interfaces = db::machine_interface::find_by_mac_address(pool, mac_address).await?;
+    let [interface] = interfaces.as_slice() else {
+        panic!("expected one interface for {mac_address}, got {interfaces:#?}");
+    };
+    Ok(interface.machine_id)
+}
+
+/// Detaches an interface from its machine, as if it had never been linked.
+async fn unlink_machine_interface(
+    pool: &PgPool,
+    mac_address: MacAddress,
+) -> Result<(), Box<dyn std::error::Error>> {
+    sqlx::query(
+        "UPDATE machine_interfaces
+         SET machine_id = NULL, attached_dpu_machine_id = NULL, association_type = 'None'
+         WHERE mac_address = $1",
+    )
+    .bind(mac_address)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

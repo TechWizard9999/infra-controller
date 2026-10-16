@@ -10,7 +10,6 @@ import (
 	cutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
-	stracer "github.com/NVIDIA/infra-controller/rest-api/db/pkg/tracer"
 	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -469,8 +468,6 @@ func TestInterfaceSQLDAO_Create(t *testing.T) {
 			if tc.verifyChildSpanner {
 				span := otrace.SpanFromContext(ctx)
 				assert.True(t, span.SpanContext().IsValid())
-				_, ok := ctx.Value(stracer.TracerKey).(otrace.Tracer)
-				assert.True(t, ok)
 			}
 		})
 	}
@@ -683,8 +680,6 @@ func TestInterfaceSQLDAO_GetByID(t *testing.T) {
 			if tc.verifyChildSpanner {
 				span := otrace.SpanFromContext(ctx)
 				assert.True(t, span.SpanContext().IsValid())
-				_, ok := ctx.Value(stracer.TracerKey).(otrace.Tracer)
-				assert.True(t, ok)
 			}
 		})
 	}
@@ -1079,8 +1074,6 @@ func TestInterfaceSQLDAO_GetAll(t *testing.T) {
 			if tc.verifyChildSpanner {
 				span := otrace.SpanFromContext(ctx)
 				assert.True(t, span.SpanContext().IsValid())
-				_, ok := ctx.Value(stracer.TracerKey).(otrace.Tracer)
-				assert.True(t, ok)
 			}
 		})
 	}
@@ -1266,8 +1259,6 @@ func TestInterfaceSQLDAO_Clear(t *testing.T) {
 			if tc.verifyChildSpanner {
 				span := otrace.SpanFromContext(ctx)
 				assert.True(t, span.SpanContext().IsValid())
-				_, ok := ctx.Value(stracer.TracerKey).(otrace.Tracer)
-				assert.True(t, ok)
 			}
 		})
 	}
@@ -1659,12 +1650,43 @@ func TestInterfaceSQLDAO_Update(t *testing.T) {
 			if tc.verifyChildSpanner {
 				span := otrace.SpanFromContext(ctx)
 				assert.True(t, span.SpanContext().IsValid())
-				_, ok := ctx.Value(stracer.TracerKey).(otrace.Tracer)
-				assert.True(t, ok)
 			}
 		})
 	}
-
+	prefixTests := []struct {
+		name     string
+		prefixes []string
+		want     []string
+		wantErr  string
+	}{
+		{name: "replace", prefixes: []string{"192.0.2.0/24", "2001:db8::/64"}, want: []string{"192.0.2.0/24", "2001:db8::/64"}},
+		{name: "omit", want: []string{"2001:db8:1::/64"}},
+		{name: "clear", prefixes: []string{}, want: []string{}},
+		{name: "reject malformed prefix", prefixes: []string{"2001:db8:2::/64", "not-a-prefix"}, want: []string{"2001:db8:1::/64"}, wantErr: "invalid Interface IP prefix"},
+	}
+	for _, tt := range prefixTests {
+		t.Run("IP prefixes/"+tt.name, func(t *testing.T) {
+			_, err := ifcd.Update(ctx, nil, InterfaceUpdateInput{
+				InterfaceID: ifc.ID,
+				IPPrefixes:  []string{"2001:db8:1::/64"},
+			})
+			require.NoError(t, err)
+			// Updating `Status` forces a write even when prefixes are omitted.
+			_, err = ifcd.Update(ctx, nil, InterfaceUpdateInput{
+				InterfaceID: ifc.ID,
+				IPPrefixes:  tt.prefixes,
+				Status:      cutil.GetPtr(InterfaceStatusReady),
+			})
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+			persisted, err := ifcd.GetByID(ctx, nil, ifc.ID, nil)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, persisted.IPPrefixes)
+		})
+	}
 }
 
 func TestInterfaceSQLDAO_Delete(t *testing.T) {
@@ -1786,8 +1808,6 @@ func TestInterfaceSQLDAO_Delete(t *testing.T) {
 			if tc.verifyChildSpanner {
 				span := otrace.SpanFromContext(ctx)
 				assert.True(t, span.SpanContext().IsValid())
-				_, ok := ctx.Value(stracer.TracerKey).(otrace.Tracer)
-				assert.True(t, ok)
 			}
 		})
 	}
@@ -1936,8 +1956,6 @@ func TestInterfaceSQLDAO_CreateMultiple(t *testing.T) {
 			if tc.verifyChildSpanner {
 				span := otrace.SpanFromContext(ctx)
 				assert.True(t, span.SpanContext().IsValid())
-				_, ok := ctx.Value(stracer.TracerKey).(otrace.Tracer)
-				assert.True(t, ok)
 			}
 		})
 	}
@@ -2085,6 +2103,4 @@ func TestInterfaceSQLDAO_DeleteAllByInstanceIDs(t *testing.T) {
 	// Verify the active span is propagated through the call.
 	span := otrace.SpanFromContext(ctx)
 	assert.True(t, span.SpanContext().IsValid())
-	_, ok := ctx.Value(stracer.TracerKey).(otrace.Tracer)
-	assert.True(t, ok)
 }

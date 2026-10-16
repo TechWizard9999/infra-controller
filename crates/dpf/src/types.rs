@@ -29,6 +29,13 @@ use crate::crds::dpus_generated::{
     DpuStatusAgentStatus, DpuStatusOperationalConditions, DpuStatusPhase,
 };
 
+/// IPv4 route prefix lengths used to build Astra DPUDevice underlay values.
+#[derive(Debug, Clone, Copy)]
+pub struct AstraRoutePrefixes {
+    pub rail_route_prefix_len: u8,
+    pub software_plane_route_prefix_len: u8,
+}
+
 /// Async provider for BMC passwords used to create and refresh the K8s BMC
 /// secret. Implement this trait to supply credentials dynamically (e.g. from
 /// a vault or credential manager). Return
@@ -69,8 +76,13 @@ pub const DOCA_WEAVE_FLOW_CONTROLLER_SERVICE_NAME: &str = "doca-weave-flow-contr
 pub const DOCA_XPLANE_SERVICE_NAME: &str = "doca-xplane";
 /// Hash-stable legacy VF population used by default DPF flavors and SDK initialization.
 pub const DEFAULT_DPU_NUM_OF_VFS: u32 = 16;
-/// Default SF capacity reserved beyond configured NICo-managed service endpoints.
+/// Default SF capacity reserve for regular BF3 and generic BF4.
+///
+/// BF3 GB200 uses this pool for validation but emits fixed `PF_TOTAL_SF=128`; Astra derives its
+/// capacity from managed endpoints and fixed allocations instead.
 pub const DEFAULT_PF_TOTAL_SF_RESERVED: u32 = 30;
+/// Default operator-declared SF ceiling per parent PF for BF3 and generic BF4.
+pub const DEFAULT_MAX_SF_PER_PF: u32 = 126;
 // Keep direct SDK validation aligned with api-core's general BlueField provisioning bound without
 // coupling this lightweight crate to the complete API configuration model.
 pub(crate) const MAX_BLUEFIELD_VFS_PER_PF: u32 = 126;
@@ -109,12 +121,22 @@ pub struct InitDpfResourcesConfig {
     pub(crate) flavor_name: String,
     /// Service templates and configs for M4 DPUDeployment.
     /// When empty, `default_services()` is used automatically.
+    /// BF4 Astra rejects consumers of SF NADs declared in these services when
+    /// absent from the effective service chains. Namespace-qualified local
+    /// references are checked during SDK initialization.
     pub(crate) services: Vec<ServiceDefinition>,
 
     /// Number of hardware VFs provisioned per DPU PF for BF3 and generic BF4.
+    /// BF4 Astra always emits `NUM_OF_VFS=46`; this value does not shrink its topology-free static
+    /// inventory, but it still bounds VF identities in the shared intercept-bridging topology.
     pub(crate) num_of_vfs: u32,
-    /// SF capacity reserved beyond configured NICo-managed service endpoints.
-    /// Without intercept bridging, this remains the complete legacy `PF_TOTAL_SF` value.
+    /// SF capacity reserve for regular BF3 and generic BF4.
+    ///
+    /// With intercept bridging, it is added to NICo-managed service endpoints and
+    /// `additional_managed_sf`. Without intercept bridging, it is the complete legacy
+    /// `PF_TOTAL_SF` pool, and those endpoints plus `additional_managed_sf` must fit inside it. BF3
+    /// GB200 applies the same validation but emits fixed `PF_TOTAL_SF=128`. BF4 Astra ignores this
+    /// value and derives capacity from managed endpoints plus fixed allocations.
     pub(crate) pf_total_sf_reserved: u32,
     /// Managed SF capacity not represented in [`interfaces`](Self::interfaces).
     /// Added to calculated BF3/generic-BF4 capacity when intercept bridging is configured;
@@ -122,6 +144,13 @@ pub struct InitDpfResourcesConfig {
     pub(crate) additional_managed_sf: u32,
     /// NICo-managed service-VPC slots wired from HBN to dedicated OVS bridges.
     pub(crate) service_vpc_slots: crate::ServiceVpcSlots,
+    /// SFs reserved for active or terminating service-VPC interfaces (default zero).
+    /// Sharing a VPC slot does not reduce this endpoint reservation.
+    pub(crate) max_active_service_vpc_interfaces_per_dpu: u32,
+    /// Operator-declared SF ceiling per parent PF (default 126, positive when slots are enabled).
+    /// BF3/generic BF4 ignore it with zero slots; GB200 retains its fixed 128-SF ceiling.
+    /// Astra does not use this field; a ceiling does not establish physical BAR qualification.
+    pub(crate) max_sf_per_pf: u32,
     /// Enables deployment-scoped DPUServiceInterface names and node selectors.
     /// False preserves the legacy global resource naming and selector mode for
     /// BF3 (including BF3 GB200) and generic BF4. BF4 Astra requires this to be true for the
@@ -135,7 +164,7 @@ pub struct InitDpfResourcesConfig {
     /// API-core rejects a disabled value during DPF initialization while scoped
     /// ServiceInterfaces exist.
     pub(crate) deployment_scoped_service_interfaces: bool,
-    /// Optional intercept-bridging topology for BF3 and generic BF4. `Some` replaces the
+    /// Optional intercept-bridging topology for BF3 and both BF4 profiles. `Some` replaces the
     /// ordinary static PF/VF inventory and contains exactly one configured PF.
     #[builder(setter(strip_option))]
     pub(crate) intercept_bridging: Option<DpfInterceptBridging>,
@@ -173,6 +202,13 @@ pub struct BlueFieldSoftwareParams {
     pub pldm_fw_bundle: Option<BTreeMap<String, String>>,
 }
 
+impl InitDpfResourcesConfig {
+    /// Returns the platform profile selected for this initialization configuration.
+    pub fn deployment_type(&self) -> DpuDeploymentType {
+        self.deployment_type
+    }
+}
+
 impl Default for InitDpfResourcesConfig {
     fn default() -> Self {
         Self {
@@ -185,6 +221,8 @@ impl Default for InitDpfResourcesConfig {
             pf_total_sf_reserved: DEFAULT_PF_TOTAL_SF_RESERVED,
             additional_managed_sf: 0,
             service_vpc_slots: crate::ServiceVpcSlots::default(),
+            max_active_service_vpc_interfaces_per_dpu: 0,
+            max_sf_per_pf: DEFAULT_MAX_SF_PER_PF,
             deployment_scoped_service_interfaces: false,
             intercept_bridging: None,
             interfaces: Vec::new(),
@@ -197,7 +235,10 @@ impl Default for InitDpfResourcesConfig {
 }
 
 impl InitDpfResourcesConfigBuilder {
-    /// Builds an immutable configuration after validation.
+    /// Builds an immutable configuration after namespace-independent inventory and capacity validation.
+    /// SDK `initialize` and `create_initialization_objects` additionally check namespace-qualified references to SF NADs declared in `services` within their target namespace.
+    /// `initialize` checks before writing the BMC Secret. `create_initialization_objects` checks before writing provisioning resources.
+    /// Types of NADs outside this inventory or namespace are not inspected.
     pub fn build(self) -> Result<InitDpfResourcesConfig, crate::DpfError> {
         let config = self
             .assemble()
@@ -298,8 +339,9 @@ pub struct ServiceDefinition {
     pub service_daemon_set_annotations: Option<std::collections::BTreeMap<String, String>>,
     /// Optional extended resources requested by the service DaemonSet.
     pub service_daemon_set_resources: Option<BTreeMap<String, IntOrString>>,
-    /// Optional service Network Attachment Definition specification
-    pub service_nad: Option<ServiceNAD>,
+    /// Deployment-local NADs referenced by this service's interfaces.
+    /// Empty creates no NADs; each name is remapped to the deployment's suffix.
+    pub service_nads: Vec<ServiceNAD>,
 }
 
 /// Interface kind rendered into a DPUServiceInterface template.
@@ -378,7 +420,7 @@ impl DpfInterceptBridge {
     }
 }
 
-/// Deterministic, validated intercept-bridging topology shared by BF3 and generic BF4.
+/// Deterministic, validated intercept-bridging topology shared by BF3 and both BF4 profiles.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DpfInterceptBridging {
     interfaces: Vec<DpfInterceptBridge>,
@@ -679,20 +721,30 @@ impl ServiceDefinition {
 /// Desired definition of a direct, detached DPUService.
 ///
 /// This is deliberately distinct from [`ServiceDefinition`], which produces a
-/// DPUServiceTemplate/DPUServiceConfiguration pair for DPUDeployment. A
-/// detached service has no DPUDeployment, service ID, interfaces, config
-/// ports, or DPU-cluster selector.
+/// DPUServiceTemplate/DPUServiceConfiguration pair for DPUDeployment.
 #[derive(Debug, Clone)]
 pub struct DetachedDpuServiceDefinition {
     pub name: String,
     pub namespace: String,
     pub labels: BTreeMap<String, String>,
     pub helm_chart: DetachedHelmChart,
-    pub deploy_in_cluster: bool,
-    pub security_privileged: bool,
+    pub deploy_in_cluster: Option<bool>,
+    pub security: DetachedDpuServiceSecurity,
     /// Optional DaemonSet settings supplied by the feature using the SDK.
     /// Absence remains absence; the SDK does not impose placement policy.
     pub service_daemon_set: Option<DetachedServiceDaemonSet>,
+    /// Optional stable workload identity projected to the DPUService specification.
+    pub service_id: Option<String>,
+}
+
+/// Security settings for a detached DPUService managed by an SDK caller.
+///
+/// Keeping the fields together preserves the DPF security boundary and makes
+/// presence-gated capabilities explicit at the SDK boundary.
+#[derive(Debug, Clone)]
+pub struct DetachedDpuServiceSecurity {
+    pub privileged: bool,
+    pub spiffe: bool,
 }
 
 /// Caller-configurable fields on a detached DPUService's generated DaemonSet.
@@ -744,13 +796,23 @@ pub struct DpuServiceObservation {
     pub dpu_cluster_selector_present: bool,
     pub interfaces_present: bool,
     pub paused: Option<bool>,
-    pub security_privileged: Option<bool>,
+    pub security: Option<DpuServiceSecurityObservation>,
     pub service_daemon_set: Option<DpuServiceDaemonSetObservation>,
     pub service_id: Option<String>,
     pub config_ports_present: bool,
     /// Whether Kubernetes has accepted deletion and the CR is retained only
     /// while finalizers remove its dependent resources.
     pub is_deleting: bool,
+}
+
+/// Security settings observed on a live DPUService.
+///
+/// Optional privilege state preserves malformed or legacy resources, while
+/// the SPIFFE Boolean records whether its presence-gated object exists.
+#[derive(Debug, Clone)]
+pub struct DpuServiceSecurityObservation {
+    pub privileged: Option<bool>,
+    pub spiffe: bool,
 }
 
 /// SDK-owned view of the DaemonSet settings observed on a DPUService.
