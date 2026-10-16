@@ -182,23 +182,33 @@ Example tenant account detail (Ready, with active allocations):
 
 ### Accepting the Invitation (Tenant Side)
 
-The tenant admin must accept the invitation to transition the account to `Ready`. The non-interactive form sends an empty PATCH body -- note the flag-first ordering:
+The tenant admin accepts the invitation, which moves the account to `Ready`.
+
+Accepting is a tenant call, so `nicocli` has to act as the tenant. Two things decide who it acts as: the token it sends, and the org in the request path. Both have to name the tenant org.
+
+Give the tenant its own config file, and set `api.org` to the tenant org in it. Pass that file with `--config` to `nicocli login` and to every tenant command. The request then carries the tenant's token, which can act only in orgs it holds a role for. If it holds no role for the org in `api.org`, the request fails with `403 Requested organization not found in token claims`. If it holds roles in several orgs, `api.org` picks which one it acts as.
+
+Don't log in to the provider's config file. Login overwrites the provider's `auth.oidc` credentials there. A provider token in `auth.token` also outranks `auth.oidc.token`. In that case the tenant's login changes nothing that is sent.
+
+On Keycloak deployments, [Pointing `nicocli` at the Tenant Org](tenant-management-keycloak.md#pointing-nicocli-at-the-tenant-org) has the commands.
+
+To accept, send an empty PATCH body. Flags go before the account ID:
 
 ```bash
-nicocli tenant-account update --data '{}' <account-id>
+nicocli --config ~/.nico/<tenant-org>.yaml tenant-account update --data '{}' <account-id>
 ```
 
-TUI:
+Or use the TUI:
 
 ```bash
-nicocli tui
+nicocli --config ~/.nico/<tenant-org>.yaml tui
 > tenant-account update
 ```
 
-Only accounts in `Invited` status can be accepted. Attempting to update a `Ready` account returns the verified error:
+Only an account in `Invited` status can be accepted. An account that is already `Ready` returns this error:
 
 ```bash
-$ nicocli tenant-account update --data '{}' <account-id>
+$ nicocli --config ~/.nico/<tenant-org>.yaml tenant-account update --data '{}' <account-id>
 Error: API error 400: Tenant Account status is not Invited
 ```
 
@@ -862,17 +872,15 @@ In TUI mode, `instance delete` prompts for confirmation before proceeding. Delet
 
 ### Machine-Level Emergency Operations (gRPC Only)
 
-For stuck or unresponsive machines that cannot be managed through the instance API, nico-admin-cli provides direct BMC operations:
+If a machine is stuck or unresponsive, operators can use `nico-admin-cli` for
+recovery. Choose the operation that matches the problem:
 
-```bash
-# Force-reboot via BMC
-nico-admin-cli -a <core-api-url> machine reboot --machine-id="<machine-id>"
-
-# Force-delete a stuck machine (destructive -- wipes machine state)
-nico-admin-cli -a <core-api-url> machine force-delete --machine="<machine-id>"
-```
-
-See the [Machine Reboot](../playbooks/machine_reboot.md) and [Force Delete](../playbooks/force_delete.md) playbooks in the core documentation for detailed procedures.
+- To restart the machine, refer to the
+  [`machine reboot` reference](../manuals/nico-admin-cli/commands/machine/machine-reboot.md).
+- To remove its NICo records and restart discovery, follow
+  [Force Deleting and Rebuilding NICo Hosts](../playbooks/force_delete.md).
+  Force deletion does not wipe the tenant operating system or its data. The
+  playbook explains deletion consent and the optional wait for DPU confirmation.
 
 ## Tenant Lifecycle Operations
 
@@ -918,15 +926,21 @@ NICo has no first-class "disable" operation. Options:
 
 ### Tenant Teardown Sequence
 
-There is no `DELETE /tenant` endpoint -- tenant records are permanent. To fully decommission:
+There is no `DELETE /tenant` endpoint -- tenant records are permanent. For peerings
+with another tenant, arrange deletion with the Site's Provider Admin.
+
+To fully decommission:
 
 1. **Terminate all instances** -- delete every instance; each must reach `Terminated` status.
 2. **Delete all tenant network resources** -- remove VPC Prefixes or Subnets
    from every VPC, according to its `networkVirtualizationType`.
-3. **Delete all VPCs** -- remove the tenant's VPCs.
-4. **Delete all allocations** -- provider admin removes compute and network allocations.
-5. **Delete the tenant account** -- provider admin severs the link.
-6. **Revoke identity provider access** -- remove roles and optionally org membership.
+3. **Delete all VPC peerings** -- follow the
+   [peering deletion guide](../manuals/vpc/vpc_peering_management.md#deleting-vpc-peering-connections)
+   and wait for each connection to disappear.
+4. **Delete all VPCs** -- remove the tenant's VPCs.
+5. **Delete all allocations** -- provider admin removes compute and network allocations.
+6. **Delete the tenant account** -- provider admin severs the link.
+7. **Revoke identity provider access** -- remove roles and optionally org membership.
 
 After this sequence, the tenant record still exists but is inert.
 
@@ -1117,7 +1131,7 @@ Flag-first ordering -- always put flags before positional args.
 - [Quick Start Guide](../getting-started/quick-start.md), NICo deployment and Day Zero walkthrough
 - [VPC Routing Profiles](../manuals/vpc/vpc_routing_profiles.md), profile configuration and behavior
 - [VPC Network Virtualization](../manuals/vpc/vpc_network_virtualization.md), full networking architecture
-- [VPC Peering](../manuals/vpc/vpc_peering_management.md), connecting VPCs (gRPC only)
+- [VPC Peering](../manuals/vpc/vpc_peering_management.md), connecting VPCs and waiting for peering deletion
 - [NVLink Partitioning](../manuals/nvlink_partitioning.md), NVLink logical partition management
 - [Machine Reboot Playbook](../playbooks/machine_reboot.md), emergency BMC reboot procedures
 - [Force Delete Playbook](../playbooks/force_delete.md), removing stuck machines

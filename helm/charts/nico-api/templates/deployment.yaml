@@ -22,6 +22,9 @@ spec:
         kubectl.kubernetes.io/default-container: {{ include "nico-api.name" . }}
         checksum/config: {{ include "nico-api.configChecksum" . }}
     spec:
+      # Prevent Kubernetes-generated CARBIDE_API_* service variables from
+      # being interpreted as API configuration.
+      enableServiceLinks: false
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
       serviceAccountName: {{ include "nico-api.name" . }}
@@ -257,8 +260,6 @@ spec:
             - name: object-metrics
               containerPort: {{ .Values.service.perObjectStateMetrics.port }}
             {{- end }}
-            - name: profiler
-              containerPort: {{ .Values.service.profiler.port }}
           livenessProbe:
             {{- toYaml .Values.livenessProbe | nindent 12 }}
           readinessProbe:

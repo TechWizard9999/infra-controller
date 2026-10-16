@@ -493,9 +493,12 @@ for the complete Helm guidance.
 (used by `nico-bmc-proxy` and other authenticating proxies). The example
 ACL set in
 [`helm/charts/nico-bmc-proxy/files/carbide-bmc-proxy.toml`](../../../helm/charts/nico-bmc-proxy/files/carbide-bmc-proxy.toml)
-is the reference. `nico-bmc-proxy` also takes `[[class]]` tables that set how
-long it waits on a BMC for groups of requests; see
-[`crates/bmc-proxy/README.md` → `class`](../../../crates/bmc-proxy/README.md#class).
+is the reference. `nico-bmc-proxy` also takes `[[class]]` tables that group
+requests by method, path, and caller, and set how long it waits on a BMC for
+each group and how many it sends at a time, and an `[admission]` table that
+limits the requests it sends to each BMC; see
+[`crates/bmc-proxy/README.md` → `class`](../../../crates/bmc-proxy/README.md#class)
+and [`admission`](../../../crates/bmc-proxy/README.md#admission).
 
 ### DPU configuration — `[dpu_config]`
 
@@ -737,7 +740,7 @@ These don't fit any sub-section but show up in production tuning:
 |-------|---------|---------------|
 | `max_database_connections` | `1000` | Drop when running multiple `nico-api` replicas to avoid saturating Postgres `max_connections`. |
 | [`api_admission_control`](#api-admission-control--api_admission_control) | enabled | Fair per-client scheduling for gRPC and admin business requests. The nico-api chart exposes `enabled` as `apiAdmissionControl.enabled`. See the dedicated section for configuration and service overrides. |
-| `max_find_by_ids` | `100` | Increase if scripts paginate batch lookups; raise the API-side limit to match the client. |
+| `max_find_by_ids` | `100` | Maximum IDs per batch lookup and card selections per `SetMachineNicFirmwareConfig` request. Omitted card selections preserve saved entries; a supplied list must fit this limit. |
 | `compute_allocation_enforcement` | `WarnOnly` | Switch to `Enforce` once tenant compute pools are sized correctly — flips over-allocation from a warning to a refusal. |
 | `bmc_session_lockout_threshold` | `3` | Number of consecutive 401/403s from a BMC before NICo stops session-token logins for that BMC. Raise on environments with flaky BMC firmware. |
 | `bmc_max_sessions_per_caller` | `4` | Cap on outstanding Redfish sessions per calling service identity per BMC; a `GetBmcCredentials` mint past the cap revokes that caller's oldest sessions. Size to the caller's replica count plus headroom; values below 1 are treated as 1. |
@@ -1470,13 +1473,6 @@ service. To ship metrics elsewhere:
 - **OpenTelemetry Collector**: deploy an OTel collector configured with the Prometheus receiver scraping NICo services and any exporter (OTLP, Mimir, Datadog, etc.).
 - **Tempo / Jaeger** (traces): NICo emits structured logs but does not currently emit distributed traces; tracing is a roadmap item.
 - **Loki** (logs): the SSH-console sidecar pattern (`nico-ssh-console-rs.lokiLogCollector.enabled`) is the only built-in log-shipper. For other services, use a cluster-wide Promtail / Vector / OTel-collector DaemonSet against pod stdout.
-
-### Profiler endpoint
-
-`nico-api` listens on port `1081` for pprof-style runtime profiling. The
-endpoint is disabled by default in production builds; enable via
-`nico-api.extraEnv` (`RUST_PROFILER=1`) and protect with a NetworkPolicy
-before exposing.
 
 ### nico-cli configuration
 

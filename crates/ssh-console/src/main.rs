@@ -16,9 +16,9 @@
  */
 #![cfg_attr(not(test), deny(dead_code_pub_in_binary))]
 
-use std::net::AddrParseError;
 use std::path::PathBuf;
 
+use carbide_utils::ParseListenAddrError;
 use clap::Parser;
 use ssh_console::config::{Config, ConfigError, Defaults};
 use ssh_console::shutdown_handle::ShutdownHandle;
@@ -31,10 +31,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Command::Run(run_command) => {
-            let spawn_handle = ssh_console::spawn((*run_command).try_into()?).await?;
+            let sigterm_cancel_token = carbide_utils::shutdown_handler::start()?;
+            let spawn_handle =
+                ssh_console::spawn((*run_command).try_into()?, Some(sigterm_cancel_token)).await?;
             // Let the service run forever by awaiting the join handle, while holding onto the
             // shutdown handle.
-            let (_shutdown_tx, join_handle) = spawn_handle.into_parts();
+            let (_drop_guard, join_handle) = spawn_handle.into_parts();
             join_handle.await.expect("ssh-console task panicked");
         }
         Command::DefaultRunConfig => {
@@ -67,18 +69,18 @@ struct RunCommand {
     #[clap(
         long,
         short,
-        help = "Address to listen on, overriding configuration file"
+        help = "Address to listen on (*:<port> or IP socket address), overriding configuration file"
     )]
     address: Option<String>,
     #[clap(
         long,
         short,
-        help = "Address to listen on for prometheus metrics requests (HTTP), overriding configuration file"
+        help = "Address for prometheus metrics (HTTP; *:<port> or IP socket address), overriding configuration file"
     )]
     metrics_address: Option<String>,
     #[clap(
         long,
-        help = "Address to listen on for the private console-log gRPC API"
+        help = "Address for the private console-log gRPC API (*:<port> or IP socket address), overriding configuration file"
     )]
     api_listen_address: Option<String>,
     #[clap(long, short = 'u', help = "Address of carbide-api (forge)")]
@@ -213,11 +215,20 @@ impl TryInto<Config> for RunCommand {
 #[derive(thiserror::Error, Debug)]
 enum CliError {
     #[error("invalid listening address {addr}: {error}")]
-    InvalidListeningAddress { addr: String, error: AddrParseError },
+    InvalidListeningAddress {
+        addr: String,
+        error: ParseListenAddrError,
+    },
     #[error("invalid metrics address {addr}: {error}")]
-    InvalidMetricsAddress { addr: String, error: AddrParseError },
+    InvalidMetricsAddress {
+        addr: String,
+        error: ParseListenAddrError,
+    },
     #[error("invalid API listening address {addr}: {error}")]
-    InvalidApiListeningAddress { addr: String, error: AddrParseError },
+    InvalidApiListeningAddress {
+        addr: String,
+        error: ParseListenAddrError,
+    },
     #[error("configuration error: {0}")]
     Config(#[from] ConfigError),
 }

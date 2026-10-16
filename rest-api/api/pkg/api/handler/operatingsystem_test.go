@@ -168,12 +168,22 @@ func TestOperatingSystemHandler_Create(t *testing.T) {
 		reqBodyModel                  *model.APIOperatingSystemCreateRequest
 		user                          *cdbm.User
 		expectedErr                   bool
+		expectedUserDataError         string
 		expectedStatus                int
 		expectedOperatingSystemStatus string
 		expectedStatusHistoryCount    int
 		expectedImageURL              bool
 		verifyChildSpanner            bool
 	}{
+		{
+			name:                  "malformed autoinstall user-data returns mapping detail without persistence",
+			reqOrgName:            tnOrg1,
+			reqBody:               `{"name":"invalid-autoinstall-os","ipxeScript":"ipxe","phoneHomeEnabled":true,"userData":"#cloud-config\nautoinstall:\n  user-data: private-value\n"}`,
+			user:                  tnu,
+			expectedErr:           true,
+			expectedStatus:        http.StatusBadRequest,
+			expectedUserDataError: "autoinstall user-data must be a mapping to insert phone-home",
+		},
 		{
 			name:           "error when user not found in request context",
 			reqOrgName:     tnOrg1,
@@ -325,6 +335,18 @@ func TestOperatingSystemHandler_Create(t *testing.T) {
 			assert.Nil(t, err)
 			assert.Equal(t, tc.expectedErr, rec.Code != http.StatusCreated)
 			assert.Equal(t, tc.expectedStatus, rec.Code)
+			if tc.expectedUserDataError != "" {
+				var response struct {
+					Data map[string]string `json:"data"`
+				}
+				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+				assert.Equal(t, map[string]string{"userData": tc.expectedUserDataError}, response.Data)
+				assert.NotContains(t, rec.Body.String(), "private-value")
+				osDAO := cdbm.NewOperatingSystemDAO(dbSession)
+				_, count, queryErr := osDAO.GetAll(ctx, nil, cdbm.OperatingSystemFilterInput{Names: []string{"invalid-autoinstall-os"}}, paginator.PageInput{}, nil)
+				require.NoError(t, queryErr)
+				assert.Zero(t, count)
+			}
 			if !tc.expectedErr {
 				rsp := &model.APIOperatingSystem{}
 				err := json.Unmarshal(rec.Body.Bytes(), rsp)
@@ -408,6 +430,7 @@ func TestOperatingSystemHandler_GetAll(t *testing.T) {
 
 	ts1 := testBuildTenantSiteAssociation(t, dbSession, tnOrg1, tenant1.ID, site.ID, tnu.ID)
 	assert.NotNil(t, ts1)
+	common.TestBuildAllocation(t, dbSession, site, tenant1, "test-allocation-1", tnu)
 
 	cfg := common.GetTestConfig()
 	tempClient := &tmocks.Client{}
@@ -481,6 +504,7 @@ func TestOperatingSystemHandler_GetAll(t *testing.T) {
 
 	ts4 := testBuildTenantSiteAssociation(t, dbSession, tnOrg4, tenant4.ID, site2.ID, tnu.ID)
 	assert.NotNil(t, ts4)
+	common.TestBuildAllocation(t, dbSession, site2, tenant4, "test-allocation-4", tnu)
 
 	imageoss := []cdbm.OperatingSystem{}
 	imageossa := []cdbm.OperatingSystemSiteAssociation{}
@@ -866,9 +890,11 @@ func TestOperatingSystemHandler_GetByID(t *testing.T) {
 
 	ts1 := testBuildTenantSiteAssociation(t, dbSession, tnOrg1, tenant1.ID, site.ID, user.ID)
 	assert.NotNil(t, ts1)
+	common.TestBuildAllocation(t, dbSession, site, tenant1, "test-allocation-1", user)
 
 	ts2 := testBuildTenantSiteAssociation(t, dbSession, tnOrg2, tenant2.ID, site.ID, user.ID)
 	assert.NotNil(t, ts2)
+	common.TestBuildAllocation(t, dbSession, site, tenant2, "test-allocation-2", user)
 
 	cfg := common.GetTestConfig()
 	tempClient := &tmocks.Client{}
@@ -1148,9 +1174,11 @@ func TestOperatingSystemHandler_Update(t *testing.T) {
 
 	ts2 := testBuildTenantSiteAssociation(t, dbSession, tnOrg1, tenant1.ID, site.ID, user.ID)
 	assert.NotNil(t, ts2)
+	common.TestBuildAllocation(t, dbSession, site, tenant1, "test-allocation-1", user)
 
 	ts3 := testBuildTenantSiteAssociation(t, dbSession, tnOrg1, tenant2.ID, site1.ID, user.ID)
 	assert.NotNil(t, ts3)
+	common.TestBuildAllocation(t, dbSession, site1, tenant2, "test-allocation-2", user)
 
 	cfg := common.GetTestConfig()
 	tempClient := &tmocks.Client{}
@@ -1547,14 +1575,15 @@ func TestOperatingSystemHandler_Update(t *testing.T) {
 	tsc1.Mock.On("TerminateWorkflow", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
 	tests := []struct {
-		name           string
-		reqOrgName     string
-		user           *cdbm.User
-		reqBody        string
-		reqUpdateModel *model.APIOperatingSystemUpdateRequest
-		osID           string
-		expectedErr    bool
-		expectedStatus int
+		name                  string
+		reqOrgName            string
+		user                  *cdbm.User
+		reqBody               string
+		reqUpdateModel        *model.APIOperatingSystemUpdateRequest
+		osID                  string
+		expectedErr           bool
+		expectedUserDataError string
+		expectedStatus        int
 
 		expectedName             *string
 		expectedDesc             *string
@@ -1568,6 +1597,16 @@ func TestOperatingSystemHandler_Update(t *testing.T) {
 		expectedDeactivationNote *string
 		verifyChildSpanner       bool
 	}{
+		{
+			name:                  "malformed autoinstall update returns mapping detail without mutation",
+			reqOrgName:            ipOrg1,
+			user:                  user,
+			reqBody:               `{"name":"rejected-rename","phoneHomeEnabled":true,"userData":"#cloud-config\nautoinstall: private-value\n"}`,
+			osID:                  os1.ID.String(),
+			expectedErr:           true,
+			expectedStatus:        http.StatusBadRequest,
+			expectedUserDataError: "autoinstall must be a mapping to insert phone-home",
+		},
 		{
 			name:           "error when user not found in request context",
 			reqOrgName:     ipOrg1,
@@ -1794,10 +1833,28 @@ func TestOperatingSystemHandler_Update(t *testing.T) {
 				cfg:       cfg,
 				scp:       scp,
 			}
+			var before *cdbm.OperatingSystem
+			if tc.expectedUserDataError != "" {
+				var readErr error
+				before, readErr = osDAO.GetByID(ctx, nil, uuid.MustParse(tc.osID), nil)
+				require.NoError(t, readErr)
+			}
+
 			err := tah.Handle(ec)
 			assert.Nil(t, err)
 
 			assert.Equal(t, tc.expectedStatus, rec.Code)
+			if tc.expectedUserDataError != "" {
+				var response struct {
+					Data map[string]string `json:"data"`
+				}
+				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+				assert.Equal(t, map[string]string{"userData": tc.expectedUserDataError}, response.Data)
+				assert.NotContains(t, rec.Body.String(), "private-value")
+				after, readErr := osDAO.GetByID(ctx, nil, before.ID, nil)
+				require.NoError(t, readErr)
+				assert.Equal(t, before, after)
+			}
 			assert.Equal(t, tc.expectedErr, rec.Code != http.StatusOK)
 
 			if !tc.expectedErr {
@@ -2596,6 +2653,7 @@ func TestOperatingSystemHandler_GetAll_Visibility(t *testing.T) {
 	tn := testMachineBuildTenant(t, dbSession, tenantOrg, "vis-tenant")
 	tsC := testBuildTenantSiteAssociation(t, dbSession, tenantOrg, tn.ID, siteC.ID, tnUser.ID)
 	assert.NotNil(t, tsC)
+	common.TestBuildAllocation(t, dbSession, siteC, tn, "vis-allocation-c", provUser)
 
 	buildTenantOS(t, ctx, osDAO, tenantOrg, tn.ID, "tenant-os-1", tnUser.ID)
 	buildTenantOS(t, ctx, osDAO, tenantOrg, tn.ID, "tenant-os-2", tnUser.ID)
@@ -2721,6 +2779,7 @@ func TestOperatingSystemHandler_GetByID_Visibility(t *testing.T) {
 	siteD := testMachineBuildSite(t, dbSession, ip2, "vis-site-d", cdbm.SiteStatusRegistered)
 	tn := testMachineBuildTenant(t, dbSession, tenantOrg, "vis-tenant")
 	testBuildTenantSiteAssociation(t, dbSession, tenantOrg, tn.ID, siteC.ID, tnUser.ID)
+	common.TestBuildAllocation(t, dbSession, siteC, tn, "vis-allocation-c", servingProviderUser)
 
 	tnOS := buildTenantOS(t, ctx, osDAO, tenantOrg, tn.ID, "tenant-os-1", tnUser.ID)
 	provC := buildProviderOS(t, ctx, osDAO, servingProviderOrg, ip2.ID, "prov-os-c", tnUser.ID)
@@ -2748,6 +2807,7 @@ func TestOperatingSystemHandler_GetByID_Visibility(t *testing.T) {
 	dualUser := testMachineBuildUser(t, dbSession, uuid.NewString(), []string{servingProviderOrg}, []string{authz.ProviderAdminRole, authz.TenantAdminRole})
 	dualTenant := testMachineBuildTenant(t, dbSession, servingProviderOrg, "vis-dual-tenant")
 	testBuildTenantSiteAssociation(t, dbSession, servingProviderOrg, dualTenant.ID, siteC.ID, dualUser.ID)
+	common.TestBuildAllocation(t, dbSession, siteC, dualTenant, "vis-dual-allocation-c", servingProviderUser)
 	privOrg := "vis-privileged-org"
 	privUser := testMachineBuildUser(t, dbSession, uuid.NewString(), []string{privOrg}, []string{authz.TenantAdminRole})
 	privTenant := testMachineBuildTenant(t, dbSession, privOrg, "vis-privileged-tenant")
@@ -2755,6 +2815,7 @@ func TestOperatingSystemHandler_GetByID_Visibility(t *testing.T) {
 	// Disabling targeted creation at C does not revoke ordinary membership.
 	// D has no membership and is accessible only through the account default.
 	cdbm.TestBuildTenantSite(t, dbSession, privTenant, siteC, &cdbm.TenantSiteConfig{TargetedInstanceCreation: cutil.GetPtr(false)}, privUser)
+	common.TestBuildAllocation(t, dbSession, siteC, privTenant, "vis-privileged-allocation-c", servingProviderUser)
 
 	ctx = common.TestCommonTraceProviderSetup(t, ctx)
 

@@ -20,6 +20,7 @@ use std::net::IpAddr;
 use std::ops::DerefMut;
 
 use carbide_network::virtualization::{VpcVirtualizationType, get_host_ip};
+use carbide_uuid::DbTable;
 use carbide_uuid::instance::InstanceId;
 use carbide_uuid::machine::MachineIdSubtypeTrait;
 use carbide_uuid::network::{NetworkPrefixId, NetworkSegmentId};
@@ -71,14 +72,17 @@ pub async fn find_all_by_address(
     txn: impl DbReader<'_>,
     address: IpAddr,
 ) -> Result<Vec<InstanceAddress>, DatabaseError> {
-    let query = "SELECT * FROM instance_addresses
+    let query = format!(
+        "SELECT {} FROM instance_addresses
         WHERE address = $1::inet
-        ORDER BY vpc_id, segment_id, instance_id";
-    sqlx::query_as(query)
+        ORDER BY vpc_id, segment_id, instance_id",
+        InstanceAddress::db_table_columns(),
+    );
+    sqlx::query_as(sqlx::AssertSqlSafe(query.as_str()))
         .bind(address)
         .fetch_all(txn)
         .await
-        .map_err(|e| DatabaseError::query(query, e))
+        .map_err(|e| DatabaseError::query(&query, e))
 }
 
 /// Returns every address an instance holds on one segment, ordered by address.
@@ -89,28 +93,34 @@ pub async fn find_all_by_instance_id_and_segment_id(
     instance_id: &InstanceId,
     segment_id: &NetworkSegmentId,
 ) -> Result<Vec<InstanceAddress>, DatabaseError> {
-    let query = "SELECT * FROM instance_addresses
+    let query = format!(
+        "SELECT {} FROM instance_addresses
         WHERE instance_id=$1 AND segment_id=$2
-        ORDER BY address";
+        ORDER BY address",
+        InstanceAddress::db_table_columns(),
+    );
 
-    sqlx::query_as(query)
+    sqlx::query_as(sqlx::AssertSqlSafe(query.as_str()))
         .bind(instance_id)
         .bind(segment_id)
         .fetch_all(txn)
         .await
-        .map_err(|e| DatabaseError::query(query, e))
+        .map_err(|e| DatabaseError::query(&query, e))
 }
 
 pub async fn find_by_segment_id(
     txn: impl DbReader<'_>,
     segment_id: &NetworkSegmentId,
 ) -> Result<Vec<InstanceAddress>, DatabaseError> {
-    let query = "SELECT * FROM instance_addresses WHERE segment_id = $1::uuid ORDER BY address";
-    sqlx::query_as(query)
+    let query = format!(
+        "SELECT {} FROM instance_addresses WHERE segment_id = $1::uuid ORDER BY address",
+        InstanceAddress::db_table_columns(),
+    );
+    sqlx::query_as(sqlx::AssertSqlSafe(query.as_str()))
         .bind(segment_id)
         .fetch_all(txn)
         .await
-        .map_err(|e| DatabaseError::query(query, e))
+        .map_err(|e| DatabaseError::query(&query, e))
 }
 
 /// Locks every address row for an instance in stable ID order.
@@ -899,6 +909,7 @@ mod tests {
     use config_version::{ConfigVersion, Versioned};
     use model::instance::config::network::{InstanceInterfaceConfig, InterfaceFunctionId};
     use model::network_segment::{NetworkSegmentConfig, NetworkSegmentStatus, NetworkSegmentType};
+    use sqlx::Connection;
     use uuid::Uuid;
 
     use super::*;
@@ -978,6 +989,7 @@ mod tests {
         InstanceNetworkConfig {
             interfaces,
             auto_config: None,
+            service_interfaces: vec![],
         }
     }
 
@@ -1321,6 +1333,88 @@ mod tests {
         })
         .await;
         assert_eq!(count, 0, "empty insert should issue no statements");
+    }
+
+    #[crate::sqlx_test]
+    async fn instance_address_queries_survive_added_columns(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut api_connection = pool.acquire().await?;
+        let mut txn = api_connection.begin().await?;
+        let (instance_id, segment_id, vpc_id) =
+            seed_fk_fixtures(txn.as_mut(), "explicit-columns").await;
+        let rows = [
+            InstanceAddress {
+                instance_id,
+                segment_id,
+                vpc_id,
+                address: "192.0.2.78".parse()?,
+                prefix: "192.0.2.0/24".parse()?,
+                hostname: Some("192-0-2-78".to_string()),
+            },
+            InstanceAddress {
+                instance_id,
+                segment_id,
+                vpc_id,
+                address: "2001:db8::78".parse()?,
+                prefix: "2001:db8::/64".parse()?,
+                hostname: None,
+            },
+        ];
+        lock_table_for_allocation(txn.as_mut()).await?;
+        insert_instance_addresses(txn.as_mut(), &[rows[1].clone(), rows[0].clone()]).await?;
+        txn.commit().await?;
+
+        assert_address_queries(&mut api_connection, &rows).await?;
+        assert!(api_connection.cached_statements_size() > 0);
+
+        // Keep the prepared readers alive while an unrelated column is added.
+        let mut migration = pool.begin().await?;
+        sqlx::raw_sql(
+            "SET LOCAL lock_timeout = '5s';
+             ALTER TABLE instance_addresses ADD COLUMN test_added_column text;",
+        )
+        .execute(&mut *migration)
+        .await?;
+        migration.commit().await?;
+
+        assert_address_queries(&mut api_connection, &rows).await?;
+        Ok(())
+    }
+
+    async fn assert_address_queries(
+        connection: &mut PgConnection,
+        expected: &[InstanceAddress],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let first = &expected[0];
+        let by_instance = find_all_by_instance_id_and_segment_id(
+            connection,
+            &first.instance_id,
+            &first.segment_id,
+        )
+        .await?;
+        let by_segment = find_by_segment_id(&mut *connection, &first.segment_id).await?;
+        for found in [by_instance, by_segment] {
+            assert_eq!(found.len(), expected.len());
+            for (found, expected) in found.iter().zip(expected) {
+                assert_instance_address(found, expected);
+            }
+        }
+        for expected in expected {
+            let found = find_all_by_address(&mut *connection, expected.address).await?;
+            assert_eq!(found.len(), 1);
+            assert_instance_address(&found[0], expected);
+        }
+        Ok(())
+    }
+
+    fn assert_instance_address(found: &InstanceAddress, expected: &InstanceAddress) {
+        assert_eq!(found.instance_id, expected.instance_id);
+        assert_eq!(found.segment_id, expected.segment_id);
+        assert_eq!(found.vpc_id, expected.vpc_id);
+        assert_eq!(found.address, expected.address);
+        assert_eq!(found.prefix, expected.prefix);
+        assert_eq!(found.hostname, expected.hostname);
     }
 }
 

@@ -577,6 +577,7 @@ func TestCreateVPCHandler_Handle(t *testing.T) {
 
 	tst3.Mock.On("ExecuteWorkflow", mock.Anything, mock.AnythingOfType("internal.StartWorkflowOptions"),
 		"CreateVPCV2", mock.Anything).Return(wruntimeout, nil)
+	tst3.Mock.On("ExecuteWorkflow", mock.Anything, mock.Anything, "CreateTenant", mock.Anything).Return(wrun, nil)
 
 	tst3.Mock.On("TerminateWorkflow", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
@@ -596,6 +597,7 @@ func TestCreateVPCHandler_Handle(t *testing.T) {
 		verifyChildSpanner bool
 		expectNoMutation   bool
 		expectRolledBack   bool
+		omitRoutingProfile bool
 	}{
 		{
 			name: "test VPC create API endpoint rejects power resource group when DPS power management is disabled",
@@ -684,7 +686,7 @@ func TestCreateVPCHandler_Handle(t *testing.T) {
 			verifyChildSpanner: true,
 		},
 		{
-			name: "test VPC create API endpoint returns Core-resolved routing profile",
+			name: "test VPC create API endpoint inherits Core-resolved routing profile when omitted",
 			fields: fields{
 				dbSession: dbSession,
 				tc:        tc,
@@ -710,6 +712,7 @@ func TestCreateVPCHandler_Handle(t *testing.T) {
 			},
 			wantErr:            false,
 			verifyChildSpanner: true,
+			omitRoutingProfile: true,
 		},
 		{
 			name: "test VPC create API endpoint rolls back when Core-resolved routing profile cannot be persisted",
@@ -974,6 +977,27 @@ func TestCreateVPCHandler_Handle(t *testing.T) {
 			},
 			wantErr:            false,
 			verifyChildSpanner: true,
+		},
+		{
+			name: "test VPC create API endpoint rejects empty routing profile before dispatch",
+			fields: fields{
+				dbSession: dbSession,
+				tc:        tc,
+				cfg:       cfg,
+			},
+			args: args{
+				reqData: &model.APIVpcCreateRequest{
+					Name:                      "Test VPC empty routing profile",
+					SiteID:                    st1.ID.String(),
+					NetworkVirtualizationType: cutil.GetPtr(cdbm.VpcFNN),
+					RoutingProfile:            cutil.GetPtr(""),
+				},
+				reqOrg:      tnOrg,
+				reqUser:     tnu,
+				respCode:    http.StatusBadRequest,
+				respMessage: "`routingProfile` must not be empty",
+			},
+			expectNoMutation: true,
 		},
 		{
 			name: "test VPC create API endpoint accepts site-configured routing profile",
@@ -1381,7 +1405,7 @@ func TestCreateVPCHandler_Handle(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "test VPC create API endpoint failure, Tenant has no Site Allocation",
+			name: "test VPC create API endpoint failure, Tenant has no Site Allocation or privilege",
 			fields: fields{
 				dbSession: dbSession,
 				tc:        tc,
@@ -1393,9 +1417,36 @@ func TestCreateVPCHandler_Handle(t *testing.T) {
 					Description: cutil.GetPtr("Test VPC Description"),
 					SiteID:      st2.ID.String(),
 				},
-				reqOrg:   tnOrg,
-				reqUser:  tnu,
+				reqOrg:   tnOrg3,
+				reqUser:  tnu3,
 				respCode: http.StatusForbidden,
+			},
+			wantErr: false,
+		},
+		{
+			name: "test VPC create API endpoint success, privileged Tenant has no Site Allocation",
+			fields: fields{
+				dbSession: dbSession,
+				tc:        tc,
+				cfg:       cfg,
+			},
+			args: args{
+				reqData: &model.APIVpcCreateRequest{
+					Name:        "Test VPC",
+					Description: cutil.GetPtr("Test VPC Description"),
+					SiteID:      st2.ID.String(),
+				},
+				reqOrg:                     tnOrg,
+				reqUser:                    tnu,
+				respCode:                   http.StatusCreated,
+				expectedStatus:             cdbm.VpcStatusProvisioning,
+				expectedVirtualizationType: cdbm.VpcFNN,
+				expectedStatusDetails: []expectedStatusDetail{
+					{
+						status:  cdbm.VpcStatusProvisioning,
+						message: "VPC provisioning has been initiated on Site",
+					},
+				},
 			},
 			wantErr: false,
 		},
@@ -1482,7 +1533,16 @@ func TestCreateVPCHandler_Handle(t *testing.T) {
 				cfg:       tt.fields.cfg,
 			}
 
-			jsonData, _ := json.Marshal(tt.args.reqData)
+			jsonData, err := json.Marshal(tt.args.reqData)
+			require.NoError(t, err)
+			if tt.omitRoutingProfile {
+				var requestBody map[string]json.RawMessage
+				err = json.Unmarshal(jsonData, &requestBody)
+				require.NoError(t, err)
+				delete(requestBody, "routingProfile")
+				jsonData, err = json.Marshal(requestBody)
+				require.NoError(t, err)
+			}
 
 			// Setup echo server/context
 			req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(jsonData)))
@@ -1770,6 +1830,8 @@ func TestUpdateVPCHandler_Handle(t *testing.T) {
 
 	vpc4 := testVPCBuildVPC(t, dbSession, "test-vpc-3", ip, tn, st3, cutil.GetPtr(cdbm.VpcEthernetVirtualizer), nil, map[string]string{"zone": "west6"}, cdbm.VpcStatusReady, tnu)
 	assert.NotNil(t, vpc4)
+	// Deny the privileged Tenant at the Site without Allocations
+	cdbm.TestBuildTenantSite(t, dbSession, tn, st3, &cdbm.TenantSiteConfig{TargetedInstanceCreation: cutil.GetPtr(false)}, tnu)
 
 	// Associate tenant 1 with site 1
 	ts1t1 := testBuildTenantSiteAssociation(t, dbSession, tnOrg, tn.ID, st.ID, tnu.ID)
@@ -2532,6 +2594,18 @@ func TestUpdateVirtualizationVPCHandler_Handle(t *testing.T) {
 	vpcNoNativeNet := testVPCBuildVPC(t, dbSession, "test-vpc-no-native-net", ip, tn, stNoNativeNet, cutil.GetPtr(cdbm.VpcEthernetVirtualizer), nil, map[string]string{"zone": "west-nonative"}, cdbm.VpcStatusReady, tnu)
 	assert.NotNil(t, vpcNoNativeNet)
 
+	// Site where the Tenant is denied without Allocations
+	stDenied := testVPCBuildSite(t, dbSession, ip, "test-site-denied", true, true, cdbm.SiteStatusRegistered, ipu)
+	cdbm.TestBuildTenantSite(t, dbSession, tn, stDenied, &cdbm.TenantSiteConfig{TargetedInstanceCreation: cutil.GetPtr(false)}, tnu)
+	vpcDeniedSite := testVPCBuildVPC(t, dbSession, "test-vpc-denied-site", ip, tn, stDenied, cutil.GetPtr(cdbm.VpcEthernetVirtualizer), nil, map[string]string{"zone": "west-denied"}, cdbm.VpcStatusReady, tnu)
+
+	// Privileged Tenant without a Tenant/Site association or Allocations
+	tnOrgPriv := "test-privileged-tenant-org"
+	tnuPriv := testVPCBuildUser(t, dbSession, "test-starfleet-id-3", tnOrgPriv, tnOrgRoles)
+	tnPriv := testVPCBuildTenant(t, dbSession, "test-privileged-tenant", tnOrgPriv, tnuPriv)
+	common.TestBuildTenantAccountWithTargetedInstanceCreation(t, dbSession, ip, &tnPriv.ID, tnOrgPriv, cdbm.TenantAccountStatusReady, tnuPriv)
+	vpcPrivileged := testVPCBuildVPC(t, dbSession, "test-vpc-privileged", ip, tnPriv, st, cutil.GetPtr(cdbm.VpcEthernetVirtualizer), nil, map[string]string{"zone": "west-privileged"}, cdbm.VpcStatusReady, tnuPriv)
+
 	e := echo.New()
 	cfg := common.GetTestConfig()
 	tc := &tmocks.Client{}
@@ -2764,6 +2838,44 @@ func TestUpdateVirtualizationVPCHandler_Handle(t *testing.T) {
 			},
 			wantErr:            false,
 			verifyChildSpanner: true,
+		},
+		{
+			name: "test VPC virtualization update error, Site denied for Tenant without Allocations",
+			fields: fields{
+				dbSession: dbSession,
+				tc:        tc,
+				cfg:       cfg,
+			},
+			args: args{
+				reqData: &model.APIVpcVirtualizationUpdateRequest{
+					NetworkVirtualizationType: "FNN",
+				},
+				reqOrg:   tnOrg,
+				reqVPCID: vpcDeniedSite.ID.String(),
+				reqVPC:   vpcDeniedSite,
+				reqUser:  tnu,
+				respCode: http.StatusForbidden,
+			},
+			wantErr: false,
+		},
+		{
+			name: "test VPC virtualization update success, privileged Tenant without Tenant/Site association",
+			fields: fields{
+				dbSession: dbSession,
+				tc:        tc,
+				cfg:       cfg,
+			},
+			args: args{
+				reqData: &model.APIVpcVirtualizationUpdateRequest{
+					NetworkVirtualizationType: "FNN",
+				},
+				reqOrg:   tnOrgPriv,
+				reqVPCID: vpcPrivileged.ID.String(),
+				reqVPC:   vpcPrivileged,
+				reqUser:  tnuPriv,
+				respCode: http.StatusOK,
+			},
+			wantErr: false,
 		},
 	}
 	for _, tt := range tests {
@@ -3880,7 +3992,7 @@ func TestDeleteVPCHandler_Handle(t *testing.T) {
 	dbSession := testSiteInitDB(t)
 	defer dbSession.Close()
 
-	testVPCSetupSchema(t, dbSession)
+	common.TestSetupSchema(t, dbSession)
 
 	ipOrg := "test-provider-org"
 	ipOrgRoles := []string{authz.ProviderAdminRole}
@@ -3920,6 +4032,7 @@ func TestDeleteVPCHandler_Handle(t *testing.T) {
 
 	vpc3 := testVPCBuildVPC(t, dbSession, "test-vpc-3", ip, tn1, st, cutil.GetPtr(cdbm.VpcFNN), nil, map[string]string{"zone": "east1"}, cdbm.VpcStatusReady, tnu1)
 	assert.NotNil(t, vpc3)
+	vpcWithPeering := testVPCBuildVPC(t, dbSession, "test-vpc-with-peering", ip, tn1, st, cutil.GetPtr(cdbm.VpcFNN), nil, nil, cdbm.VpcStatusReady, tnu1)
 
 	os := common.TestBuildOperatingSystem(t, dbSession, "test-os", tn1, cdbm.OperatingSystemStatusReady, tnu1)
 	assert.NotNil(t, os)
@@ -3989,6 +4102,15 @@ func TestDeleteVPCHandler_Handle(t *testing.T) {
 
 	tscWithNICoNotFound.Mock.On("TerminateWorkflow", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
+	peeringPrecondition := fmt.Sprintf("VPC `%s` still has peerings; delete its peerings and wait for them to disappear before deleting the VPC", vpcWithPeering.ID)
+	peeringWorkflowRun := &tmocks.WorkflowRun{}
+	peeringWorkflowRun.On("GetID").Return("workflow-with-peering-precondition")
+	peeringWorkflowRun.On("Get", mock.Anything, mock.Anything).Return(tp.NewNonRetryableApplicationError(peeringPrecondition, swe.ErrTypeNICoFailedPrecondition, errors.New(peeringPrecondition))).Once()
+	peeringSiteClient := &tmocks.Client{}
+	peeringSiteClient.On("ExecuteWorkflow", mock.Anything, mock.Anything, "DeleteVPCV2", mock.Anything).Return(peeringWorkflowRun, nil).Once()
+	scpWithPeering := sc.NewClientPool(tcfg)
+	scpWithPeering.IDClientMap[st.ID.String()] = peeringSiteClient
+
 	// Prepare client pool for sync calls
 	// to site(s).
 
@@ -4019,7 +4141,26 @@ func TestDeleteVPCHandler_Handle(t *testing.T) {
 		args               args
 		wantErr            bool
 		verifyChildSpanner bool
+		responseContains   string
+		expectedVpcStatus  string
 	}{
+		{
+			name: "VPC peering precondition reaches the caller without marking the VPC Deleting",
+			fields: fields{
+				dbSession: dbSession,
+				tc:        tc,
+				scp:       scpWithPeering,
+				cfg:       cfg,
+			},
+			args: args{
+				reqVPC:   vpcWithPeering.ID.String(),
+				reqOrg:   tnOrg1,
+				reqUser:  tnu1,
+				respCode: http.StatusPreconditionFailed,
+			},
+			responseContains:  peeringPrecondition,
+			expectedVpcStatus: cdbm.VpcStatusReady,
+		},
 		{
 			name: "test VPC delete API endpoint success",
 			fields: fields{
@@ -4214,6 +4355,14 @@ func TestDeleteVPCHandler_Handle(t *testing.T) {
 			}
 
 			require.Equal(t, tt.args.respCode, rec.Code)
+			if tt.responseContains != "" {
+				assert.Contains(t, rec.Body.String(), tt.responseContains)
+			}
+			if tt.expectedVpcStatus != "" {
+				vpc, err := cdbm.NewVpcDAO(dbSession).GetByID(ctx, nil, uuid.MustParse(tt.args.reqVPC), nil)
+				require.NoError(t, err)
+				assert.Equal(t, tt.expectedVpcStatus, vpc.Status)
+			}
 			if tt.args.respCode != http.StatusAccepted {
 				return
 			}
@@ -4232,6 +4381,8 @@ func TestDeleteVPCHandler_Handle(t *testing.T) {
 			}
 		})
 	}
+	peeringSiteClient.AssertExpectations(t)
+	peeringWorkflowRun.AssertExpectations(t)
 }
 
 func TestNewCreateVPCHandler(t *testing.T) {

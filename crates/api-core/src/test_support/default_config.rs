@@ -201,6 +201,7 @@ pub fn get() -> CarbideConfig {
         ssh_console_url: None,
         auth: None,
         pools: None,
+        resource_pool_backends: HashMap::new(),
         networks: None,
         vpcs: None,
         dpu_ipmi_tool_impl: None,
@@ -240,6 +241,8 @@ pub fn get() -> CarbideConfig {
             IbFabricDefinition {
                 // The actual IP is not used and thereby does not matter
                 endpoints: vec!["https://127.0.0.1:443".to_string()],
+                backend: None,
+                remote_pool: None,
                 pkeys: vec![resource_pool::Range {
                     start: "1".to_string(),
                     end: "100".to_string(),
@@ -288,6 +291,7 @@ pub fn get() -> CarbideConfig {
             dpu_enable_secure_boot: true,
             num_of_vfs: crate::cfg::file::DEFAULT_DPU_NUM_OF_VFS,
             service_vpc_slot_count: 0,
+            max_active_service_vpc_interfaces_per_dpu: 0,
             additional_managed_sf: 0,
             restart_ovs_on_use_admin_network_change: false,
         },
@@ -326,7 +330,8 @@ pub fn get() -> CarbideConfig {
             svpc_enabled: true,
             astra_enabled: false,
             subnet_ip: Ipv4Addr::UNSPECIFIED,
-            subnet_mask: 0_i32,
+            subnet_mask: EwEthersConfig::default_subnet_mask(),
+            astra: Default::default(),
             monitor_run_interval: std::time::Duration::from_secs(10),
             svpc: SvpcConfig {
                 mqtt_endpoint: "mqtt.forge".to_string(),

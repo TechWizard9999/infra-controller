@@ -28,7 +28,9 @@ use attestation::{
 };
 use carbide_credential_rotation::site_explorer_pause::{self, GateDecision};
 use carbide_credential_rotation::{RotationStep, advance};
-use carbide_firmware::{FirmwareConfig, FirmwareConfigSnapshot, FirmwareDownloader};
+use carbide_firmware::{
+    ArtifactStatus, FirmwareConfig, FirmwareConfigSnapshot, FirmwareDownloader,
+};
 use carbide_redfish::boot_interface::BootInterfaceTarget;
 use carbide_redfish::libredfish::conv::{
     IntoLibredfish, IntoModel, machine_last_reboot_requested_mode,
@@ -122,7 +124,10 @@ use crate::health_report::{
 use crate::redfish::{
     did_dpu_finish_booting, host_power_control, host_power_control_with_location,
 };
-use crate::{MeasuringOutcome, get_measuring_prerequisites, handle_measuring_state};
+use crate::{
+    MeasuringOutcome, get_measuring_prerequisites, handle_measuring_state,
+    waiting_for_measurements_outcome,
+};
 
 pub mod attestation;
 mod bios_config;
@@ -823,10 +828,13 @@ impl MachineStateHandler {
 
         // Don't update failed state failure cause everytime. Record first failure cause only,
         // otherwise first failure cause will be overwritten.
-        // A reset is a deliberate teardown, so a failure record must not park it.
+        // Reset and force deletion already own teardown. Preserve their state
+        // and failure evidence instead of parking them in Failed.
         if !matches!(
             mh_state,
-            ManagedHostState::Failed { .. } | ManagedHostState::Reset { .. }
+            ManagedHostState::Failed { .. }
+                | ManagedHostState::Reset { .. }
+                | ManagedHostState::ForceDeletion
         ) && let Some((machine_id, details)) = get_failed_state(mh_snapshot)
         {
             let already_relocking_machine_failure = matches!(
@@ -6142,10 +6150,16 @@ async fn trigger_reboot_if_needed_with_policy(
             })
         }
     } else {
-        let h = (current_time - entered_state_at).num_hours();
-        Err(StateHandlerError::ManualInterventionRequired(format!(
-            "Machine has not responded after {h} hours."
-        )))
+        let message = match retry_count {
+            Some(retry_count) => {
+                format!("machine has not responded after {retry_count} reboot attempts")
+            }
+            None => format!(
+                "machine has not responded after {} minutes",
+                time_elapsed_since_state_change
+            ),
+        };
+        Err(StateHandlerError::ManualInterventionRequired(message))
     }
 }
 
@@ -8157,7 +8171,7 @@ impl StateHandler for HostMachineStateHandler {
                             },
                         ));
                     }
-                    match handle_measuring_state(
+                    let measuring_outcome = match handle_measuring_state(
                         measuring_state,
                         &mh_snapshot.host_snapshot.id,
                         &mut ctx.services.db_reader,
@@ -8169,22 +8183,51 @@ impl StateHandler for HostMachineStateHandler {
                     )
                     .await
                     {
-                        Ok(measuring_outcome) => {
-                            map_host_init_measuring_outcome_to_state_handler_outcome(
-                                &measuring_outcome,
-                                measuring_state,
+                        Ok(measuring_outcome) => measuring_outcome,
+                        Err(StateHandlerError::MissingData {
+                            object_id: _,
+                            missing: "ek_cert_verification_status",
+                        }) if *measuring_state == MeasuringState::WaitingForMeasurements => {
+                            waiting_for_measurements_outcome(
+                                &mh_snapshot.host_snapshot.id,
+                                mh_snapshot.host_snapshot.state.version.timestamp(),
+                                self.host_handler_params
+                                    .reachability_params
+                                    .waiting_for_measurements_timeout,
                             )
                         }
                         Err(StateHandlerError::MissingData {
                             object_id: _,
                             missing: "ek_cert_verification_status",
                         }) => {
-                            Ok(StateHandlerOutcome::wait(
+                            return Ok(StateHandlerOutcome::wait(
                                 "Waiting for Scout to start and send registration info (in discover_machine)".to_string(),
-                            ))
+                            ));
                         }
-                        Err(e) => Err(e),
+                        Err(e) => return Err(e),
+                    };
+
+                    if *measuring_state == MeasuringState::WaitingForMeasurements
+                        && measuring_outcome == MeasuringOutcome::NoChange
+                    {
+                        let status = trigger_reboot_if_needed(
+                            &mh_snapshot.host_snapshot,
+                            mh_snapshot,
+                            None,
+                            &self.host_handler_params.reachability_params,
+                            ctx,
+                        )
+                        .await?;
+                        return Ok(StateHandlerOutcome::wait(format!(
+                            "Waiting for Scout measurements: {}",
+                            status.status
+                        )));
                     }
+
+                    map_host_init_measuring_outcome_to_state_handler_outcome(
+                        &measuring_outcome,
+                        measuring_state,
+                    )
                 }
                 MachineState::SpdmMeasuring {
                     spdm_measuring_state,
@@ -9769,17 +9812,15 @@ impl StateHandler for InstanceStateHandler {
     }
 }
 
-// Process the host's use_admin_network flag change and selectively flag
-// DPUs that undergo an actual network mode change with the
-// use_admin_network_changed flag if restart_ovs_on_use_admin_network_change
-// is true.
-// Not every DPU participates in tenant networking — only those with instance
-// interface configs assigned to them. DPUs without tenant interfaces remain on
-// the admin network regardless of the host-level toggle.
-async fn process_dpu_use_admin_network_state_change(
+/// Requests an OVS restart for DPUs with tenant interfaces when the host changes
+/// between Admin and tenant networking. The caller checks
+/// `restart_ovs_on_use_admin_network_change` and commits these flags in the same
+/// transaction as the network configuration change. DPUs without tenant
+/// interfaces remain on Admin and do not need a restart.
+pub async fn process_dpu_use_admin_network_state_change(
     txn: &mut PgConnection,
     mh_snapshot: &ManagedHostStateSnapshot,
-) -> Result<(), StateHandlerError> {
+) -> Result<(), DatabaseError> {
     tracing::info!(
         machine_id = %mh_snapshot.host_snapshot.id,
         "Request an OVS restart for DPUs switching between Admin and tenant networking"
@@ -9907,13 +9948,47 @@ async fn handle_instance_network_config_update_request(
                 }
             }
 
-            // Update requested network config and increment version.
+            // Service state can change after staging or after this iteration's snapshot.
+            // Lock and reload the instance so promotion preserves its latest endpoints.
+            // Release still completes pending host work before reclaiming its resources.
             let mut txn = ctx.services.db_pool.begin().await?;
+            db::instance::find_by_id_for_update(txn.as_mut(), instance.id)
+                .await?
+                .filter(|current| current.machine_id == instance.machine_id)
+                .ok_or_else(|| {
+                    StateHandlerError::GenericError(eyre::eyre!(
+                        "instance {} is no longer assigned to machine {}",
+                        instance.id,
+                        instance.machine_id
+                    ))
+                })?;
+            // The locking lookup returns a limited projection, so promotion needs a second read.
+            // TODO: Combine both reads in a full-snapshot lookup that locks by ID, accepts
+            // deletion-marked instances, and leaves ordinary find_by_id reads unlocked.
+            let current_instance = db::instance::find_by_id(txn.as_mut(), instance.id)
+                .await?
+                .ok_or_else(|| {
+                    StateHandlerError::GenericError(eyre::eyre!(
+                        "instance {} no longer exists",
+                        instance.id
+                    ))
+                })?;
+            let Some(update_request) = &current_instance.update_network_config_request else {
+                return Err(StateHandlerError::GenericError(eyre::eyre!(
+                    "network config update request is missing from db. instance: {}",
+                    instance.id
+                )));
+            };
+
+            // Legacy pending requests may carry obsolete endpoints. Only live state owns them.
+            let mut new_config = update_request.new_config.clone();
+            new_config.service_interfaces = current_instance.config.network.service_interfaces;
+            // Update requested network config and increment version.
             db::instance::update_network_config(
                 txn.as_mut(),
-                instance.id,
-                instance.network_config_version,
-                &update_request.new_config,
+                current_instance.id,
+                current_instance.network_config_version,
+                &new_config,
                 true,
             )
             .await?;
@@ -11468,14 +11543,32 @@ impl HostUpgradeState {
 
         match &artifact.source {
             ResolvedFirmwareArtifactSource::Remote { url, sha256 } => {
-                if !self.downloader.available(&artifact.local_path, url, sha256) {
-                    tracing::debug!(
-                        artifact_path = %artifact.local_path.display(),
-                        %url,
-                        "firmware artifact is being downloaded, update deferred"
-                    );
-
-                    return Ok(StateHandlerOutcome::do_nothing());
+                match self
+                    .downloader
+                    .available(&artifact.local_path, url, sha256)
+                    .await
+                {
+                    ArtifactStatus::Available => {}
+                    ArtifactStatus::Downloading => {
+                        return Ok(StateHandlerOutcome::wait(format!(
+                            "waiting for firmware artifact {} to download",
+                            artifact.local_path.display()
+                        )));
+                    }
+                    ArtifactStatus::Failed { error } => {
+                        return Ok(StateHandlerOutcome::transition(scenario.actual_new_state(
+                            HostReprovisionState::FailedFirmwareUpgrade {
+                                firmware_type: *component_type,
+                                report_time: Some(Utc::now()),
+                                reason: Some(format!(
+                                    "firmware artifact {} for machine {} could not be downloaded: {error}",
+                                    artifact.local_path.display(),
+                                    snapshot.id
+                                )),
+                            },
+                            state.managed_state.get_host_repro_retry_count(),
+                        )));
+                    }
                 }
             }
             ResolvedFirmwareArtifactSource::Local => {

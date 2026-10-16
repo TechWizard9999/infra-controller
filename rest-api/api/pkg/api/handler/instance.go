@@ -1399,7 +1399,7 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 			alconstraints, err := common.GetAllocationConstraintsForInstanceType(ctx, tx, cih.dbSession, tenant.ID, instanceType, tnas)
 			if err != nil {
 				if err == common.ErrAllocationConstraintNotFound {
-					return cutil.NewAPIError(http.StatusInternalServerError, "No Allocations for specified Instance Type were found for current Tenant", nil)
+					return cutil.NewAPIError(http.StatusForbidden, "No Allocations for specified Instance Type were found for current Tenant", nil)
 				}
 				logger.Error().Err(err).Msg("error retrieving Allocation Constraints from DB for InstanceType and Allocation")
 				return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve Allocations for specified Instance Type, DB error", nil)
@@ -1441,6 +1441,9 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 				if errors.As(err, &ibSelErr) {
 					return cutil.NewAPIError(http.StatusBadRequest, ibSelErr.Error(), ibSelErr.ValidationError())
 				}
+				if errors.Is(err, common.ErrSpectrumXMachineSelection) {
+					return cutil.NewAPIError(http.StatusBadRequest, err.Error(), nil)
+				}
 				if err == common.ErrInstanceTypeMachineNotFound {
 					return cutil.NewAPIError(http.StatusBadRequest,
 						"No Machines are available for specified Instance Type", nil)
@@ -1455,6 +1458,15 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 		logger.Info().Str("MachineID", machine.ID).
 			Interface("MachineLabelSelector", apiRequest.MachineLabelSelector).
 			Msg("selected Machine for Instance creation")
+
+		// Instance Type placement already validated each candidate. Explicit
+		// placement validates the selected machine using the same DB projection.
+		if apiRequest.MachineID != nil {
+			apiErr := common.ValidateMachineSpectrumXAttachments(ctx, tx, cih.dbSession, machine.ID, apiRequest.SpectrumXAttachments)
+			if apiErr != nil {
+				return apiErr
+			}
+		}
 
 		mcDAO := cdbm.NewMachineCapabilityDAO(cih.dbSession)
 
@@ -3407,7 +3419,7 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 		}
 
 		if des.TenantID != tenant.ID {
-			logger.Warn().Str("Tenant ID", tenant.ID.String()).Str("DPU Extension Service ID", desID.String()).Msg("DPU Extension Service does not belong to current Tenant")
+			logger.Warn().Str("DPU Extension Service ID", desID.String()).Msg("DPU Extension Service does not belong to current Tenant")
 			return cutil.NewAPIErrorResponse(c, http.StatusForbidden, fmt.Sprintf("DPU Extension Service: %s does not belong to current Tenant", desID.String()), nil)
 		}
 
@@ -3532,6 +3544,13 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 			logger.Error().Msgf("NVLink interfaces validation failed: %s", err)
 			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Failed to validate NVLink interfaces specified in request", err)
 		}
+	}
+
+	// Omission preserves attachments; an empty replacement must allow removal
+	// even after the corresponding capability disappears from inventory.
+	apiErr = common.ValidateMachineSpectrumXAttachments(ctx, nil, uih.dbSession, machine.ID, apiRequest.SpectrumXAttachments)
+	if apiErr != nil {
+		return apiErr.Send(c)
 	}
 
 	// Values populated inside the transaction closure that are needed for the response.
@@ -3763,7 +3782,7 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 				}
 
 				if sshkeygroup.TenantID != ui.TenantID {
-					logger.Warn().Str("Tenant ID", ui.TenantID.String()).Str("SSH Key Group ID", skgID.String()).Msg("SSH Key Group does not belong to current Tenant")
+					logger.Warn().Str("SSH Key Group ID", skgID.String()).Msg("SSH Key Group does not belong to current Tenant")
 					return cutil.NewAPIError(http.StatusBadRequest, fmt.Sprintf("Failed to update Instance, SSH Key Group with ID: %s does not belong to Tenant", skgID), nil)
 				}
 
@@ -4416,7 +4435,7 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 			description = *ui.Description
 		}
 
-		interfaceConfigs := make([]*corev1.InstanceInterfaceConfig, len(newdbIfcs))
+		interfaceConfigs := []*corev1.InstanceInterfaceConfig{}
 		for i := range newdbIfcs {
 			ifc := &newdbIfcs[i]
 			if ifc.Status == cdbm.InterfaceStatusDeleting {
@@ -4472,7 +4491,7 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 				interfaceConfig.RoutingProfile = ifc.InlineRoutingProfile.ToProto()
 			}
 
-			interfaceConfigs[i] = interfaceConfig
+			interfaceConfigs = append(interfaceConfigs, interfaceConfig)
 		}
 
 		// Populate InfiniBand Interface details for Site Controller request
@@ -5172,44 +5191,18 @@ func (gaih GetAllInstanceHandler) Handle(c echo.Context) error {
 		if len(sites) != len(siteIDs) {
 			return cutil.NewAPIErrorResponse(c, http.StatusNotFound, "Could not find one or more Sites specified in query", nil)
 		}
-	} else {
-		tsDAO := cdbm.NewTenantSiteDAO(gaih.dbSession)
-		tss, _, err := tsDAO.GetAll(ctx, nil, cdbm.TenantSiteFilterInput{TenantIDs: []uuid.UUID{tenant.ID}}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, []string{cdbm.SiteRelationName})
-		if err != nil {
-			logger.Error().Err(err).Msg("error retrieving Sites for Tenant from DB")
-			return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve Sites for Tenant, DB error", nil)
-		}
-		for _, ts := range tss {
-			// Check if Site relation was loaded successfully
-			if ts.Site != nil {
-				sitesByID[ts.Site.ID] = ts.Site
-			}
-		}
 	}
 
-	// Check TenantSite entry
-	if len(siteIDs) > 0 {
-		tsDAO := cdbm.NewTenantSiteDAO(gaih.dbSession)
-		_, count, err := tsDAO.GetAll(
-			ctx,
-			nil,
-			cdbm.TenantSiteFilterInput{
-				TenantIDs: []uuid.UUID{tenant.ID},
-				SiteIDs:   siteIDs,
-			},
-			cdbp.PageInput{},
-			nil,
-		)
-		if err != nil {
-			logger.Error().Err(err).Msg("error retrieving TenantSite entry")
-			return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to determine Tenant's association with Site", nil)
-		}
-
-		// We've ensured that the set of siteIDs is unique earlier,
-		// so if the counts don't match, then something wasn't found.
-		if count != len(siteIDs) {
+	// Check Tenant access to each Site
+	for _, siteID := range siteIDs {
+		err := common.ValidateTenantSiteAccess(ctx, nil, gaih.dbSession, &tenant, siteID)
+		if errors.Is(err, cdb.ErrDoesNotExist) {
 			return cutil.NewAPIErrorResponse(c, http.StatusForbidden,
 				"Tenant is not associated with one or more of the Sites specified in query", nil)
+		}
+		if err != nil {
+			logger.Error().Err(err).Msg("error checking Tenant access to Site")
+			return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to determine Tenant's association with Site", nil)
 		}
 	}
 
@@ -5393,6 +5386,25 @@ func (gaih GetAllInstanceHandler) Handle(c echo.Context) error {
 	if serr != nil {
 		logger.Error().Err(serr).Msg("error retrieving Instances for this Site")
 		return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve Instances for Site", nil)
+	}
+
+	// Get Sites for Instances that weren't loaded from the siteId query
+	unloadedSiteIDs := goset.NewSet[uuid.UUID]()
+	for _, ins := range dbInstances {
+		_, loaded := sitesByID[ins.SiteID]
+		if !loaded {
+			unloadedSiteIDs.Add(ins.SiteID)
+		}
+	}
+	if unloadedSiteIDs.Cardinality() > 0 {
+		sites, _, err := stDAO.GetAll(ctx, nil, cdbm.SiteFilterInput{SiteIDs: unloadedSiteIDs.ToSlice()}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
+		if err != nil {
+			logger.Error().Err(err).Msg("error retrieving Sites for Instances from DB")
+			return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve Sites for Instances, DB error", nil)
+		}
+		for _, site := range sites {
+			sitesByID[site.ID] = &site
+		}
 	}
 
 	// Make a map for instanceID -> ref Instance

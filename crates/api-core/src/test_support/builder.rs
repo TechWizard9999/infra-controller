@@ -21,8 +21,10 @@ use arc_swap::ArcSwap;
 use carbide_ib_fabric::ib::IBFabricManager;
 use carbide_machine_controller::dpf::DpfOperations;
 use carbide_nvlink_manager::nvlink::test_support::NmxcSimClient;
+use carbide_rack_controller::firmware_object::FirmwareObjectFetcher;
 use carbide_redfish::libredfish::BmcCredentialOps;
 use carbide_redfish::libredfish::test_support::RedfishSim;
+use carbide_resource_pool::ResourcePoolRegistry;
 use carbide_secrets::credentials::CredentialManager;
 use carbide_secrets::test_support::certificates::TestCertificateProvider;
 use carbide_secrets::test_support::credentials::TestCredentialManager;
@@ -56,6 +58,7 @@ use crate::test_support::network::default_test_eth_virt_data;
 pub struct TestApiBuilder {
     db_pool: PgPool,
     common_pools: Arc<CommonPools>,
+    resource_pool_registry: ResourcePoolRegistry,
     work_lock_manager: WorkLockManagerHandle,
     runtime_config: Option<Arc<CarbideConfig>>,
     credential_manager: Option<Arc<dyn CredentialManager>>,
@@ -70,6 +73,7 @@ pub struct TestApiBuilder {
     secrets_context: Option<crate::secrets::SecretsContext>,
     endpoint_explorer: Option<MockEndpointExplorer>,
     console_log_source: Option<Arc<dyn crate::console_logs::ConsoleLogSource>>,
+    firmware_object_fetcher: Option<Arc<dyn FirmwareObjectFetcher>>,
 }
 
 impl TestApiBuilder {
@@ -81,6 +85,7 @@ impl TestApiBuilder {
         TestApiBuilder {
             db_pool,
             common_pools,
+            resource_pool_registry: ResourcePoolRegistry::default(),
             work_lock_manager,
             runtime_config: None,
             credential_manager: None,
@@ -95,6 +100,16 @@ impl TestApiBuilder {
             secrets_context: None,
             endpoint_explorer: None,
             console_log_source: None,
+            firmware_object_fetcher: None,
+        }
+    }
+
+    /// `with_resource_pool_registry` supplies the resolved pool backends used by the API.
+    /// Without one, pool lookups read the database in the caller's transaction.
+    pub fn with_resource_pool_registry(self, resource_pool_registry: ResourcePoolRegistry) -> Self {
+        Self {
+            resource_pool_registry,
+            ..self
         }
     }
 
@@ -211,6 +226,17 @@ impl TestApiBuilder {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_firmware_object_fetcher(
+        self,
+        firmware_object_fetcher: Arc<dyn FirmwareObjectFetcher>,
+    ) -> Self {
+        Self {
+            firmware_object_fetcher: Some(firmware_object_fetcher),
+            ..self
+        }
+    }
+
     pub fn build(self) -> Api {
         let runtime_config = self
             .runtime_config
@@ -319,6 +345,7 @@ impl TestApiBuilder {
             bmc_proxy_passthrough: None,
             eth_data,
             common_pools: self.common_pools,
+            resource_pool_registry: self.resource_pool_registry,
             ib_fabric_manager,
             dynamic_settings,
             endpoint_explorer,
@@ -332,6 +359,9 @@ impl TestApiBuilder {
             machine_state_handler_enqueuer,
             metric_emitter,
             component_manager: self.component_manager.map(|cm| (*cm).clone()),
+            firmware_object_fetcher: self
+                .firmware_object_fetcher
+                .unwrap_or_else(|| Arc::new(reqwest::Client::new())),
             bmc_session_manager,
             bms_client: std::sync::OnceLock::new(),
             secrets_context: self.secrets_context,

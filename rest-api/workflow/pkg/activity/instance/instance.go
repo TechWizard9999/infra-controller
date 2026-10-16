@@ -1183,7 +1183,7 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 	instancesToTerminate := []*cdbm.Instance{}
 
 	// If inventory paging is enabled, we only need to do this once and we do it on the last page
-	if instanceInventory.InventoryPage == nil || instanceInventory.InventoryPage.TotalPages == 0 || (instanceInventory.InventoryPage.CurrentPage == instanceInventory.InventoryPage.TotalPages) {
+	if util.ShouldReconcileDeletions(instanceInventory.GetInventoryPage()) {
 		for _, instance := range existingInstanceIDMap {
 			found := false
 
@@ -1215,7 +1215,7 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 
 			serr := mi.deleteInstanceFromDB(ctx, tx, instance, logger)
 			if serr != nil {
-				slogger.Error().Err(serr).Str("Instance ID", instance.ID.String()).Msg("failed to delete Instance from DB")
+				slogger.Error().Err(serr).Msg("failed to delete Instance from DB")
 				terr := tx.Rollback()
 				if terr != nil {
 					slogger.Error().Err(terr).Msg("failed to rollback transaction")
@@ -1226,7 +1226,7 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 					slogger.Error().Err(err).Msg("error committing Instance delete transaction to DB")
 				} else {
 					// Add delete lifecycle event for metrics
-					slogger.Info().Str("Instance ID", instance.ID.String()).Msg("recording instance delete lifecycle event")
+					slogger.Info().Msg("recording instance delete lifecycle event")
 					instanceLifecycleEvents = append(instanceLifecycleEvents, cwm.InventoryObjectLifecycleEvent{ObjectID: instance.ID, Deleted: cwutil.GetPtr(time.Now())})
 				}
 			}
@@ -1673,7 +1673,7 @@ func (milm ManageInstanceLifecycleMetrics) RecordInstanceStatusTransitionMetrics
 
 	siteName, err := milm.siteNames.Get(ctx, milm.dbSession, siteID)
 	if err != nil {
-		logger.Error().Err(err).Str("Site ID", siteID.String()).Msg("failed to retrieve Site from DB")
+		logger.Error().Err(err).Msg("failed to retrieve Site from DB")
 		return err
 	}
 

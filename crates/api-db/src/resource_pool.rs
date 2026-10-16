@@ -14,6 +14,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+pub mod binding;
+
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
@@ -1440,19 +1442,9 @@ fn expand_ipv6_prefix_range(
 
 // All the numbers between start_s and end_s
 fn expand_int_range(start_s: &str, end_s: &str) -> Result<Vec<i64>, eyre::Report> {
-    let start: i64 = parse_int_range(start_s)?;
-    let end: i64 = parse_int_range(end_s)?;
+    let start = resource_pool::parse_integer_range_bound(start_s)?;
+    let end = resource_pool::parse_integer_range_bound(end_s)?;
     Ok((start..end).collect())
-}
-
-const HEX_PRE: &str = "0x";
-
-fn parse_int_range(data: &str) -> Result<i64, eyre::Report> {
-    let data = data.to_lowercase();
-    let base = if data.starts_with(HEX_PRE) { 16 } else { 10 };
-    let p = data.trim_start_matches(HEX_PRE);
-
-    i64::from_str_radix(p, base).map_err(eyre::Report::from)
 }
 
 /// How often to update the resource pool metrics
@@ -2276,6 +2268,12 @@ mod tests {
                 allocate_exact(&pool_handle, &mut txn, OwnerType::Vpc, "owner", 42).await?;
             assert_eq!(allocated, 42);
 
+            if auto_assign {
+                let result =
+                    allocate_exact(&pool_handle, &mut txn, OwnerType::Vpc, "owner", 42).await;
+                assert!(matches!(result, Err(DatabaseError::FailedPrecondition(_))));
+            }
+
             let rows: Vec<(
                 i32,
                 sqlx::types::Json<ResourcePoolEntryState>,
@@ -2489,6 +2487,11 @@ mod tests {
 
         txn.rollback().await?;
         Ok(())
+    }
+
+    #[test]
+    fn test_expand_int_range_uses_shared_hexadecimal_parser() {
+        assert_eq!(expand_int_range("0X10", "0x0x12").unwrap(), vec![16, 17]);
     }
 
     #[test]

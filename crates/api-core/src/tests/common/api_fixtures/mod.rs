@@ -55,6 +55,7 @@ use carbide_rack_controller::firmware_object::FirmwareObjectFetcher;
 use carbide_rack_controller::handler::RackStateHandler;
 use carbide_rack_controller::io::RackStateControllerIO;
 use carbide_redfish::libredfish::test_support::RedfishSim;
+use carbide_resource_pool::{PoolDefinitionSource, ResourcePoolRegistry};
 use carbide_secrets::credentials::{
     CompositeCredentialManager, CredentialKey, CredentialManager, CredentialReader, CredentialType,
     Credentials,
@@ -218,12 +219,13 @@ pub(in crate::tests) struct TestEnvOverrides {
     /// Optional compute-tray backend injected into the component manager.
     pub(in crate::tests) compute_tray_manager:
         Option<Arc<dyn component_manager::compute_tray_manager::ComputeTrayManager>>,
-
-    /// Optional NV-Switch backend injected into the component manager.
+    pub(in crate::tests) compute_tray_use_state_controller: Option<bool>,
     pub(in crate::tests) nv_switch_manager:
         Option<Arc<dyn component_manager::nv_switch_manager::NvSwitchManager>>,
+    pub(in crate::tests) power_shelf_manager:
+        Option<Arc<dyn component_manager::power_shelf_manager::PowerShelfManager>>,
 
-    /// Optional firmware-object fetcher injected into the rack state handler.
+    /// Optional firmware-object fetcher shared by the API and rack state handler.
     pub(in crate::tests) firmware_object_fetcher: Option<Arc<dyn FirmwareObjectFetcher>>,
 
     pub(in crate::tests) nras_should_fail_parsing: Option<Arc<AtomicBool>>,
@@ -1412,6 +1414,14 @@ async fn create_test_env_with_overrides_inner(
     db::resource_pool::define_all_from(&mut txn, &pool_defs(pool_size))
         .await
         .unwrap();
+    // Bind the populated fixture pools to Integrated before constructing the API.
+    let resource_pool_registry = ResourcePoolRegistry::resolve(
+        PoolDefinitionSource::SeedConfiguration,
+        &mut txn,
+        &HashMap::new(),
+    )
+    .await
+    .unwrap();
     txn.commit().await.unwrap();
 
     let common_pools =
@@ -1458,6 +1468,14 @@ async fn create_test_env_with_overrides_inner(
         test_component_manager.nv_switch = nv_switch_manager;
     }
 
+    if let Some(power_shelf_manager) = overrides.power_shelf_manager.clone() {
+        test_component_manager.power_shelf = power_shelf_manager;
+    }
+
+    if let Some(use_state_controller) = overrides.compute_tray_use_state_controller {
+        test_component_manager.compute_tray_use_state_controller = use_state_controller;
+    }
+
     let test_component_manager = Some(Arc::new(test_component_manager));
     let fake_endpoint_explorer = MockEndpointExplorer::default();
 
@@ -1466,6 +1484,7 @@ async fn create_test_env_with_overrides_inner(
         common_pools.clone(),
         work_lock_manager_handle,
     )
+    .with_resource_pool_registry(resource_pool_registry)
     .with_credential_manager(composite_manager.clone())
     .with_runtime_config(config.clone())
     .with_eth_data(eth_virt_data)
@@ -1473,6 +1492,7 @@ async fn create_test_env_with_overrides_inner(
     .with_metric_emitter(ApiMetricsEmitter::new(&test_meter.meter()))
     .with_redfish_pool(redfish_sim.clone())
     .with_ib_fabric_manager(ib_fabric_manager.clone())
+    .with_firmware_object_fetcher(firmware_object_fetcher.clone())
     .with_endpoint_explorer(fake_endpoint_explorer.clone());
 
     if let Some(rms_client) = rms_sim.as_rms_client() {
@@ -1839,19 +1859,28 @@ async fn create_test_env_with_overrides_inner(
 
     txn.commit().await.unwrap();
 
-    // Create domain
-    let domain: carbide_uuid::domain::DomainId = api
-        .create_domain(Request::new(rpc::protos::dns::CreateDomainRequest {
-            name: "dwrt1.com".to_string(),
-            default_ttl: None,
-        }))
+    // Restart tests keep their database. Reuse the domain so its name stays
+    // unique and existing segments keep the same domain ID.
+    let domain_name = "dwrt1.com";
+    let existing_domain = db::dns::domain::find_by_name(&db_pool, domain_name)
         .await
-        .unwrap()
-        .into_inner()
-        .id
-        .map(::carbide_uuid::domain::DomainId::try_from)
-        .unwrap()
-        .unwrap();
+        .expect("fixture domain lookup succeeds")
+        .into_iter()
+        .find(|domain| domain.vpc_id.is_none());
+    let domain = match existing_domain {
+        Some(domain) => domain.id,
+        None => api
+            .create_domain(Request::new(rpc::protos::dns::CreateDomainRequest {
+                name: domain_name.to_string(),
+                default_ttl: None,
+                vpc_id: None,
+            }))
+            .await
+            .expect("fixture domain creation succeeds")
+            .into_inner()
+            .id
+            .expect("created domain has an ID"),
+    };
 
     let (admin_segments, underlay_segment) = if overrides.create_network_segments.unwrap_or(true) {
         // Create admin network
@@ -2248,14 +2277,52 @@ pub(in crate::tests) async fn network_configured_with_health(
 
 /// Fake an iteration of forge-dpu-agent requesting network config, applying it, and reporting back.
 /// When reporting back, the health and extension services statuses reported by the DPU can be overrridden
-// This fixture reports the compatibility fields populated for older agents.
-#[allow(deprecated)]
 pub(in crate::tests) async fn network_configured_with_health_and_ext_services(
     env: &TestEnv,
     dpu_machine_id: &DpuMachineId,
     dpu_health: Option<rpc::health::HealthReport>,
     extension_services_state: Option<rpc::forge::DpuExtensionServiceDeploymentStatus>,
 ) {
+    report_network_status(
+        env,
+        dpu_machine_id,
+        dpu_health,
+        extension_services_state,
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+/// Fake an iteration of forge-dpu-agent that attaches `lldp` to its network status report.
+pub(in crate::tests) async fn network_configured_with_lldp(
+    env: &TestEnv,
+    dpu_machine_id: &DpuMachineId,
+    lldp: rpc::forge::LldpReport,
+) {
+    try_network_configured_with_lldp(env, dpu_machine_id, lldp)
+        .await
+        .unwrap()
+}
+
+/// Like [`network_configured_with_lldp`], but returns the status report's result.
+pub(in crate::tests) async fn try_network_configured_with_lldp(
+    env: &TestEnv,
+    dpu_machine_id: &DpuMachineId,
+    lldp: rpc::forge::LldpReport,
+) -> Result<(), tonic::Status> {
+    report_network_status(env, dpu_machine_id, None, None, Some(lldp)).await
+}
+
+// This fixture reports the compatibility fields populated for older agents.
+#[allow(deprecated)]
+async fn report_network_status(
+    env: &TestEnv,
+    dpu_machine_id: &DpuMachineId,
+    dpu_health: Option<rpc::health::HealthReport>,
+    extension_services_state: Option<rpc::forge::DpuExtensionServiceDeploymentStatus>,
+    lldp: Option<rpc::forge::LldpReport>,
+) -> Result<(), tonic::Status> {
     let network_config = env
         .api
         .get_managed_host_network_config(Request::new(
@@ -2390,7 +2457,7 @@ pub(in crate::tests) async fn network_configured_with_health_and_ext_services(
             .map(|instance| instance.dpu_extension_service_version),
         dpu_extension_services,
         astra_config_status: None,
-        lldp: None,
+        lldp,
     };
     tracing::trace!(
         network_config_version = %status.network_config_version.as_ref().unwrap(),
@@ -2398,11 +2465,10 @@ pub(in crate::tests) async fn network_configured_with_health_and_ext_services(
         instance_config_version = ?instance_config_version,
         "machine network configured",
     );
-    let _ = env
-        .api
+    env.api
         .record_dpu_network_status(Request::new(status))
         .await
-        .unwrap();
+        .map(|_| ())
 }
 
 /// Fake hardware health service reporting health

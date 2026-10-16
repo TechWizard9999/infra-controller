@@ -16,6 +16,7 @@ import (
 	otrace "go.opentelemetry.io/otel/trace"
 
 	cotel "github.com/NVIDIA/infra-controller/rest-api/common/pkg/otel"
+	cutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
 	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
@@ -50,31 +51,97 @@ var (
 type ExpectedMachine struct {
 	bun.BaseModel `bun:"table:expected_machine,alias:em"`
 
-	ID                       uuid.UUID            `bun:"id,pk"`
-	SiteID                   uuid.UUID            `bun:"site_id,type:uuid,notnull"`
-	Site                     *Site                `bun:"rel:belongs-to,join:site_id=id"`
-	BmcMacAddress            string               `bun:"bmc_mac_address,notnull"`
-	ChassisSerialNumber      string               `bun:"chassis_serial_number,notnull"`
-	SkuID                    *string              `bun:"sku_id"`
-	Sku                      *SKU                 `bun:"rel:belongs-to,join:sku_id=id"`
-	MachineID                *string              `bun:"machine_id"`
-	Machine                  *Machine             `bun:"rel:belongs-to,join:machine_id=id"`
-	FallbackDpuSerialNumbers []string             `bun:"fallback_dpu_serial_numbers,array"`
-	BmcIpAddress             *string              `bun:"bmc_ip_address"`
-	RackID                   *string              `bun:"rack_id"`
-	Name                     *string              `bun:"name"`
-	Manufacturer             *string              `bun:"manufacturer"`
-	Model                    *string              `bun:"model"`
-	Description              *string              `bun:"description"`
-	SlotID                   *int32               `bun:"slot_id"`
-	TrayIdx                  *int32               `bun:"tray_idx"`
-	HostID                   *int32               `bun:"host_id"`
-	IsDpfEnabled             *bool                `bun:"is_dpf_enabled"`
-	Labels                   Labels               `bun:"labels,type:jsonb"`
-	HostLifecycleProfile     HostLifecycleProfile `bun:"host_lifecycle_profile,type:jsonb,notnull"`
-	Created                  time.Time            `bun:"created,nullzero,notnull,default:current_timestamp"`
-	Updated                  time.Time            `bun:"updated,nullzero,notnull,default:current_timestamp"`
-	CreatedBy                uuid.UUID            `bun:"type:uuid,notnull"`
+	ID                       uuid.UUID                  `bun:"id,pk"`
+	SiteID                   uuid.UUID                  `bun:"site_id,type:uuid,notnull"`
+	Site                     *Site                      `bun:"rel:belongs-to,join:site_id=id"`
+	BmcMacAddress            string                     `bun:"bmc_mac_address,notnull"`
+	ChassisSerialNumber      string                     `bun:"chassis_serial_number,notnull"`
+	SkuID                    *string                    `bun:"sku_id"`
+	Sku                      *SKU                       `bun:"rel:belongs-to,join:sku_id=id"`
+	MachineID                *string                    `bun:"machine_id"`
+	Machine                  *Machine                   `bun:"rel:belongs-to,join:machine_id=id"`
+	FallbackDpuSerialNumbers []string                   `bun:"fallback_dpu_serial_numbers,array"`
+	Interfaces               []ExpectedMachineInterface `bun:"interfaces,type:jsonb,notnull,default:'[]'::jsonb"`
+	BmcIpAddress             *string                    `bun:"bmc_ip_address"`
+	RackID                   *string                    `bun:"rack_id"`
+	Name                     *string                    `bun:"name"`
+	Manufacturer             *string                    `bun:"manufacturer"`
+	Model                    *string                    `bun:"model"`
+	Description              *string                    `bun:"description"`
+	SlotID                   *int32                     `bun:"slot_id"`
+	TrayIdx                  *int32                     `bun:"tray_idx"`
+	HostID                   *int32                     `bun:"host_id"`
+	IsDpfEnabled             *bool                      `bun:"is_dpf_enabled"`
+	Labels                   Labels                     `bun:"labels,type:jsonb"`
+	HostLifecycleProfile     HostLifecycleProfile       `bun:"host_lifecycle_profile,type:jsonb,notnull"`
+	Created                  time.Time                  `bun:"created,nullzero,notnull,default:current_timestamp"`
+	Updated                  time.Time                  `bun:"updated,nullzero,notnull,default:current_timestamp"`
+	CreatedBy                uuid.UUID                  `bun:"type:uuid,notnull"`
+}
+
+// ExpectedMachineInterface is host NIC intent persisted by REST and forwarded
+// to Core's ExpectedMachine.host_nics field.
+type ExpectedMachineInterface struct {
+	MacAddress         string                               `json:"mac_address"`
+	NicType            *string                              `json:"nic_type,omitempty"`
+	FixedIP            *string                              `json:"fixed_ip,omitempty"`
+	FixedMask          *string                              `json:"fixed_mask,omitempty"`
+	FixedGateway       *string                              `json:"fixed_gateway,omitempty"`
+	Primary            *bool                                `json:"primary,omitempty"`
+	NetworkSegmentType *ExpectedInterfaceNetworkSegmentType `json:"network_segment_type,omitempty"`
+	Role               *ExpectedInterfaceRole               `json:"role,omitempty"`
+	IPAllocation       *ExpectedInterfaceIPAllocation       `json:"ip_allocation,omitempty"`
+}
+
+// ToProto converts persisted REST interface intent to Core's wire shape.
+func (i ExpectedMachineInterface) ToProto() *corev1.ExpectedHostNic {
+	result := &corev1.ExpectedHostNic{
+		MacAddress:   i.MacAddress,
+		NicType:      i.NicType,
+		FixedIp:      i.FixedIP,
+		FixedMask:    i.FixedMask,
+		FixedGateway: i.FixedGateway,
+		Primary:      i.Primary,
+	}
+	if i.NetworkSegmentType != nil {
+		result.NetworkSegmentType = i.NetworkSegmentType.ToProto().Enum()
+	}
+	if i.Role != nil {
+		result.Role = i.Role.ToProto().Enum()
+	}
+	if i.IPAllocation != nil {
+		result.IpAllocation = i.IPAllocation.ToProto().Enum()
+	}
+	return result
+}
+
+// FromProto replaces this interface with the REST-supported fields from Core.
+func (i *ExpectedMachineInterface) FromProto(proto *corev1.ExpectedHostNic) {
+	if proto == nil {
+		*i = ExpectedMachineInterface{}
+		return
+	}
+	i.MacAddress = proto.MacAddress
+	i.NicType = proto.NicType
+	i.FixedIP = proto.FixedIp
+	i.FixedMask = proto.FixedMask
+	i.FixedGateway = proto.FixedGateway
+	i.Primary = proto.Primary
+	i.NetworkSegmentType = nil
+	if proto.NetworkSegmentType != nil {
+		i.NetworkSegmentType = new(ExpectedInterfaceNetworkSegmentType)
+		i.NetworkSegmentType.FromProto(*proto.NetworkSegmentType)
+	}
+	i.Role = nil
+	if proto.Role != nil {
+		i.Role = new(ExpectedInterfaceRole)
+		i.Role.FromProto(*proto.Role)
+	}
+	i.IPAllocation = nil
+	if proto.IpAllocation != nil {
+		i.IPAllocation = new(ExpectedInterfaceIPAllocation)
+		i.IPAllocation.FromProto(*proto.IpAllocation)
+	}
 }
 
 // HostLifecycleProfile holds per-host lifecycle settings that affect how a host
@@ -131,6 +198,10 @@ func (em *ExpectedMachine) ToProto(creds ExpectedMachineCredentials) *corev1.Exp
 		ChassisSerialNumber:      em.ChassisSerialNumber,
 		FallbackDpuSerialNumbers: em.FallbackDpuSerialNumbers,
 		SkuId:                    em.SkuID,
+	}
+	proto.HostNics = make([]*corev1.ExpectedHostNic, 0, len(em.Interfaces))
+	for _, expectedInterface := range em.Interfaces {
+		proto.HostNics = append(proto.HostNics, expectedInterface.ToProto())
 	}
 
 	if em.BmcIpAddress != nil {
@@ -199,6 +270,7 @@ func (em *ExpectedMachine) ToProto(creds ExpectedMachineCredentials) *corev1.Exp
 // table). A nil proto is a no-op. An invalid or missing proto.Id leaves
 // em.ID unchanged so the caller can validate the proto's UUID before
 // calling.
+// Name and description come from `Metadata`; empty strings become nil.
 func (em *ExpectedMachine) FromProto(proto *corev1.ExpectedMachine, linkedMachineID *string) {
 	if proto == nil {
 		return
@@ -213,6 +285,12 @@ func (em *ExpectedMachine) FromProto(proto *corev1.ExpectedMachine, linkedMachin
 	em.SkuID = proto.SkuId
 	em.MachineID = linkedMachineID
 	em.FallbackDpuSerialNumbers = proto.FallbackDpuSerialNumbers
+	em.Interfaces = make([]ExpectedMachineInterface, 0, len(proto.HostNics))
+	for _, expectedInterface := range proto.HostNics {
+		var restInterface ExpectedMachineInterface
+		restInterface.FromProto(expectedInterface)
+		em.Interfaces = append(em.Interfaces, restInterface)
+	}
 	em.BmcIpAddress = proto.BmcIpAddress
 	if proto.RackId != nil {
 		rackID := proto.RackId.Id
@@ -220,10 +298,10 @@ func (em *ExpectedMachine) FromProto(proto *corev1.ExpectedMachine, linkedMachin
 	} else {
 		em.RackID = nil
 	}
-	em.Name = proto.Name
+	em.Name = cutil.GetPtrIfNotZero(proto.Metadata.GetName())
 	em.Manufacturer = proto.Manufacturer
 	em.Model = proto.Model
-	em.Description = proto.Description
+	em.Description = cutil.GetPtrIfNotZero(proto.Metadata.GetDescription())
 	em.SlotID = proto.SlotId
 	em.TrayIdx = proto.TrayIdx
 	em.HostID = proto.HostId
@@ -241,6 +319,7 @@ type ExpectedMachineCreateInput struct {
 	SkuID                    *string
 	MachineID                *string
 	FallbackDpuSerialNumbers []string
+	Interfaces               []ExpectedMachineInterface
 	BmcIpAddress             *string
 	RackID                   *string
 	Name                     *string
@@ -264,6 +343,7 @@ type ExpectedMachineUpdateInput struct {
 	SkuID                    *string
 	MachineID                *string
 	FallbackDpuSerialNumbers []string
+	Interfaces               []ExpectedMachineInterface
 	BmcIpAddress             *string
 	RackID                   *string
 	Name                     *string
@@ -344,6 +424,9 @@ type ExpectedMachineDAO interface {
 	UpdateMultiple(ctx context.Context, tx *db.Tx, inputs []ExpectedMachineUpdateInput) ([]ExpectedMachine, error)
 	// Delete used to delete row
 	Delete(ctx context.Context, tx *db.Tx, expectedMachineID uuid.UUID) error
+	// DeleteIfUnchanged deletes only the version observed by inventory reconciliation.
+	// It returns false if the row changed or no longer exists.
+	DeleteIfUnchanged(ctx context.Context, tx *db.Tx, expectedMachineID uuid.UUID, updated time.Time) (bool, error)
 	// DeleteAll deletes all rows matching a required filter
 	DeleteAll(ctx context.Context, tx *db.Tx, filter ExpectedMachineFilterInput) error
 	// ReplaceAll replaces all rows matching a required filter
@@ -411,6 +494,7 @@ func (emsd ExpectedMachineSQLDAO) CreateMultiple(ctx context.Context, tx *db.Tx,
 			SkuID:                    input.SkuID,
 			MachineID:                input.MachineID,
 			FallbackDpuSerialNumbers: input.FallbackDpuSerialNumbers,
+			Interfaces:               input.Interfaces,
 			BmcIpAddress:             input.BmcIpAddress,
 			RackID:                   input.RackID,
 			Name:                     input.Name,
@@ -783,6 +867,10 @@ func (emsd ExpectedMachineSQLDAO) UpdateMultiple(ctx context.Context, tx *db.Tx,
 			em.FallbackDpuSerialNumbers = input.FallbackDpuSerialNumbers
 			columnsSet["fallback_dpu_serial_numbers"] = true
 		}
+		if input.Interfaces != nil {
+			em.Interfaces = input.Interfaces
+			columnsSet["interfaces"] = true
+		}
 		if input.Labels != nil {
 			em.Labels = input.Labels
 			columnsSet["labels"] = true
@@ -1039,6 +1127,22 @@ func (emsd ExpectedMachineSQLDAO) Delete(ctx context.Context, tx *db.Tx, expecte
 	}
 
 	return nil
+}
+
+// DeleteIfUnchanged deletes a row only if its Updated timestamp matches updated.
+// It returns false if the row changed or no longer exists.
+func (emsd ExpectedMachineSQLDAO) DeleteIfUnchanged(ctx context.Context, tx *db.Tx, expectedMachineID uuid.UUID, updated time.Time) (_ bool, retErr error) {
+	ctx, expectedMachineDAOSpan := cotel.StartSpan(ctx, "ExpectedMachineDAO.DeleteIfUnchanged")
+	defer func() { cotel.EndSpan(expectedMachineDAOSpan, retErr) }()
+	cotel.SetAttribute(expectedMachineDAOSpan, attribute.String("id", expectedMachineID.String()))
+
+	result, err := db.GetIDB(tx, emsd.dbSession).NewDelete().Model((*ExpectedMachine)(nil)).
+		Where("id = ?", expectedMachineID).Where("updated = ?", updated).Exec(ctx)
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	return count > 0, err
 }
 
 // DeleteAll deletes all ExpectedMachines matching the supplied filter. An

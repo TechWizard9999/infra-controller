@@ -195,6 +195,37 @@ The gateway reads its listener address only at startup. Restarting the controlle
 Deployment applies a changed address and resets the gateway's process-local
 partition state, as described above.
 
+## NMX-C mock
+
+Machine-a-tron also hosts an NMX-C (NVLink controller) mock on the same
+listener, always mounted, answering for every simulated rack with its own
+NVLink domain and partition table. NICo reaches a rack's controller at a
+switch NVOS address on port 9370, so in controller mode `mat-k8s-controller`
+creates a `mat-nvos-<id>` Service per switch that publishes the switch's NVOS
+lease as `externalIPs`, exactly as the BMC Services publish BMC IPs. The same
+Service forwards port 443 to the switch's NVUE REST API mock, which answers
+with the switch's NVOS credentials as NICo stores them, rotated password
+included, so hardware health's NVUE collector and the BMC proxy's switch
+targets work against a simulated rack. The NVOS network (the `[networks.*]`
+prefix that `underlayDhcpRelayAddress` belongs to) must meet the same
+[Requirements](#requirements) as the BMC network. Override mode has no
+per-switch routing, so NICo cannot reach either mock there.
+
+Because NICo dials by address, it verifies the NMX-C mock's certificate
+against `nvlink_config.nmx_c_tls_authority`. Every pod's certificate carries
+`certificate.extraDnsNames`, `mat-mock.nvidia.com` by default, for that
+purpose. That setting does not cover the NVUE mock on port 443: hardware
+health's NVUE REST collector accepts any server certificate unless its
+`[tls.switch]` profile is configured, in which case it verifies the mock
+against that profile's CA bundle and `tls_server_name`, and the BMC proxy
+accepts any upstream certificate. The simulation profile
+`helm-prereqs/values/nico-core-simulation.yaml` ships the matching
+`[nvlink_config]` block; refer to
+[Machine-a-tron NMX-C Mock](../../../docs/development/machine-a-tron-nmxc-mock.md)
+for what it serves and its limitations. The optional `[nmxc_mock]` section of
+the MAT configuration sets the reported version and the factory partition each
+rack boots with.
+
 ## Logging
 
 The chart defaults `machineATron.logFormat` to `logfmt`, so machine-a-tron emits
@@ -273,7 +304,7 @@ pods:
         hostCount: 5
         dpuPerHostCount: 2
         bmcDhcpRelayAddress: "10.200.0.1"  # All pods share same relay
-        underlayDhcpRelayAddress: "10.104.0.1"
+        underlayDhcpRelayAddress: "10.201.0.1"
   mat-1:
     machines:
       rack-machines:
@@ -281,7 +312,7 @@ pods:
         hostCount: 5
         dpuPerHostCount: 2
         bmcDhcpRelayAddress: "10.200.0.1"
-        underlayDhcpRelayAddress: "10.104.0.1"
+        underlayDhcpRelayAddress: "10.201.0.1"
 
 macAddressPool:
   enabled: true
@@ -379,8 +410,9 @@ adds a dynamic target UDP port for IPMI access.
   dynamically allocated clusterIP or hides the real destination. This is a
   hard requirement that neither the chart nor the controller checks. Run
   `helm-prereqs/check-mat-service-cidr.py` against the values file before
-  every `helm upgrade --install`. It resolves each `bmcDhcpRelayAddress` to
-  its `[networks.*]` prefix in the Core values file or a rendered site config,
+  every `helm upgrade --install`. It resolves each `bmcDhcpRelayAddress`, and
+  each `underlayDhcpRelayAddress` where set, to its `[networks.*]` prefix in
+  the Core values file or a rendered site config,
   reads the ServiceCIDR from the cluster (`SCALE_SERVICE_CIDRS` overrides it),
   and exits nonzero on an overlap, an unresolved relay, an unknown
   ServiceCIDR, or a Controller Mode values file without `pods`, which would
@@ -399,6 +431,11 @@ adds a dynamic target UDP port for IPMI access.
   relay Services a small dedicated ServiceCIDR (`10.96.127.0/24` in that
   section) and keep the BMC network clear of every other ServiceCIDR.
 - NICo assigns unique BMC IPs from the configured network
+- The NVOS network (the prefix that `underlayDhcpRelayAddress` belongs to)
+  has the same requirement: the controller publishes each NVLink switch's
+  NVOS lease as the `externalIPs` of a `mat-nvos-*` Service for the hosted
+  [NMX-C mock](#nmx-c-mock). `check-mat-service-cidr.py` checks it alongside
+  the BMC network.
 - Default ServiceCIDR ranges to stay clear of:
   - `10.96.0.0/12` - vanilla Kubernetes (kubeadm)
   - `10.96.0.0/16` - KinD
@@ -452,7 +489,7 @@ pods:
         hostCount: 10
         dpuPerHostCount: 2
         bmcDhcpRelayAddress: "10.200.0.1"
-        underlayDhcpRelayAddress: "10.104.0.1"
+        underlayDhcpRelayAddress: "10.201.0.1"
 ```
 
 ### IPMI/SOL Simulation
@@ -541,8 +578,9 @@ PersistentVolume.
 The chart creates one PersistentVolumeClaim for each configured `pods` entry
 that contains at least one machine group. It mounts the claim at
 `machineATron.persistDir`, which defaults to `/tmp/machine-a-tron-data`.
-Machine-a-tron stores simulated machine identity and installed operating-system
-state there. On a graceful pod restart it restores the devices and resumes them
+Machine-a-tron stores simulated machine identity, installed operating-system
+state, and the credentials each simulated BMC and switch NVOS currently accepts
+there. On a graceful pod restart it restores the devices and resumes them
 powered on. Without persistence, a restart creates new powered-off simulator
 state while Core may still consider the old machines assigned, preventing the
 simulated DPU agents from resuming their reports.
@@ -760,7 +798,7 @@ Startup probe failed: dial tcp ...:1266: connect: connection refused
 ```
 
 machine-a-tron binds its Redfish port only after it has registered every
-expected rack, host, switch, and power shelf with nico-api. The default
+expected rack group, rack, host, switch, and power shelf with nico-api. The default
 `startupProbe` allows 120 x 30 s = 60 min. If registration takes longer,
 raise `startupProbe.failureThreshold` in your values file; the sizing rule is
 in the `startupProbe` comment in the chart's `values.yaml`.
