@@ -63,6 +63,44 @@ func TestSession_fetchDPUMachines(t *testing.T) {
 	}
 }
 
+func TestSession_fetchNVLinkDomains(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		site      string
+		wantError string
+	}{
+		{name: "selected site", site: "site-1"},
+		{name: "missing site", wantError: "siteId must be resolved before NVLink domains"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				assert.Equal(t, "/v2/org/acme/nico/domain/nvlink", r.URL.Path)
+				assert.Equal(t, test.site, r.URL.Query().Get("siteId"))
+				_, _ = io.WriteString(w, `[{"id":"domain-1","name":"Domain One"},{"id":"domain-2","name":""}]`)
+			}))
+			defer server.Close()
+			session := NewSession(appcli.NewClient(server.URL, "acme", "token", nil, false), "acme", "")
+			session.Scope.SiteID = test.site
+
+			items, err := session.Resolver.Fetch(context.Background(), "domain")
+
+			if test.wantError != "" {
+				require.ErrorContains(t, err, test.wantError)
+				assert.Zero(t, requests)
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, items, 2)
+			assert.Equal(t, "Domain One", items[0].Name)
+			assert.Equal(t, "domain-1", items[0].ID)
+			assert.Equal(t, "domain-2", items[1].Name)
+			assert.Equal(t, 1, requests)
+		})
+	}
+}
+
 func TestSession_fetchSpectrumXPartitions(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
