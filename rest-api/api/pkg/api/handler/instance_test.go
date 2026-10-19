@@ -8011,7 +8011,7 @@ func TestUpdateInstanceHandler_Handle(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "test Instance update succeeds with empty NVLink list and unrelated Deleting Ethernet interface",
+			name: "test Instance update without interfaces skips unrelated Deleting Ethernet interface",
 			fields: fields{
 				dbSession: dbSession,
 				tc:        tc,
@@ -8029,7 +8029,6 @@ func TestUpdateInstanceHandler_Handle(t *testing.T) {
 				reqUser:                          tnu1,
 				respCode:                         http.StatusOK,
 				expectedRespNVLinkInterfaceCount: cutil.GetPtr(0),
-				ethInterfacesToDelete:            []cdbm.Interface{*deletingEthIfcForEmptyNVLinkUpdate},
 				beforeHandle: func(t *testing.T) {
 					originalClient := scp.IDClientMap[st2.ID.String()]
 					scp.IDClientMap[st2.ID.String()] = tsc
