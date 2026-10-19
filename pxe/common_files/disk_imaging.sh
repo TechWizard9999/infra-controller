@@ -148,7 +148,7 @@ function find_bootdisk() {
 	else
 		image_disk=$(find_efi_disk $disk_names)
 		if [ -z "$image_disk" ]; then
-			image_disk=$(echo "$disk_names" | head -n 1)
+			image_disk=$(echo "$disk_names" | grep -E '^/dev/(nvme[0-9]+n[0-9]+|[sv]d[a-z]+)$' | head -n 1)
 		fi
 	fi
 

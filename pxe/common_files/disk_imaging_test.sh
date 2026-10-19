@@ -75,10 +75,6 @@ set_blkid_result() {
 	: >"$log_output"
 }
 
-set_lsblk_esp_disk() {
-	mock_lsblk_esp_disk=$1
-}
-
 blkid() {
 	printf '%s' "$mock_blkid_stdout"
 	printf '%s' "$mock_blkid_stderr" >&2
@@ -266,6 +262,12 @@ mock_lsblk_esp_disk=
 image_disk=
 find_bootdisk
 assert_eq "version-sorted name order is preserved without EFI" "/dev/nvme0n1" "$image_disk"
+
+mock_lsblk_scan=$'/dev/mmcblk0 8589934592 disk\n/dev/nvme0n1 21474836480 disk'
+mock_lsblk_esp_disk=
+image_disk=
+find_bootdisk
+assert_eq "fallback skips non-selector disks such as eMMC" "/dev/nvme0n1" "$image_disk"
 
 mock_lsblk_scan=$'/dev/vda 10737418240 disk'
 mock_lsblk_esp_disk=
