@@ -1533,6 +1533,12 @@ func TestNewApp_VpcPeeringListOutputAndRelationRequests(t *testing.T) {
 			"vpc1": {"name": "Application VPC"},
 			"vpc2Id": "vpc2-id",
 			"vpc2": {"name": "Storage VPC"}
+		},
+		{
+			"id": "orphan-peering-id",
+			"vpc1Id": "vpc3-id",
+			"vpc1": {"name": "Edge VPC"},
+			"vpc2Id": "vpc4-id"
 		}
 	]`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -1590,9 +1596,11 @@ func TestNewApp_VpcPeeringListOutputAndRelationRequests(t *testing.T) {
 			require.Len(t, requests, before+1)
 			assert.Equal(t, test.wantRelations, requests[before]["includeRelation"])
 			if test.wantTableOutput {
-				for _, want := range []string{"ID", "VPC1 Name", "VPC1 ID", "VPC2 Name", "VPC2 ID", "peering-id", "Application VPC", "Storage VPC"} {
-					assert.Contains(t, output, want)
-				}
+				assert.Equal(t, ""+
+					"ID                 VPC1 Name        VPC1 ID  VPC2 Name    VPC2 ID\n"+
+					"peering-id         Application VPC  vpc1-id  Storage VPC  vpc2-id\n"+
+					"orphan-peering-id  Edge VPC         vpc3-id               vpc4-id\n",
+					output)
 			}
 			switch test.wantFormat {
 			case "json":
