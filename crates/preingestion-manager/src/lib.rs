@@ -1924,6 +1924,7 @@ impl PreingestionManagerStatic {
         &self,
         redfish_client: &dyn libredfish::Redfish,
         endpoint: &ExploredEndpoint,
+        last_time: Option<&DateTime<Utc>>,
     ) -> bool {
         if let Err(e) = redfish_client.get_tasks().await {
             tracing::info!(
@@ -1948,7 +1949,7 @@ impl PreingestionManagerStatic {
             Err(_) => return false,
         }
 
-        let mut status = match redfish_client.get_power_state().await {
+        let status = match redfish_client.get_power_state().await {
             Ok(status) => status,
             Err(e) => {
                 tracing::warn!(
@@ -1959,12 +1960,18 @@ impl PreingestionManagerStatic {
                 return false;
             }
         };
-        // On can leave a BlueField-3 in the UEFI shell reporting Paused.
-        // Restart only in that case, and still require On before advancing.
+        // A BlueField-3 also reports Paused while booting, so only treat it as
+        // stuck in the UEFI shell once it stays Paused past the grace period.
         if status == PowerState::Paused
             && endpoint.report.identify_dpu() == Some(DpuModel::BlueField3)
         {
-            if instrument_power_op(
+            if Utc::now().signed_duration_since(last_time.unwrap_or(&Utc::now()))
+                < chrono::TimeDelta::minutes(5)
+            {
+                return false;
+            }
+            // Returning true advances to the boot wait, which decides whether the restart worked.
+            return instrument_power_op(
                 PowerOperation::ForceRestart,
                 redfish_client.power(SystemPowerControl::ForceRestart),
                 PowerControlLog::RecoverySequence {
@@ -1972,21 +1979,7 @@ impl PreingestionManagerStatic {
                 },
             )
             .await
-            .is_err()
-            {
-                return false;
-            }
-            status = match redfish_client.get_power_state().await {
-                Ok(status) => status,
-                Err(e) => {
-                    tracing::warn!(
-                        bmc_ip_address = %endpoint.address,
-                        error = %e,
-                        "Could not get power state"
-                    );
-                    return false;
-                }
-            };
+            .is_ok();
         }
         if status != PowerState::On {
             tracing::warn!(
@@ -2066,9 +2059,24 @@ impl PreingestionManagerStatic {
             }
             InitialResetPhase::BMCWasReset => {
                 if !self
-                    .execute_wait_bmc_and_power_on(redfish_client.as_ref(), endpoint)
+                    .execute_wait_bmc_and_power_on(redfish_client.as_ref(), endpoint, last_time)
                     .await
                 {
+                    // A host that never powers on is terminal here; without this it would retry forever.
+                    if Utc::now().signed_duration_since(last_time.unwrap_or(&Utc::now()))
+                        > chrono::TimeDelta::minutes(30)
+                    {
+                        db.with_txn(|txn| {
+                            db::explored_endpoints::set_preingestion_failed(
+                                endpoint.address,
+                                "Host did not power on within 30 minutes of the BMC reset"
+                                    .to_string(),
+                                txn,
+                            )
+                            .boxed()
+                        })
+                        .await??;
+                    }
                     return Ok(());
                 }
                 tracing::info!(
@@ -2168,9 +2176,37 @@ impl PreingestionManagerStatic {
             }
             TimeSyncResetPhase::BMCWasReset => {
                 if !self
-                    .execute_wait_bmc_and_power_on(redfish_client.as_ref(), endpoint)
+                    .execute_wait_bmc_and_power_on(redfish_client.as_ref(), endpoint, last_time)
                     .await
                 {
+                    // Count a host that never turns on as a failed cycle so the attempt budget applies.
+                    if Utc::now().signed_duration_since(last_time.unwrap_or(&Utc::now()))
+                        > chrono::TimeDelta::minutes(30)
+                    {
+                        let attempts_done = attempt + 1;
+                        if attempts_done < MAX_TIME_SYNC_RESET_ATTEMPTS {
+                            db.with_txn(|txn| {
+                                db::explored_endpoints::set_preingestion_time_sync_reset(
+                                    endpoint.address,
+                                    TimeSyncResetPhase::Start,
+                                    attempts_done,
+                                    txn,
+                                )
+                                .boxed()
+                            })
+                            .await??;
+                        } else {
+                            db.with_txn(|txn| {
+                                db::explored_endpoints::set_preingestion_failed(
+                                    endpoint.address,
+                                    format!("Host did not power on after BMC reset in {attempts_done} attempts"),
+                                    txn,
+                                )
+                                .boxed()
+                            })
+                            .await??;
+                        }
+                    }
                     return Ok(false);
                 }
                 tracing::info!(

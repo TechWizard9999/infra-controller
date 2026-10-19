@@ -543,6 +543,11 @@ async fn test_preingestion_time_sync_reset_accepts_paused_power_state_for_dpu(
         "host must not power on while the BMC reset is still in progress"
     );
 
+    // The paused DPU has been in the reset window long enough to restart it.
+    let mut txn = pool.begin().await?;
+    db::explored_endpoints::pregestion_hostboot_time_test(dpu_ip, &mut txn).await?;
+    txn.commit().await?;
+
     // A failed restart must leave recovery retryable, not advance past Paused.
     redfish_sim.fail_next_power_action(
         SystemPowerControl::ForceRestart,
@@ -607,6 +612,117 @@ async fn test_preingestion_time_sync_reset_accepts_paused_power_state_for_dpu(
         preingestion_state(&pool, dpu_ip).await?,
         PreingestionState::Complete
     );
+
+    Ok(())
+}
+
+/// A paused BlueField-3 may be booting, so it is not restarted within the grace period.
+#[sqlx_test]
+async fn test_preingestion_time_sync_reset_waits_grace_before_restarting_paused_dpu(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = TestHarness::builder(pool.clone()).build().await;
+    let domain = env.test_domain().await;
+    let nc = env.network_controller();
+    let underlay_segment = nc.create_underlay_segment(&domain).await;
+    let mut config = default_config::get();
+    config.ntp_servers.clear();
+
+    let redfish_sim = Arc::new(RedfishSim::default());
+    redfish_sim.set_bmc_time_offset_seconds(600);
+    redfish_sim.set_paused_when_off(true);
+    let mgr = PreingestionManager::new(
+        pool.clone(),
+        config.preingestion_manager(),
+        redfish_sim.clone(),
+        env.test_meter.meter(),
+        None,
+        None,
+        None,
+        env.api().work_lock_manager_handle(),
+        config.ntp_servers,
+    );
+    let dpu_ip = prepare_time_sync_endpoint(
+        &env,
+        &pool,
+        underlay_segment.relay_address,
+        "b8:3f:d2:90:97:a8",
+        true,
+    )
+    .await?;
+    let timepoint = redfish_sim.timepoint();
+
+    mgr.run_single_iteration().await?;
+    mgr.run_single_iteration().await?;
+
+    assert!(matches!(
+        preingestion_state(&pool, dpu_ip).await?,
+        PreingestionState::TimeSyncReset {
+            phase: TimeSyncResetPhase::BMCWasReset,
+            ..
+        }
+    ));
+    let actions = redfish_sim
+        .actions_since(&timepoint)
+        .for_host(&dpu_ip.to_string());
+    assert!(actions.contains(&RedfishSimAction::Power(SystemPowerControl::On)));
+    assert!(
+        !actions.contains(&RedfishSimAction::Power(SystemPowerControl::ForceRestart)),
+        "a paused DPU must not be restarted within the grace period"
+    );
+
+    Ok(())
+}
+
+/// A host that never powers on is retried as a failed cycle after 30 minutes.
+#[sqlx_test]
+async fn test_preingestion_time_sync_reset_counts_host_power_on_timeout_as_attempt(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = TestHarness::builder(pool.clone()).build().await;
+    let domain = env.test_domain().await;
+    let nc = env.network_controller();
+    let underlay_segment = nc.create_underlay_segment(&domain).await;
+    let mut config = default_config::get();
+    config.ntp_servers.clear();
+
+    let redfish_sim = Arc::new(RedfishSim::default());
+    redfish_sim.set_bmc_time_offset_seconds(600);
+    redfish_sim.set_bmc_reset_unavailable_polls(usize::MAX);
+    let mgr = PreingestionManager::new(
+        pool.clone(),
+        config.preingestion_manager(),
+        redfish_sim.clone(),
+        env.test_meter.meter(),
+        None,
+        None,
+        None,
+        env.api().work_lock_manager_handle(),
+        config.ntp_servers,
+    );
+    let dpu_ip = prepare_time_sync_endpoint(
+        &env,
+        &pool,
+        underlay_segment.relay_address,
+        "b8:3f:d2:90:97:a9",
+        true,
+    )
+    .await?;
+
+    mgr.run_single_iteration().await?;
+    let mut txn = pool.begin().await?;
+    db::explored_endpoints::pregestion_hostboot_time_test(dpu_ip, &mut txn).await?;
+    txn.commit().await?;
+    mgr.run_single_iteration().await?;
+
+    assert!(matches!(
+        preingestion_state(&pool, dpu_ip).await?,
+        PreingestionState::TimeSyncReset {
+            phase: TimeSyncResetPhase::Start,
+            attempt: 1,
+            ..
+        }
+    ));
 
     Ok(())
 }
