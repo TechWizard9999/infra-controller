@@ -278,36 +278,55 @@ This ordering gives the operator a reliable place to:
   contradicts an operator override, because the override is evaluated
   first and decides the packet.
 
-> **Warning:** Override rules are evaluated statelessly. A one-way `Permit` override will not allow return traffic; you must write the matching opposite-direction rule manually.
+> **Warning:** `policy_overrides` are stateless, even when
+> `stateful_acls_enabled = true`. They are evaluated before tenant NSGs,
+> so tenant `stateful_egress` cannot allow a reply denied by an override.
+> Add an explicit opposite-direction rule for return traffic.
 
 Each entry follows the same JSON / TOML structure as a tenant rule. A
 worked example:
 
 ```toml
 [network_security_group]
-stateful_acls_enabled = false
 max_network_security_group_size = 200
 
-  [[network_security_group.policy_overrides]]
-  direction = "Egress"
-  ipv6 = false
-  protocol = "Udp"
-  dst_net = "10.0.5.0/24"          # site-controller VIPs
-  dst_port_start = 123
-  dst_port_end = 123
-  action = "Permit"
-  priority = 10
+[[network_security_group.policy_overrides]]
+direction = "Ingress"
+ipv6 = false
+protocol = "Tcp"
+src_net = { Prefix = "192.0.2.0/24" }
+dst_net = { Prefix = "198.51.100.0/24" }
+dst_port_start = 6443
+dst_port_end = 6443
+action = "Permit"
+priority = 25
 
-  [[network_security_group.policy_overrides]]
-  direction = "Egress"
-  ipv6 = false
-  protocol = "Tcp"
-  dst_net = "0.0.0.0/0"
-  dst_port_start = 22
-  dst_port_end = 22
-  action = "Deny"
-  priority = 20
+[[network_security_group.policy_overrides]]
+direction = "Egress"
+ipv6 = false
+protocol = "Tcp"
+src_net = { Prefix = "198.51.100.0/24" }
+dst_net = { Prefix = "192.0.2.0/24" }
+src_port_start = 6443
+src_port_end = 6443
+action = "Permit"
+priority = 26
+
+[[network_security_group.policy_overrides]]
+direction = "Egress"
+ipv6 = false
+protocol = "Any"
+src_net = { Prefix = "0.0.0.0/0" }
+dst_net = { Prefix = "192.0.2.0/24" }
+action = "Deny"
+priority = 101
 ```
+
+The first rule permits client traffic to the service. The second permits
+the reply traffic, matching the service port on the source side. Both
+`src_net` and `dst_net` use the `Prefix` variant. Without the explicit
+return rule, the egress deny drops the reply before any tenant NSG rule is
+evaluated.
 
 Changing `policy_overrides` requires restarting the API server (it is a
 static configuration field, not a runtime-mutable RPC). After restart, the
@@ -349,10 +368,8 @@ worth knowing before designing rule sets:
 - **`policy_overrides` are always stateless.** Unlike tenant NSGs, operator
   override rules never participate in connection tracking, even when
   `stateful_acls_enabled = true`. Every permit override that expects a
-  reply must include an explicit opposite-direction rule (with the port
-  field on the correct side — e.g., an Ingress permit to `dst_port=6443`
-  needs an Egress permit with `src_port=6443`). No validation warns about
-  missing return legs.
+  reply must include an explicit opposite-direction rule, with the port
+  field on the correct side. NICo does not validate missing return legs.
 
 ---
 
@@ -438,4 +455,4 @@ For a given tenant configuration, confirm:
 | NSG rule change made, but `configs_synced.ethernet` / instance `Ready` never reacted | Expected: NSG changes do not feed `configs_synced`. Track rollout via `networkSecurityGroupPropagationDetails` instead |
 | NSG propagation status stuck `Synchronizing` (`unpropagatedInstanceIds` non-empty) | DPUs on the listed instances have not yet applied the current NSG version; check DPU health and the per-interface config push |
 | NSG propagation status `Error` | A DPU rejected the rule set (for example, expanded size over the DPU ceiling); inspect the propagation `details` string |
-| One-way override permit works but connection hangs | `policy_overrides` are stateless; add explicit return-leg rule in opposite direction |
+| One-way override permit works but connection hangs | `policy_overrides` are stateless; add an explicit opposite-direction return rule, placing the service port on the correct side |
