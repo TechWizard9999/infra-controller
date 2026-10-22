@@ -24,8 +24,8 @@ use crate::infiniband::Guid;
 use crate::mac_address_pool::{MacAddressPool, PoolConfig as MacAddressPoolConfig};
 use crate::redfish::update_service::UpdateServiceConfig;
 use crate::{
-    Callbacks, DUMMY_FACTORY_PASSWORD, DUMMY_FACTORY_USERNAME, HardwareType, RackPlacement, hw,
-    redfish,
+    Callbacks, DUMMY_FACTORY_PASSWORD, DUMMY_FACTORY_USERNAME, DUMMY_NVOS_USERNAME, HardwareType,
+    RackPlacement, hw, nvue, redfish,
 };
 
 /// Represents static information we know ahead of time about a host or DPU (independent of any
@@ -308,16 +308,6 @@ impl DpuMachineInfo {
             | HardwareType::NvidiaSwitchNd5200Ld
             | HardwareType::NvidiaSwitchN5700Ld => DpuType::Bluefield3,
             HardwareType::DellPowerEdgeR760Bf4 | HardwareType::NvidiaDgxVr => DpuType::Bluefield4,
-        }
-    }
-
-    /// The [`bmc_vendor::DpuModel`] this DPU emulates, so the mock can share
-    /// per-model logic (e.g. factory-default credentials) with the rest of the
-    /// stack rather than duplicating it against the local [`DpuType`].
-    fn dpu_model(&self) -> bmc_vendor::DpuModel {
-        match self.dpu_type() {
-            DpuType::Bluefield3 => bmc_vendor::DpuModel::BlueField3,
-            DpuType::Bluefield4 => bmc_vendor::DpuModel::BlueField4,
         }
     }
 
@@ -761,6 +751,25 @@ impl HostMachineInfo {
             DUMMY_FACTORY_USERNAME,
             DUMMY_FACTORY_PASSWORD,
         )
+    }
+
+    /// The NVOS a switch tray runs, served over NVUE at its NVOS address;
+    /// `None` for hardware without one. The administrator starts on the
+    /// factory password, as the BMC's accounts do.
+    pub(crate) fn nvue_config(&self) -> Option<nvue::Config> {
+        let admin = nvue::Account::new(DUMMY_NVOS_USERNAME, DUMMY_FACTORY_PASSWORD);
+        let management_mac = self.nvos_mac_addresses.first().copied();
+        match self.hw_type {
+            HardwareType::NvidiaSwitchN5700Ld => Some(
+                self.nvidia_switch_n5700_ld()
+                    .nvue_config(management_mac, admin),
+            ),
+            HardwareType::NvidiaSwitchNd5200Ld => Some(
+                self.nvidia_switch_nd5200_ld()
+                    .nvue_config(management_mac, admin),
+            ),
+            _ => None,
+        }
     }
 
     fn dell_poweredge_r750(&self) -> hw::dell_poweredge_r750::DellPowerEdgeR750<'_> {
@@ -1305,9 +1314,11 @@ impl MachineInfo {
         match self {
             MachineInfo::Host(h) => h.factory_default_account(),
             MachineInfo::Dpu(d) => {
-                // Read the per-model default from the shared source of truth so the
-                // mock and site-explorer's fallback cannot drift.
-                let (username, password) = d.dpu_model().default_factory_credentials();
+                let username = match d.dpu_type() {
+                    DpuType::Bluefield3 => "root",
+                    DpuType::Bluefield4 => "admin",
+                };
+                let password = "0penBmc";
                 redfish::account_service::Account::administrator(username, username, password)
             }
         }
@@ -1390,6 +1401,31 @@ mod tests {
             .expect("valid hardware MAC pool");
         let dpu = DpuMachineInfo::new(hw_type, pool, DpuSettings::default());
         HostMachineInfo::new(hw_type, vec![dpu], pool, hw_mac_addr_pool)
+    }
+
+    #[test]
+    fn bluefield_factory_accounts_use_generation_credentials() {
+        for (hardware_type, username) in [
+            (HardwareType::DellPowerEdgeR750, "root"),
+            (HardwareType::DellPowerEdgeR760Bf4, "admin"),
+        ] {
+            let mut pool = MacAddressPool::new(Config {
+                ranges: None,
+                pool: Some(PoolConfig::new(MacAddress::new([2, 0, 0, 0, 0, 0]), 16).unwrap()),
+            });
+            let info = MachineInfo::Dpu(dpu(
+                hardware_type,
+                &mut pool,
+                DpuFirmwareVersions::default(),
+            ));
+            let accounts =
+                redfish::account_service::AccountServiceState::new(info.factory_default_account());
+            assert!(
+                accounts.is_factory_default_password(username, "0penBmc"),
+                "{hardware_type}"
+            );
+            assert!(accounts.find(username).is_some(), "{hardware_type}");
+        }
     }
 
     #[test]

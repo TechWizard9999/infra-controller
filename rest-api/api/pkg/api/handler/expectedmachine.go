@@ -113,20 +113,6 @@ func (cemh CreateExpectedMachineHandler) Handle(c echo.Context) error {
 		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Failed to validate Expected Machine creation data", verr)
 	}
 
-	// Validate that SKU exists if specified
-	if apiRequest.SkuID != nil {
-		skuDAO := cdbm.NewSkuDAO(cemh.dbSession)
-		_, err = skuDAO.Get(ctx, nil, *apiRequest.SkuID)
-		if err != nil {
-			if errors.Is(err, cdb.ErrDoesNotExist) {
-				logger.Warn().Msg("SKU ID specified in request does not exist")
-				return cutil.NewAPIErrorResponse(c, http.StatusUnprocessableEntity, "SKU ID specified in request does not exist", nil)
-			}
-			logger.Warn().Err(err).Msg("error validating SKU ID in request data")
-			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Failed to validate SKU ID in request data due to DB error", nil)
-		}
-	}
-
 	// Retrieve the Site from the DB
 	site, err := common.GetSiteFromIDString(ctx, nil, apiRequest.SiteID, cemh.dbSession)
 	if err != nil {
@@ -154,6 +140,24 @@ func (cemh CreateExpectedMachineHandler) Handle(c echo.Context) error {
 
 	if !hasAccess {
 		return cutil.NewAPIErrorResponse(c, http.StatusForbidden, "User does not have access to Site", nil)
+	}
+
+	// Keep SKU lookup after Site authorization so denied requests cannot
+	// reveal whether a SKU exists.
+	if apiRequest.SkuID != nil {
+		skuDAO := cdbm.NewSkuDAO(cemh.dbSession)
+		skus, _, err := skuDAO.GetAll(ctx, nil, cdbm.SkuFilterInput{
+			SiteIDs: []uuid.UUID{site.ID},
+			SkuIDs:  []string{*apiRequest.SkuID},
+		}, paginator.PageInput{Limit: cutil.GetPtr(1)})
+		if err != nil {
+			logger.Warn().Err(err).Msg("error validating SKU ID in request data")
+			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Failed to validate SKU ID in request data due to DB error", nil)
+		}
+		if len(skus) == 0 {
+			logger.Warn().Msg("SKU ID specified in request does not exist")
+			return cutil.NewAPIErrorResponse(c, http.StatusUnprocessableEntity, "SKU ID specified in request does not exist", nil)
+		}
 	}
 
 	// Check if Site is in Registered state
@@ -186,6 +190,9 @@ func (cemh CreateExpectedMachineHandler) Handle(c echo.Context) error {
 	}
 
 	expectedMachine, err := cdb.WithTxResult(ctx, cemh.dbSession, func(tx *cdb.Tx) (*cdbm.ExpectedMachine, error) {
+		if apiErr := acquireExpectedInventorySharedMutationLock(ctx, logger, tx, site.ID); apiErr != nil {
+			return nil, apiErr
+		}
 		// Note: DefaultBmcUsername and BmcPassword are not stored in DB, only passed to workflow
 		em, err := emDAO.Create(
 			ctx,
@@ -198,11 +205,13 @@ func (cemh CreateExpectedMachineHandler) Handle(c echo.Context) error {
 				ChassisSerialNumber:      apiRequest.ChassisSerialNumber,
 				SkuID:                    apiRequest.SkuID,
 				FallbackDpuSerialNumbers: apiRequest.FallbackDPUSerialNumbers,
+				Interfaces:               apiRequest.InterfacesToDBModel(),
 				RackID:                   apiRequest.RackID,
 				Name:                     apiRequest.Name,
 				Manufacturer:             apiRequest.Manufacturer,
 				Model:                    apiRequest.Model,
 				Description:              apiRequest.Description,
+				ServerName:               apiRequest.ServerName,
 				SlotID:                   apiRequest.SlotID,
 				TrayIdx:                  apiRequest.TrayIdx,
 				HostID:                   apiRequest.HostID,
@@ -635,20 +644,6 @@ func (uemh UpdateExpectedMachineHandler) Handle(c echo.Context) error {
 		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "If provided, Expected Machine ID specified in request data must match URL request value", nil)
 	}
 
-	// Validate that SKU exists if specified
-	if apiRequest.SkuID != nil {
-		skuDAO := cdbm.NewSkuDAO(uemh.dbSession)
-		_, err = skuDAO.Get(ctx, nil, *apiRequest.SkuID)
-		if err != nil {
-			if errors.Is(err, cdb.ErrDoesNotExist) {
-				logger.Warn().Msg("SKU ID specified in request does not exist")
-				return cutil.NewAPIErrorResponse(c, http.StatusUnprocessableEntity, "SKU ID specified in request does not exist", nil)
-			}
-			logger.Warn().Err(err).Msg("error validating SKU ID in request data")
-			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Failed to validate SKU ID in request data due to DB error", nil)
-		}
-	}
-
 	// Get ExpectedMachine from DB by ID
 	emDAO := cdbm.NewExpectedMachineDAO(uemh.dbSession)
 	expectedMachine, err := emDAO.Get(ctx, nil, expectedMachineID, []string{cdbm.SiteRelationName}, false)
@@ -683,6 +678,24 @@ func (uemh UpdateExpectedMachineHandler) Handle(c echo.Context) error {
 		return cutil.NewAPIErrorResponse(c, http.StatusForbidden, "Current org is not associated with the Site of the Expected Machine", nil)
 	}
 
+	// Keep SKU lookup after Site authorization so denied requests cannot
+	// reveal whether a SKU exists.
+	if apiRequest.SkuID != nil {
+		skuDAO := cdbm.NewSkuDAO(uemh.dbSession)
+		skus, _, err := skuDAO.GetAll(ctx, nil, cdbm.SkuFilterInput{
+			SiteIDs: []uuid.UUID{site.ID},
+			SkuIDs:  []string{*apiRequest.SkuID},
+		}, paginator.PageInput{Limit: cutil.GetPtr(1)})
+		if err != nil {
+			logger.Warn().Err(err).Msg("error validating SKU ID in request data")
+			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Failed to validate SKU ID in request data due to DB error", nil)
+		}
+		if len(skus) == 0 {
+			logger.Warn().Msg("SKU ID specified in request does not exist")
+			return cutil.NewAPIErrorResponse(c, http.StatusUnprocessableEntity, "SKU ID specified in request does not exist", nil)
+		}
+	}
+
 	if !bmcMacUnchanged(expectedMachine.BmcMacAddress, apiRequest.BmcMacAddress) {
 		validationErrors := bmcMacImmutableValidationError()
 		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Failed to validate Expected Machine update data", validationErrors)
@@ -695,6 +708,9 @@ func (uemh UpdateExpectedMachineHandler) Handle(c echo.Context) error {
 	}
 
 	updatedExpectedMachine, err := cdb.WithTxResult(ctx, uemh.dbSession, func(tx *cdb.Tx) (*cdbm.ExpectedMachine, error) {
+		if apiErr := acquireExpectedInventorySharedMutationLock(ctx, logger, tx, site.ID); apiErr != nil {
+			return nil, apiErr
+		}
 		// Note: DefaultBmcUsername and BmcPassword are not stored in DB, only passed to workflow
 		em, err := emDAO.Update(
 			ctx,
@@ -705,11 +721,13 @@ func (uemh UpdateExpectedMachineHandler) Handle(c echo.Context) error {
 				ChassisSerialNumber:      apiRequest.ChassisSerialNumber,
 				SkuID:                    apiRequest.SkuID,
 				FallbackDpuSerialNumbers: apiRequest.FallbackDPUSerialNumbers,
+				Interfaces:               apiRequest.InterfacesToDBModel(),
 				RackID:                   apiRequest.RackID,
 				Name:                     apiRequest.Name,
 				Manufacturer:             apiRequest.Manufacturer,
 				Model:                    apiRequest.Model,
 				Description:              apiRequest.Description,
+				ServerName:               apiRequest.ServerName,
 				SlotID:                   apiRequest.SlotID,
 				TrayIdx:                  apiRequest.TrayIdx,
 				HostID:                   apiRequest.HostID,
@@ -848,6 +866,9 @@ func (demh DeleteExpectedMachineHandler) Handle(c echo.Context) error {
 	}
 
 	err = cdb.WithTx(ctx, demh.dbSession, func(tx *cdb.Tx) error {
+		if apiErr := acquireExpectedInventorySharedMutationLock(ctx, logger, tx, site.ID); apiErr != nil {
+			return apiErr
+		}
 		if err := emDAO.Delete(ctx, tx, expectedMachine.ID); err != nil {
 			logger.Error().Err(err).Msg("unable to delete ExpectedMachine record from DB")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to delete Expected Machine due to DB error", nil)
@@ -1051,11 +1072,12 @@ func (cemh CreateExpectedMachinesHandler) Handle(c echo.Context) error {
 		existingSerialMap[machine.ChassisSerialNumber] = true
 	}
 
-	// Retrieve all SKUs on Site to validate existence of SKU IDs in request.
+	// Retrieve requested SKUs on the Site to validate their existence.
 	// This is a pure validation read, so it stays outside the write transaction.
 	skuDAO := cdbm.NewSkuDAO(cemh.dbSession)
 	existingSkus, _, err := skuDAO.GetAll(ctx, nil, cdbm.SkuFilterInput{
 		SiteIDs: []uuid.UUID{siteID},
+		SkuIDs:  slices.Collect(maps.Keys(requestedSkuIDs)),
 	}, paginator.PageInput{
 		Limit: cutil.GetPtr(len(requestedSkuIDs)),
 	})
@@ -1119,11 +1141,13 @@ func (cemh CreateExpectedMachinesHandler) Handle(c echo.Context) error {
 			ChassisSerialNumber:      machineReq.ChassisSerialNumber,
 			SkuID:                    machineReq.SkuID,
 			FallbackDpuSerialNumbers: machineReq.FallbackDPUSerialNumbers,
+			Interfaces:               machineReq.InterfacesToDBModel(),
 			RackID:                   machineReq.RackID,
 			Name:                     machineReq.Name,
 			Manufacturer:             machineReq.Manufacturer,
 			Model:                    machineReq.Model,
 			Description:              machineReq.Description,
+			ServerName:               machineReq.ServerName,
 			SlotID:                   machineReq.SlotID,
 			TrayIdx:                  machineReq.TrayIdx,
 			HostID:                   machineReq.HostID,
@@ -1135,6 +1159,9 @@ func (cemh CreateExpectedMachinesHandler) Handle(c echo.Context) error {
 	}
 
 	createdExpectedMachines, err := cdb.WithTxResult(ctx, cemh.dbSession, func(tx *cdb.Tx) ([]cdbm.ExpectedMachine, error) {
+		if apiErr := acquireExpectedInventorySharedMutationLock(ctx, logger, tx, site.ID); apiErr != nil {
+			return nil, apiErr
+		}
 		createdMachines, derr := emDAO.CreateMultiple(ctx, tx, createInputs)
 		if derr != nil {
 			logger.Error().Err(derr).Msg("error creating ExpectedMachine records in DB")
@@ -1247,12 +1274,14 @@ type expectedMachineUpdateFieldSet struct {
 	defaultBmcPassword       bool
 	chassisSerialNumber      bool
 	fallbackDPUSerialNumbers bool
+	interfaces               bool
 	skuID                    bool
 	rackID                   bool
 	name                     bool
 	manufacturer             bool
 	model                    bool
 	description              bool
+	serverName               bool
 	slotID                   bool
 	trayIdx                  bool
 	hostID                   bool
@@ -1272,12 +1301,14 @@ func expectedMachineUpdateFields(req model.APIExpectedMachineUpdateRequest) expe
 		defaultBmcPassword:       req.DefaultBmcPassword != nil,
 		chassisSerialNumber:      req.ChassisSerialNumber != nil,
 		fallbackDPUSerialNumbers: req.FallbackDPUSerialNumbers != nil,
+		interfaces:               req.Interfaces != nil,
 		skuID:                    req.SkuID != nil,
 		rackID:                   req.RackID != nil,
 		name:                     req.Name != nil,
 		manufacturer:             req.Manufacturer != nil,
 		model:                    req.Model != nil,
 		description:              req.Description != nil,
+		serverName:               req.ServerName != nil,
 		slotID:                   req.SlotID != nil,
 		trayIdx:                  req.TrayIdx != nil,
 		hostID:                   req.HostID != nil,
@@ -1397,7 +1428,7 @@ func (uemh UpdateExpectedMachinesHandler) Handle(c echo.Context) error {
 	// We will split into multiple queries:
 	// 1. Retrieve SiteID and Site by loading the requested ExpectedMachine records
 	// 2. Retrieve all Expected Machines for that Site to check for Serial uniqueness.
-	// 3. Retrieve all SKUs for that Site to validate SKU IDs in the request.
+	// 3. Retrieve requested SKUs for that Site to validate SKU IDs in the request.
 	// All of these are pure validation reads and stay outside the WithTxResult call below.
 	// TODO: now that we have a unique index on (mac,siteID) we should reconsider adding unique indices on (serial,siteID).
 	//       At this time it is expected that existing serial data may not be unique so we
@@ -1516,11 +1547,12 @@ func (uemh UpdateExpectedMachinesHandler) Handle(c echo.Context) error {
 		emMap[em.ID] = *em
 	}
 
-	// Retrieve all SKUs on Site to validate existence of SKU IDs in request.
+	// Retrieve requested SKUs on the Site to validate their existence.
 	// Pure validation read, kept outside the write transaction.
 	skuDAO := cdbm.NewSkuDAO(uemh.dbSession)
 	skus, _, err := skuDAO.GetAll(ctx, nil, cdbm.SkuFilterInput{
 		SiteIDs: []uuid.UUID{siteID},
+		SkuIDs:  slices.Collect(maps.Keys(requestedSkuIDs)),
 	}, paginator.PageInput{
 		Limit: cutil.GetPtr(len(requestedSkuIDs)),
 	})
@@ -1604,11 +1636,13 @@ func (uemh UpdateExpectedMachinesHandler) Handle(c echo.Context) error {
 			ChassisSerialNumber:      machineReq.ChassisSerialNumber,
 			SkuID:                    machineReq.SkuID,
 			FallbackDpuSerialNumbers: machineReq.FallbackDPUSerialNumbers,
+			Interfaces:               machineReq.InterfacesToDBModel(),
 			RackID:                   machineReq.RackID,
 			Name:                     machineReq.Name,
 			Manufacturer:             machineReq.Manufacturer,
 			Model:                    machineReq.Model,
 			Description:              machineReq.Description,
+			ServerName:               machineReq.ServerName,
 			SlotID:                   machineReq.SlotID,
 			TrayIdx:                  machineReq.TrayIdx,
 			HostID:                   machineReq.HostID,
@@ -1619,10 +1653,13 @@ func (uemh UpdateExpectedMachinesHandler) Handle(c echo.Context) error {
 	}
 	// Update provided ExpectedMachines in DB
 	updatedExpectedMachines, err := cdb.WithTxResult(ctx, uemh.dbSession, func(tx *cdb.Tx) ([]cdbm.ExpectedMachine, error) {
+		if apiErr := acquireExpectedInventorySharedMutationLock(ctx, logger, tx, site.ID); apiErr != nil {
+			return nil, apiErr
+		}
 		// Lock the full target set before clearing any one row. Clear touches
 		// only a subset, while UpdateMultiple writes every target; without this
 		// canonical lock pass, overlapping batches can each hold a different
-		// cleared row and deadlock during the bulk update.
+		// cleared row and deadlock during the batch update.
 		derr := emDAO.LockForUpdate(ctx, tx, slices.Collect(maps.Keys(idMap)))
 		if derr != nil {
 			if errors.Is(derr, cdb.ErrDoesNotExist) {
@@ -1706,11 +1743,11 @@ func (uemh UpdateExpectedMachinesHandler) Handle(c echo.Context) error {
 
 // ReplaceAllExpectedMachinesHandler replaces the complete ExpectedMachine set
 // for one Site.
-type ReplaceAllExpectedMachinesHandler struct{ expectedInventoryBulkBase }
+type ReplaceAllExpectedMachinesHandler struct{ expectedInventoryBatchBase }
 
 // NewReplaceAllExpectedMachinesHandler creates a full-Site ExpectedMachine replacement handler.
 func NewReplaceAllExpectedMachinesHandler(dbSession *cdb.Session, scp *sc.ClientPool, cfg *config.Config) ReplaceAllExpectedMachinesHandler {
-	return ReplaceAllExpectedMachinesHandler{newExpectedInventoryBulkBase(dbSession, scp, cfg)}
+	return ReplaceAllExpectedMachinesHandler{newExpectedInventoryBatchBase(dbSession, scp, cfg)}
 }
 
 // Handle godoc
@@ -1786,8 +1823,9 @@ func (h ReplaceAllExpectedMachinesHandler) Handle(c echo.Context) error {
 			ExpectedMachineID: id, SiteID: site.ID, BmcMacAddress: machine.BmcMacAddress,
 			BmcIpAddress: machine.BmcIpAddress, ChassisSerialNumber: machine.ChassisSerialNumber,
 			SkuID: machine.SkuID, FallbackDpuSerialNumbers: machine.FallbackDPUSerialNumbers,
-			RackID: machine.RackID, Name: machine.Name, Manufacturer: machine.Manufacturer,
-			Model: machine.Model, Description: machine.Description, SlotID: machine.SlotID,
+			Interfaces: machine.InterfacesToDBModel(),
+			RackID:     machine.RackID, Name: machine.Name, Manufacturer: machine.Manufacturer,
+			Model: machine.Model, Description: machine.Description, ServerName: machine.ServerName, SlotID: machine.SlotID,
 			TrayIdx: machine.TrayIdx, HostID: machine.HostID, IsDpfEnabled: machine.IsDpfEnabled,
 			Labels: machine.Labels, HostLifecycleProfile: machine.HostLifecycleProfile.ToDBModel(), CreatedBy: dbUser.ID,
 		})
@@ -1799,6 +1837,10 @@ func (h ReplaceAllExpectedMachinesHandler) Handle(c echo.Context) error {
 	}
 	dao := cdbm.NewExpectedMachineDAO(h.dbSession)
 	replaced, err := cdb.WithTxResult(ctx, h.dbSession, func(tx *cdb.Tx) ([]cdbm.ExpectedMachine, error) {
+		apiErr := acquireExpectedInventoryExclusiveMutationLock(ctx, logger, tx, site.ID)
+		if apiErr != nil {
+			return nil, apiErr
+		}
 		machines, derr := dao.ReplaceAll(ctx, tx, cdbm.ExpectedMachineFilterInput{SiteIDs: []uuid.UUID{site.ID}}, inputs)
 		if derr != nil {
 			logger.Error().Err(derr).Msg("error replacing ExpectedMachine records in DB")
@@ -1806,7 +1848,10 @@ func (h ReplaceAllExpectedMachinesHandler) Handle(c echo.Context) error {
 		}
 		protos := make([]*corev1.ExpectedMachine, 0, len(machines))
 		for i := range machines {
-			protos = append(protos, machines[i].ToProto(credentials[machines[i].ID]))
+			machine := machines[i].ToProto(credentials[machines[i].ID])
+			// Replace-all owns the entire list, including removal of nested Host BMCs.
+			machine.ReplaceHostNics = true
+			protos = append(protos, machine)
 		}
 		coreRequest := &corev1.ExpectedMachineList{ExpectedMachines: protos}
 		var secretFields []string
@@ -1815,7 +1860,7 @@ func (h ReplaceAllExpectedMachinesHandler) Handle(c echo.Context) error {
 		}) {
 			secretFields = []string{"expectedMachines"}
 		}
-		apiErr := common.ExecuteCoreGRPC(ctx, stc, corev1.Forge_ReplaceAllExpectedMachines_FullMethodName, coreRequest, nil, site.ID.String(), secretFields...)
+		apiErr = common.ExecuteCoreGRPC(ctx, stc, corev1.Forge_ReplaceAllExpectedMachines_FullMethodName, coreRequest, nil, site.ID.String(), secretFields...)
 		if apiErr != nil {
 			return nil, apiErr
 		}
@@ -1833,11 +1878,11 @@ func (h ReplaceAllExpectedMachinesHandler) Handle(c echo.Context) error {
 }
 
 // DeleteAllExpectedMachinesHandler deletes the complete ExpectedMachine set for one Site.
-type DeleteAllExpectedMachinesHandler struct{ expectedInventoryBulkBase }
+type DeleteAllExpectedMachinesHandler struct{ expectedInventoryBatchBase }
 
 // NewDeleteAllExpectedMachinesHandler creates a full-Site ExpectedMachine deletion handler.
 func NewDeleteAllExpectedMachinesHandler(dbSession *cdb.Session, scp *sc.ClientPool, cfg *config.Config) DeleteAllExpectedMachinesHandler {
-	return DeleteAllExpectedMachinesHandler{newExpectedInventoryBulkBase(dbSession, scp, cfg)}
+	return DeleteAllExpectedMachinesHandler{newExpectedInventoryBatchBase(dbSession, scp, cfg)}
 }
 
 // Handle godoc

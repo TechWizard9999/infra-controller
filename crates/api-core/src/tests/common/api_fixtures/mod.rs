@@ -24,7 +24,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use carbide_extension_service_controller::context::ExtensionServiceStateHandlerServices;
+use carbide_extension_service_controller::context::{
+    ExtensionServiceStateHandlerServices, ServiceVpcRegistrationConfig,
+};
 use carbide_extension_service_controller::handler::ExtensionServiceStateHandler;
 use carbide_extension_service_controller::io::ExtensionServiceStateControllerIO;
 use carbide_ib_fabric::IbFabricMonitor;
@@ -55,6 +57,7 @@ use carbide_rack_controller::firmware_object::FirmwareObjectFetcher;
 use carbide_rack_controller::handler::RackStateHandler;
 use carbide_rack_controller::io::RackStateControllerIO;
 use carbide_redfish::libredfish::test_support::RedfishSim;
+use carbide_resource_pool::{PoolDefinitionSource, ResourcePoolRegistry};
 use carbide_secrets::credentials::{
     CompositeCredentialManager, CredentialKey, CredentialManager, CredentialReader, CredentialType,
     Credentials,
@@ -205,6 +208,12 @@ pub(in crate::tests) struct TestEnvOverrides {
     pub(in crate::tests) prevent_allocations_on_stale_dpu_agent_version: Option<bool>,
     pub(in crate::tests) network_segments_drain_period: Option<chrono::Duration>,
     pub(in crate::tests) power_manager_enabled: Option<bool>,
+    /// Enables filtering machine aggregate metrics by database object IDs only
+    /// for tests that need to verify the production controller wiring.
+    pub(in crate::tests) machine_filter_metrics_by_existing_object_ids_enabled: Option<bool>,
+    /// Overrides the machine controller's metric prefix when a test needs to
+    /// isolate its aggregate series from other fixture controllers.
+    pub(in crate::tests) machine_metric_prefix: Option<&'static str>,
     pub(in crate::tests) dpf_sdk: Option<Arc<dyn DpfOperations>>,
     pub(in crate::tests) fnn_config: Option<FnnConfig>,
     pub(in crate::tests) nmxc_default_partition: Option<bool>,
@@ -218,12 +227,13 @@ pub(in crate::tests) struct TestEnvOverrides {
     /// Optional compute-tray backend injected into the component manager.
     pub(in crate::tests) compute_tray_manager:
         Option<Arc<dyn component_manager::compute_tray_manager::ComputeTrayManager>>,
-
-    /// Optional NV-Switch backend injected into the component manager.
+    pub(in crate::tests) compute_tray_use_state_controller: Option<bool>,
     pub(in crate::tests) nv_switch_manager:
         Option<Arc<dyn component_manager::nv_switch_manager::NvSwitchManager>>,
+    pub(in crate::tests) power_shelf_manager:
+        Option<Arc<dyn component_manager::power_shelf_manager::PowerShelfManager>>,
 
-    /// Optional firmware-object fetcher injected into the rack state handler.
+    /// Optional firmware-object fetcher shared by the API and rack state handler.
     pub(in crate::tests) firmware_object_fetcher: Option<Arc<dyn FirmwareObjectFetcher>>,
 
     pub(in crate::tests) nras_should_fail_parsing: Option<Arc<AtomicBool>>,
@@ -623,6 +633,18 @@ impl TestEnv {
             .await;
     }
 
+    /// Reports membership in the latest database object-ID list so integration
+    /// tests can verify which identity the machine controller read after discovery.
+    pub(in crate::tests) async fn machine_object_ids_from_database_contains(
+        &self,
+        machine_id: &HostMachineId,
+    ) -> Option<bool> {
+        self.machine_state_controller
+            .lock()
+            .await
+            .object_ids_from_database_contains_for_test(machine_id)
+    }
+
     /// Runs one iteration of the network state controller handler with the services
     /// in this test environment
     pub(in crate::tests) async fn run_network_segment_controller_iteration(&self) {
@@ -652,6 +674,17 @@ impl TestEnv {
             .lock()
             .await
             .run_single_iteration()
+            .boxed()
+            .await;
+    }
+
+    /// Processes extension-service work already queued by a transition.
+    /// Skipping the periodic scan proves the preceding controller pass requested the retry.
+    pub(in crate::tests) async fn run_queued_extension_service_controller_iterations(&self) {
+        self.extension_service_controller
+            .lock()
+            .await
+            .run_queued_iterations()
             .boxed()
             .await;
     }
@@ -1412,6 +1445,14 @@ async fn create_test_env_with_overrides_inner(
     db::resource_pool::define_all_from(&mut txn, &pool_defs(pool_size))
         .await
         .unwrap();
+    // Bind the populated fixture pools to Integrated before constructing the API.
+    let resource_pool_registry = ResourcePoolRegistry::resolve(
+        PoolDefinitionSource::SeedConfiguration,
+        &mut txn,
+        &HashMap::new(),
+    )
+    .await
+    .unwrap();
     txn.commit().await.unwrap();
 
     let common_pools =
@@ -1458,6 +1499,14 @@ async fn create_test_env_with_overrides_inner(
         test_component_manager.nv_switch = nv_switch_manager;
     }
 
+    if let Some(power_shelf_manager) = overrides.power_shelf_manager.clone() {
+        test_component_manager.power_shelf = power_shelf_manager;
+    }
+
+    if let Some(use_state_controller) = overrides.compute_tray_use_state_controller {
+        test_component_manager.compute_tray_use_state_controller = use_state_controller;
+    }
+
     let test_component_manager = Some(Arc::new(test_component_manager));
     let fake_endpoint_explorer = MockEndpointExplorer::default();
 
@@ -1466,6 +1515,7 @@ async fn create_test_env_with_overrides_inner(
         common_pools.clone(),
         work_lock_manager_handle,
     )
+    .with_resource_pool_registry(resource_pool_registry)
     .with_credential_manager(composite_manager.clone())
     .with_runtime_config(config.clone())
     .with_eth_data(eth_virt_data)
@@ -1473,6 +1523,7 @@ async fn create_test_env_with_overrides_inner(
     .with_metric_emitter(ApiMetricsEmitter::new(&test_meter.meter()))
     .with_redfish_pool(redfish_sim.clone())
     .with_ib_fabric_manager(ib_fabric_manager.clone())
+    .with_firmware_object_fetcher(firmware_object_fetcher.clone())
     .with_endpoint_explorer(fake_endpoint_explorer.clone());
 
     if let Some(rms_client) = rms_sim.as_rms_client() {
@@ -1596,10 +1647,24 @@ async fn create_test_env_with_overrides_inner(
         std::time::Duration::from_secs(60),
     );
 
-    let machine_controller = StateController::<MachineStateControllerIO>::builder()
+    let machine_controller_builder = StateController::<MachineStateControllerIO>::builder()
         .database(db_pool.clone(), api.work_lock_manager_handle.clone())
-        .meter("carbide_machines", test_meter.meter())
-        .processor_id(state_controller_id.clone())
+        .meter(
+            overrides
+                .machine_metric_prefix
+                .unwrap_or("carbide_machines"),
+            test_meter.meter(),
+        )
+        .processor_id(state_controller_id.clone());
+    let machine_controller_builder = if overrides
+        .machine_filter_metrics_by_existing_object_ids_enabled
+        .unwrap_or(false)
+    {
+        machine_controller_builder.filter_metrics_by_existing_object_ids()
+    } else {
+        machine_controller_builder
+    };
+    let machine_controller = machine_controller_builder
         .services(
             MachineStateHandlerServices {
                 db_pool: db_pool.clone(),
@@ -1732,6 +1797,13 @@ async fn create_test_env_with_overrides_inner(
             ExtensionServiceStateHandlerServices {
                 db_pool: db_pool.clone(),
                 dpf_sdk: api.dpf_sdk.clone(),
+                service_vpc: ServiceVpcRegistrationConfig {
+                    slots: carbide_dpf::ServiceVpcSlots::new(
+                        config.dpu_config.service_vpc_slot_count,
+                    )
+                    .expect("test configuration has a validated service-VPC slot count"),
+                    enabled_address_families: config.dpf.deployments.service_vpc_address_families(),
+                },
             }
             .into(),
         )
@@ -1779,6 +1851,12 @@ async fn create_test_env_with_overrides_inner(
         SiteExplorerConfig {
             enabled: Arc::new(true.into()),
             retained_boot_interface_window: None,
+            admin_fnn_enabled: api
+                .runtime_config
+                .fnn
+                .as_ref()
+                .and_then(|fnn| fnn.admin_vpc.as_ref())
+                .is_some_and(|admin| admin.enabled),
             // run_interval shouldn't matter, this should not be run(), we only trigger intervals manually.
             run_interval: Duration::seconds(0).to_std().unwrap(),
             concurrent_explorations: 100,
@@ -1839,19 +1917,28 @@ async fn create_test_env_with_overrides_inner(
 
     txn.commit().await.unwrap();
 
-    // Create domain
-    let domain: carbide_uuid::domain::DomainId = api
-        .create_domain(Request::new(rpc::protos::dns::CreateDomainRequest {
-            name: "dwrt1.com".to_string(),
-            default_ttl: None,
-        }))
+    // Restart tests keep their database. Reuse the domain so its name stays
+    // unique and existing segments keep the same domain ID.
+    let domain_name = "dwrt1.com";
+    let existing_domain = db::dns::domain::find_by_name(&db_pool, domain_name)
         .await
-        .unwrap()
-        .into_inner()
-        .id
-        .map(::carbide_uuid::domain::DomainId::try_from)
-        .unwrap()
-        .unwrap();
+        .expect("fixture domain lookup succeeds")
+        .into_iter()
+        .find(|domain| domain.vpc_id.is_none());
+    let domain = match existing_domain {
+        Some(domain) => domain.id,
+        None => api
+            .create_domain(Request::new(rpc::protos::dns::CreateDomainRequest {
+                name: domain_name.to_string(),
+                default_ttl: None,
+                vpc_id: None,
+            }))
+            .await
+            .expect("fixture domain creation succeeds")
+            .into_inner()
+            .id
+            .expect("created domain has an ID"),
+    };
 
     let (admin_segments, underlay_segment) = if overrides.create_network_segments.unwrap_or(true) {
         // Create admin network

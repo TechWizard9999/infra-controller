@@ -179,7 +179,8 @@ func (bcih BatchCreateInstanceHandler) buildBatchInstanceCreateRequestOsConfig(c
 	// Options below should all have been set by the
 	// earlier call to ValidateAndSetOperatingSystemData
 
-	if os.Type == cdbm.OperatingSystemTypeIPXE {
+	switch os.Type {
+	case cdbm.OperatingSystemTypeIPXE:
 		return &corev1.InstanceOperatingSystemConfig{
 			RunProvisioningInstructionsOnEveryBoot: *apiRequest.AlwaysBootWithCustomIpxe,
 			PhoneHomeEnabled:                       *apiRequest.PhoneHomeEnabled,
@@ -190,7 +191,7 @@ func (bcih BatchCreateInstanceHandler) buildBatchInstanceCreateRequestOsConfig(c
 			},
 			UserData: apiRequest.UserData,
 		}, osID, nil
-	} else if os.Type == cdbm.OperatingSystemTypeTemplatedIPXE {
+	case cdbm.OperatingSystemTypeTemplatedIPXE:
 		if apiErr := validateTemplatedIpxeOsForSite(ctx, bcih.dbSession, logger, os, site.ID); apiErr != nil {
 			return nil, nil, apiErr
 		}
@@ -204,7 +205,7 @@ func (bcih BatchCreateInstanceHandler) buildBatchInstanceCreateRequestOsConfig(c
 			},
 			UserData: apiRequest.UserData,
 		}, osID, nil
-	} else {
+	default:
 		return &corev1.InstanceOperatingSystemConfig{
 			PhoneHomeEnabled: *apiRequest.PhoneHomeEnabled,
 			Variant: &corev1.InstanceOperatingSystemConfig_OsImageId{
@@ -1380,7 +1381,7 @@ func (bcih BatchCreateInstanceHandler) Handle(c echo.Context) error {
 		alconstraints, acerr := common.GetAllocationConstraintsForInstanceType(ctx, tx, bcih.dbSession, tenant.ID, instancetype, tnas)
 		if acerr != nil {
 			if acerr == common.ErrAllocationConstraintNotFound {
-				return cutil.NewAPIError(http.StatusInternalServerError, "No Allocations for specified Instance Type were found for current Tenant", nil)
+				return cutil.NewAPIError(http.StatusForbidden, "No Allocations for specified Instance Type were found for current Tenant", nil)
 			}
 			logger.Error().Err(acerr).Msg("error retrieving Allocation Constraints from DB for InstanceType and Allocation")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve Allocations for specified Instance Type, DB error", nil)
@@ -2143,27 +2144,41 @@ func allocateMachinesForBatch(
 			break
 		}
 
-		// Acquire an advisory lock on the MachineID
-		err = tx.TryAcquireAdvisoryLock(ctx, cdb.GetAdvisoryLockIDFromString(mc.ID), nil)
+		// Verify the Machine inside a savepoint, so a rejected Machine is unlocked right away
+		// instead of staying locked until the batch create transaction ends.
+		var umc *cdbm.Machine
+		err = tx.WithSavepoint(ctx, func(sp *cdb.Tx) error {
+			// Acquire an advisory lock on the MachineID
+			lerr := sp.TryAcquireAdvisoryLock(ctx, cdb.GetAdvisoryLockIDFromString(mc.ID), nil)
+			if lerr != nil {
+				return lerr
+			}
+
+			// Re-obtain the Machine record to ensure it is still available
+			var gerr error
+			umc, gerr = mcDAO.GetByID(ctx, sp, mc.ID, nil, true)
+			if gerr != nil {
+				return gerr
+			}
+
+			if umc.Status != cdbm.MachineStatusReady {
+				return common.ErrMachineUnavailable
+			}
+
+			if umc.IsAssigned {
+				return common.ErrMachineUnavailable
+			}
+
+			if !umc.MatchesLabelSelector(machineLabelSelector) {
+				return common.ErrMachineUnavailable
+			}
+			return nil
+		})
+		if errors.Is(err, cdb.ErrTransactionSavepoint) {
+			logger.Error().Err(err).Str("machineID", mc.ID).Msg("failed to verify Machine for batch allocation, DB savepoint error")
+			return nil, cutil.NewAPIError(http.StatusInternalServerError, "Failed to verify Machines for allocation, DB error", nil)
+		}
 		if err != nil {
-			continue
-		}
-
-		// Re-obtain the Machine record to ensure it is still available
-		umc, err := mcDAO.GetByID(ctx, tx, mc.ID, nil, true)
-		if err != nil {
-			continue
-		}
-
-		if umc.Status != cdbm.MachineStatusReady {
-			continue
-		}
-
-		if umc.IsAssigned {
-			continue
-		}
-
-		if !umc.MatchesLabelSelector(machineLabelSelector) {
 			continue
 		}
 

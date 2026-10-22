@@ -14,6 +14,10 @@ global:
     pullPolicy: IfNotPresent
   imagePullSecrets: []
   certificate:
+    ## Use cert-manager for Scout and DPU certificates; the default is Vault.
+    useCertManager: false
+    ## Independently enable UFM issuance after approval policy allows its DNS SANs.
+    useCertManagerUfm: false
     duration: 720h0m0s
     renewBefore: 360h0m0s
     privateKey:
@@ -31,6 +35,16 @@ global:
 
 ## Override the release namespace (defaults to helm install -n <namespace>)
 namespaceOverride: ""
+
+## Used when global.certificate.useCertManager is true. Requests are created
+## in the API namespace using its service account. The issuer must chain to
+## the same site CA already trusted by the API, Scout and DPU agents.
+machineCertificates:
+  issuerRef:
+    name: site-issuer
+    kind: ClusterIssuer
+  ## Issuance deadline in seconds, including request creation; range 1..600.
+  requestTimeoutSecs: 120
 
 ## Legacy name aliases — opt-in ExternalName Services so binaries that
 ## hardcode the pre-rename hostnames (e.g. `carbide-api.forge-system.svc.
@@ -187,8 +201,6 @@ service:
       - vpc_prefix
       - spdm_attestation
       - ib_partition
-  profiler:
-    port: 1081
 
 sshConsole:
   serviceName: nico-ssh-console-rs
@@ -532,7 +544,7 @@ configFiles:
 ## nicoApiSiteConfig is REQUIRED: nico-api exits at startup if the four
 ## resource pool definitions (lo-ip, vlan-id, vni, vpc-vni) are absent.
 ## See PREREQUISITES.md § "Site Configuration" and
-## deploy/files/nico-api/nico-api-site-config.toml for a full example.
+## helm/examples/nico-api-site-config.toml for a full example.
 siteConfig:
   enabled: true
   nicoApiSiteConfig: ""  # Must include [pools.lo-ip], [pools.vlan-id], [pools.vni], [pools.vpc-vni]
@@ -585,7 +597,15 @@ externalService:
   # Service's primary family (the first entry) cannot be changed in place.
   ipFamilyPolicy: ""
   ipFamilies: []
+  # External gRPC port. The backend target port stays service.grpc.port, and
+  # clients must use the port set here.
+  port: 443
+  # Local preserves client source IPs. MetalLB only lets Local Services share
+  # an IP with Services that select the same pods.
   externalTrafficPolicy: Local
+  # Annotations are passed through unchanged. To share an IP with another
+  # Service, add your load-balancer controller's sharing annotation here, for
+  # example metallb.universe.tf/allow-shared-ip: "<group>".
   annotations: {}
   # annotations:
   #   metallb.universe.tf/loadBalancerIPs: "10.x.x.x"

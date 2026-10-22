@@ -93,11 +93,13 @@ config it edits.
    `perPodAnnotations` for `nico-ntp` / `nico-dns`) must match a VIP from the
    pools you carved out in step 1.
    → `values/nico-core.yaml`.
-5. **Set the DHCP hook parameters.** `nico-dhcp.config.kea.hookParameters`
-   (`nameservers`, `ntpServer`, `provisioningServer`) tells DHCP clients
-   where to find DNS / NTP / PXE. These must equal the VIPs you set in step 4.
-   The chart default is `127.0.0.1` — leaving it there silently breaks DPU
-   bring-up.
+5. **Set the DHCP hook parameters.** Under `nico-dhcp.config.kea.hookParameters`,
+   set `nameservers` to the VIP of Unbound or another recursive resolver that
+   resolves site, infrastructure, and external names. Do not use a `nico-dns`
+   VIP; it serves authoritative zones only. Set `ntpServer` and
+   `provisioningServer` to their corresponding NTP and PXE Service VIPs from
+   step 4. Replace the chart placeholders with addresses reachable from the
+   DPU network.
    → `values/nico-core.yaml`.
 6. **Decide how the `.forge` compatibility zone is served.** Built-in unbound
    (enable in `values/nico-core.yaml`) or your external DNS. Required for
@@ -318,13 +320,14 @@ VIP requirements below apply to enabled external `LoadBalancer` Services.
 | `siteConfig.[pools.lo-ip]` ranges | `{ start = "10.180.62.84", end = "10.180.62.86" }` | **Yes** | Loopback IP range for bare-metal hosts |
 | `siteConfig.[pools.vlan-id]` ranges | `{ start = "100", end = "501" }` | **Yes** | VLAN ID allocation range |
 | `siteConfig.[pools.vni]` ranges | `{ start = "1024500", end = "1024800" }` | **Yes** | VXLAN Network Identifier range |
-| `siteConfig.[networks.admin]` | example values | **Yes** | Admin network: `type = "admin"`, `prefix`, `mtu`, and `reserve_first`. Every IPv4 prefix requires a `gateway`. DPU provisioning requires an IPv4 admin prefix. Refer to [Initial Network Configuration](../docs/provisioning/ip-and-network-configuration.md#initial-network-configuration) for IPv6 fields, valid combinations, and compatibility. |
+| `siteConfig.[networks.admin]` | example values | **Yes** | Admin network: `type = "admin"`, `prefix`, `mtu`, and `reserve_first`. Every IPv4 prefix requires a `gateway`. IPv6-only admin requires a configured FNN site and compatible Core and DPU-agent builds. Retain IPv4 DPU loopbacks and IPv4 VXLAN tunnel endpoints; this does not restrict the address families of physical underlay segments. Non-FNN admin requires an IPv4 prefix and gateway. Refer to [Initial Network Configuration](../docs/provisioning/ip-and-network-configuration.md#initial-network-configuration) for settings and compatibility requirements. |
 | `siteConfig.[networks.<underlay>]` | `[networks.RNO1-M04-D04-IPMITOR-01]` | **Yes** | One block per underlay data-plane L3 segment to create at startup, with `type = "underlay"` and the same field requirements. Rename the block to match your site segment name. Add additional blocks for each underlay segment. |
-| `nico-api / nico-dhcp / nico-dns / nico-pxe / nico-ssh-console-rs .externalService.annotations.metallb.universe.tf/loadBalancerIPs` | example IPs | **Yes** | Single MetalLB VIP per service. Must be inside the matching IPAddressPool from `metallb-config.yaml` (external pool for `nico-api`, internal pool for the rest). |
-| `nico-ntp.externalService.perPodAnnotations` | 3-element example list | **Yes** | `nico-ntp` is a StatefulSet — one MetalLB VIP per replica (3 by default). List entry `[0]` goes on the LB Service for pod `nico-ntp-0`, `[1]` on `nico-ntp-1`, etc. These three VIPs are what DPUs sync clocks against. |
-| `nico-dhcp.config.kea.hookParameters.nameservers` | `"127.0.0.1"` (chart default) | **Yes** | IP(s) advertised to DHCP clients as their DNS resolver. Must be the `nico-dns` VIP (or whichever DNS the DPUs should use). Leaving the `127.0.0.1` chart default silently breaks DPU name resolution. |
-| `nico-dhcp.config.kea.hookParameters.ntpServer` | `"127.0.0.1"` (chart default) | **Yes** | Comma-separated IPs advertised to DHCP clients as their NTP servers. Must match the three `nico-ntp.externalService.perPodAnnotations` VIPs. DPU pre-ingestion fails on clock divergence if this is left at the default. |
-| `nico-dhcp.config.kea.hookParameters.provisioningServer` | `"127.0.0.1"` (chart default) | **Yes** | IP advertised as the PXE / provisioning server. Must be the `nico-pxe` VIP. |
+| `nico-api / nico-dhcp / nico-pxe / nico-ssh-console-rs .externalService.annotations.metallb.universe.tf/loadBalancerIPs` | example IPs | **Yes** | Single MetalLB VIP per service. Must be inside the matching IPAddressPool from `metallb-config.yaml` (external pool for `nico-api`, internal pool for the rest). |
+| `nico-dns.externalService.perPodAnnotations` | 2-element example list | **Yes** | Each list entry supplies annotations for one replica's UDP and TCP Services. Use VIPs from matching MetalLB pools. Refer to [`nico-dns` External Services](../docs/configuration/dns.md#nico-dns-external-services) for IPv6-only and dual-stack values, defaults, and primary-family restrictions. |
+| `nico-ntp.externalService.perPodAnnotations` | 3-element example list | **Yes** | `nico-ntp` is a StatefulSet — one MetalLB VIP per replica (3 by default). List entry `[0]` goes on the LB Service for pod `nico-ntp-0`, `[1]` on `nico-ntp-1`, etc. These VIPs are what DPUs sync clocks against. |
+| `nico-dhcp.config.kea.hookParameters.nameservers` | `"REPLACE_WITH_NICO_DNS_VIP"` (chart default) | **Yes** | Comma-separated IPv4 addresses advertised to DHCP clients as DNS resolvers in option 6. The placeholder name and chart comment refer to `nico-dns`, but this setting requires a recursive resolver. Set it to the VIP of Unbound or another recursive resolver that can resolve site, infrastructure, and external names. Do not use a `nico-dns` VIP, which serves authoritative zones only. |
+| `nico-dhcp.config.kea.hookParameters.ntpServer` | `"REPLACE_WITH_NICO_NTP_VIPS"` (chart default) | **Yes** | Comma-separated IPs advertised to DHCP clients as their NTP servers. Must include one `nico-ntp.externalService.perPodAnnotations` VIP per configured replica. |
+| `nico-dhcp.config.kea.hookParameters.provisioningServer` | `"REPLACE_WITH_NICO_PXE_VIP"` (chart default) | **Yes** | IP advertised as the PXE / provisioning server. Must be the `nico-pxe` VIP. |
 
 ### `values/nico-rest.yaml`
 
@@ -360,7 +363,7 @@ VIP requirements below apply to enabled external `LoadBalancer` Services.
 ## Setup options
 
 `setup.sh` runs preflight validation automatically before making cluster changes.
-Core VIP validation requires Python 3 with PyYAML installed in the `python3` environment. It parses `--core-values` as YAML, so indentation and Boolean capitalization do not affect VIP validation for enabled external `LoadBalancer` Services. Existing `externalService` configurations may omit VIP annotations for automatic allocation; explicitly blank annotations are errors. An enabled DHCPv6 external Service requires an explicit IPv6 VIP annotation. Configurable `externalService.type` values such as `NodePort` and `ClusterIP` do not require VIPs; the DHCPv6 external Service always uses `LoadBalancer`. Missing parser dependencies or invalid YAML produce a preflight error. This VIP check is skipped with `--skip-core`.
+Core VIP validation requires Python 3 with PyYAML installed in the `python3` environment. It parses `--core-values` as YAML, so indentation and Boolean capitalization do not affect VIP validation for enabled external `LoadBalancer` Services. Existing `externalService` configurations may omit VIP annotations for automatic allocation; explicitly blank annotations are errors. An enabled DHCPv6 external Service requires an explicit IPv6 VIP annotation. Configurable `externalService.type` values such as `NodePort` and `ClusterIP` do not require VIPs; the DHCPv6 external Service always uses `LoadBalancer`. Missing parser dependencies or invalid YAML produce a preflight error. This VIP check is skipped with `--skip-core`. A VIP used by more than one Service is a warning unless every Service on it has the same `allow-shared-ip` value, the same `externalTrafficPolicy`, and distinct protocol and port pairs, and `Local` Services share only within one chart; these warnings do not stop `setup.sh`.
 
 It supports these common deployment modes:
 
@@ -371,6 +374,7 @@ It supports these common deployment modes:
 | `--skip-rest` | Install prerequisites and Core, but skip all REST phases and REST repo checks. |
 | `--skip-core --skip-rest` | Infrastructure-only run; image tags, image registry, and REST repo are not required. |
 | `--core-values <file>` | Use site-specific Core values instead of `helm-prereqs/values/nico-core.yaml`. |
+| `--flow-values <file>` | Pass a site-specific NICo Flow values file to the `flow` Helm release. Every run resets the release to the chart defaults plus the image and pull-secret settings, so Flow overrides made with `helm upgrade` outside `setup.sh` are lost unless they are in this file. The file must not set `namespaceOverride`: `setup.sh` and the site-agent address Flow in the `flow` namespace. |
 | `--metallb-config <path>` | Use a site-specific MetalLB manifest file or kustomize directory. |
 | `--skip-dpf` | Skip the DPF (DOCA Platform Framework) DPU provisioning stack, which installs **by default**. Use for sites with no DPUs or that still use the deprecated iPXE DPU path. See [DPF](#dpf). |
 | `--install-contour` | Install the optional Contour/Envoy ingress controller. The Envoy Service is `LoadBalancer` and is pinned to the `vip-pool-external` MetalLB pool, so that pool must have addresses before the install. Setup aborts if `projectcontour` already runs a Contour that NICo does not manage, rather than upgrading it with these values. |

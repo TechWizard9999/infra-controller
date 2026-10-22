@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
+use carbide_uuid::DbTable;
 use carbide_uuid::machine::{MachineId, MachineIdSubtypeTrait};
 use chrono::Utc;
 use futures_util::stream::StreamExt;
@@ -35,6 +36,8 @@ use sqlx::PgConnection;
 use crate::db_read::DbReader;
 use crate::{DatabaseError, ObjectFilter, Transaction, machine};
 
+#[cfg(test)]
+mod test_decode;
 #[cfg(test)]
 mod test_explicit_columns;
 
@@ -59,9 +62,10 @@ pub async fn find_matching_with_exclusion(
     sku: &Sku,
     excluded_sku_id: Option<&String>,
 ) -> Result<Option<Sku>, DatabaseError> {
-    let mut builder = sqlx::QueryBuilder::new(
-        "SELECT id, description, created, components, schema_version, device_type FROM machine_skus",
-    );
+    let mut builder = sqlx::QueryBuilder::new(format!(
+        "SELECT {} FROM machine_skus",
+        Sku::db_table_columns(),
+    ));
     if let Some(excluded_sku_id) = excluded_sku_id {
         builder.push(" WHERE id != ");
         builder.push_bind(excluded_sku_id);
@@ -218,9 +222,12 @@ pub async fn find(
         return Ok(Vec::new());
     }
 
-    let query = "SELECT id, description, created, components, schema_version, device_type FROM machine_skus WHERE id=ANY($1)";
+    let query = format!(
+        "SELECT {} FROM machine_skus WHERE id=ANY($1)",
+        Sku::db_table_columns(),
+    );
 
-    let skus: Vec<Sku> = sqlx::query_as(query)
+    let skus: Vec<Sku> = sqlx::query_as(sqlx::AssertSqlSafe(query))
         .bind(sku_ids.iter().map(AsRef::as_ref).collect::<Vec<_>>())
         .fetch_all(txn)
         .await

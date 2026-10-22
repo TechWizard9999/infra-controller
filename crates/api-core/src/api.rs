@@ -34,7 +34,9 @@ use carbide_ib_fabric::ib::IBFabricManager;
 use carbide_machine_controller::dpf::DpfOperations;
 use carbide_machine_controller::io::MachineStateControllerIO;
 use carbide_rack::bms_client::BmsDsxExchangeHandle;
+use carbide_rack_controller::firmware_object::FirmwareObjectFetcher;
 use carbide_redfish::libredfish::{BmcCredentialOps, RedfishClientPool};
+use carbide_resource_pool::ResourcePoolRegistry;
 use carbide_secrets::SecretsError;
 use carbide_secrets::certificates::CertificateProvider;
 use carbide_secrets::credentials::{
@@ -55,6 +57,7 @@ use model::resource_pool::common::CommonPools;
 use sqlx::PgTransaction;
 use state_controller::controller::Enqueuer;
 use tokio_stream::Stream;
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 
 use self::metrics::ApiMetricsEmitter;
@@ -85,6 +88,8 @@ pub struct Api {
     pub(crate) bmc_session_manager: Arc<crate::credentials::BmcSessionManager>,
     pub(crate) eth_data: EthVirtData,
     pub(crate) common_pools: Arc<CommonPools>,
+    /// Pool backends resolved at startup; runtime lookups also see later growth.
+    pub(crate) resource_pool_registry: ResourcePoolRegistry,
     pub(crate) ib_fabric_manager: Arc<dyn IBFabricManager>,
     // `pub` (not `pub(crate)`): read by the `carbide-api-web` admin UI for config-derived display.
     pub runtime_config: Arc<CarbideConfig>,
@@ -104,6 +109,7 @@ pub struct Api {
     pub(crate) machine_state_handler_enqueuer: Enqueuer<MachineStateControllerIO>,
     pub(crate) metric_emitter: ApiMetricsEmitter,
     pub(crate) component_manager: Option<component_manager::component_manager::ComponentManager>,
+    pub(crate) firmware_object_fetcher: Arc<dyn FirmwareObjectFetcher>,
     pub(crate) bms_client: OnceLock<Arc<BmsDsxExchangeHandle>>,
     pub(crate) secrets_context: Option<crate::secrets::SecretsContext>,
     /// Validator for node-auth bearer JWTs (issue #355). `Some` only when
@@ -111,6 +117,7 @@ pub struct Api {
     /// listener.
     pub(crate) node_jwt_validator: Option<Arc<crate::node_auth::NodeJwtValidator>>,
     pub(crate) console_log_source: Arc<dyn crate::console_logs::ConsoleLogSource>,
+    pub(crate) cancel_token: CancellationToken,
 }
 
 pub(crate) type ScoutStreamType =
@@ -877,6 +884,20 @@ impl Forge for Api {
         request: Request<rpc::UpdateTenantRequest>,
     ) -> Result<Response<rpc::UpdateTenantResponse>, Status> {
         crate::handlers::tenant::update(self, request).await
+    }
+
+    async fn get_tenant_nic_firmware_config(
+        &self,
+        request: Request<rpc::GetTenantNicFirmwareConfigRequest>,
+    ) -> Result<Response<rpc::GetTenantNicFirmwareConfigResponse>, Status> {
+        crate::handlers::tenant::get_nic_firmware_config(self, request).await
+    }
+
+    async fn set_tenant_nic_firmware_config(
+        &self,
+        request: Request<rpc::SetTenantNicFirmwareConfigRequest>,
+    ) -> Result<Response<rpc::SetTenantNicFirmwareConfigResponse>, Status> {
+        crate::handlers::tenant::set_nic_firmware_config(self, request).await
     }
 
     async fn find_tenants_by_organization_ids(
@@ -2088,6 +2109,41 @@ impl Forge for Api {
         crate::handlers::expected_rack::delete_all_expected_racks(self, request).await
     }
 
+    async fn create_expected_nv_link_domain(
+        &self,
+        request: Request<rpc::CreateExpectedNvLinkDomainRequest>,
+    ) -> Result<Response<rpc::ExpectedNvLinkDomain>, Status> {
+        crate::handlers::expected_nvlink_domain::create(self, request).await
+    }
+
+    async fn delete_expected_nv_link_domain(
+        &self,
+        request: Request<rpc::ExpectedNvLinkDomainRequest>,
+    ) -> Result<Response<()>, Status> {
+        crate::handlers::expected_nvlink_domain::delete(self, request).await
+    }
+
+    async fn get_expected_nv_link_domain(
+        &self,
+        request: Request<rpc::ExpectedNvLinkDomainRequest>,
+    ) -> Result<Response<rpc::ExpectedNvLinkDomain>, Status> {
+        crate::handlers::expected_nvlink_domain::get(self, request).await
+    }
+
+    async fn find_expected_nv_link_domain_ids(
+        &self,
+        request: Request<rpc::ExpectedNvLinkDomainSearchFilter>,
+    ) -> Result<Response<rpc::ExpectedNvLinkDomainIdList>, Status> {
+        crate::handlers::expected_nvlink_domain::find_ids(self, request).await
+    }
+
+    async fn find_expected_nv_link_domains_by_ids(
+        &self,
+        request: Request<rpc::ExpectedNvLinkDomainsByIdsRequest>,
+    ) -> Result<Response<rpc::ExpectedNvLinkDomainList>, Status> {
+        crate::handlers::expected_nvlink_domain::find_by_ids(self, request).await
+    }
+
     async fn add_expected_rack_group(
         &self,
         request: Request<rpc::ExpectedRackGroup>,
@@ -3061,6 +3117,41 @@ impl Forge for Api {
         crate::handlers::nic_firmware::update(self, request).await
     }
 
+    async fn set_nic_firmware_site_selection(
+        &self,
+        request: Request<rpc::SetNicFirmwareSiteSelectionRequest>,
+    ) -> Result<Response<rpc::NicFirmwareSiteSelectionResponse>, Status> {
+        crate::handlers::nic_firmware::set_site_selection(self, request).await
+    }
+
+    async fn find_nic_firmware_site_selection_ids(
+        &self,
+        request: Request<rpc::NicFirmwareSiteSelectionSearchFilter>,
+    ) -> Result<Response<rpc::FindNicFirmwareSiteSelectionIdsResponse>, Status> {
+        crate::handlers::nic_firmware::find_site_selection_ids(self, request).await
+    }
+
+    async fn find_nic_firmware_site_selections_by_ids(
+        &self,
+        request: Request<rpc::FindNicFirmwareSiteSelectionsByIdsRequest>,
+    ) -> Result<Response<rpc::FindNicFirmwareSiteSelectionsByIdsResponse>, Status> {
+        crate::handlers::nic_firmware::find_site_selections_by_ids(self, request).await
+    }
+
+    async fn set_machine_nic_firmware_config(
+        &self,
+        request: Request<rpc::SetMachineNicFirmwareConfigRequest>,
+    ) -> Result<Response<()>, Status> {
+        crate::handlers::nic_firmware::set_machine_config(self, request).await
+    }
+
+    async fn get_desired_nic_firmware(
+        &self,
+        request: Request<rpc::GetDesiredNicFirmwareRequest>,
+    ) -> Result<Response<rpc::GetDesiredNicFirmwareResponse>, Status> {
+        crate::handlers::nic_firmware::get_desired(self, request).await
+    }
+
     async fn delete_nic_firmware_profile(
         &self,
         request: Request<rpc::DeleteNicFirmwareProfileRequest>,
@@ -3894,6 +3985,16 @@ impl Forge for Api {
             .await
     }
 
+    async fn get_component_power_details(
+        &self,
+        request: Request<rpc::GetComponentPowerDetailsRequest>,
+    ) -> Result<Response<rpc::GetComponentPowerDetailsResponse>, Status> {
+        crate::handlers::component_manager::power_details::get_component_power_details(
+            self, request,
+        )
+        .await
+    }
+
     async fn component_power_control(
         &self,
         request: Request<rpc::ComponentPowerControlRequest>,
@@ -4183,9 +4284,7 @@ impl Api {
             let machine = match db::machine::find_one(&mut txn, &machine_id, search_config).await {
                 Err(err) => {
                     tracing::warn!(%machine_id, error = %err, "failed loading machine");
-                    return Err(CarbideError::InvalidArgument(
-                        "err loading machine".to_string(),
-                    ));
+                    return Err(err.into());
                 }
                 Ok(None) => {
                     tracing::info!(%machine_id, "machine not found");

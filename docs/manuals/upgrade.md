@@ -1,6 +1,6 @@
-# Upgrading NICo <Badge intent="info">v2.1</Badge> <Badge intent="launch" minimal>New</Badge>
+# Upgrading NICo <Badge intent="info">v2.1</Badge>
 
-`setup.sh` is designed to be **idempotent** for supported deployment topologies: running it against an existing NICo installation upgrades each component in place. The same script and values files used for initial installation are the mechanism for upgrades — there is no separate upgrade script. For a predecessor Flow Deployment that bundles PSM or NSM, first choose whether to preserve it or follow the [manual Flow-only overwrite guidance](../../helm-prereqs/README.md#upgrading-deployments-that-bundled-psm-and-nsm).
+`setup.sh` is designed to be **idempotent** for supported deployment topologies: running it against an existing NICo installation upgrades each component in place. The same script and values files used for initial installation are the mechanism for upgrades — there is no separate upgrade script. For a predecessor Flow Deployment that bundles PSM or NSM, first choose whether to preserve it or follow the [manual Flow-only overwrite guidance](https://github.com/dsx-ai-factory/infra-controller/blob/main/helm-prereqs/README.md#upgrading-deployments-that-bundled-psm-and-nsm).
 
 This page documents how each component behaves when you re-run `setup.sh` against a live cluster, what to prepare before upgrading, and version-specific considerations for the 2.0-to-2.1 upgrade path.
 
@@ -46,7 +46,12 @@ After any required manual Flow overwrite, every installation phase is safe to re
 
 Complete every item before running `setup.sh`. Missing any of these can cause the upgrade to fail or leave the cluster in a partially upgraded state.
 
-If `flow/flow` or an active Flow Pod still contains a `psm` or `nsm` container, do not run setup yet. Preserve that release, or follow the [manual Flow-only overwrite guidance](../../helm-prereqs/README.md#upgrading-deployments-that-bundled-psm-and-nsm). Setup rejects that predecessor topology or an incomplete Flow-only rollout before making any cluster change.
+If you are upgrading to
+[asynchronous VPC peering deletion](#upgrades-that-introduce-asynchronous-peering-deletion)
+for the first time, plan an API maintenance window. You must stop the old API
+before starting the new one; the default rolling update does not do this.
+
+If `flow/flow` or an active Flow Pod still contains a `psm` or `nsm` container, do not run setup yet. Preserve that release, or follow the [manual Flow-only overwrite guidance](https://github.com/dsx-ai-factory/infra-controller/blob/main/helm-prereqs/README.md#upgrading-deployments-that-bundled-psm-and-nsm). Setup rejects that predecessor topology or an incomplete Flow-only rollout before making any cluster change.
 
 <Steps toc={true}>
 
@@ -167,7 +172,7 @@ git diff upstream/release/v2.0..upstream/release/v2.1 -- helm-prereqs/values.yam
 
 ### Update image tags
 
-Set the new image tags for the target release:
+Build and push images from the same repository revision as the target release checkout, then set their tags below. The chart and setup script must come from that revision too; refer to the [image compatibility policy](https://github.com/dsx-ai-factory/infra-controller/blob/main/helm/README.md#image-configuration) for more details.
 
 ```bash
 export NICO_IMAGE_REGISTRY=registry.example.com/nico   # your registry
@@ -285,6 +290,7 @@ If a phase fails, `setup.sh` prints `SETUP FAILED` and offers: `Run clean.sh to 
 | `--skip-rms` | Skip the Rack Management Service upgrade (Phase 5c). RMS installs **by default** (like DPF); `NICO_RMS_IMAGE_TAG` is required unless this flag is passed. Skipping leaves an existing RMS release untouched. |
 | `--skip-dpf` | Use **only** if DPF is not enabled at this site. This is not a pure skip: it clears `INSTALL_DPF`, which drops phase 5b and redeploys NICo Core with the `[dpf]` block disabled — on a DPF-enabled site that is a config change, not a skip. |
 | `--core-values <file>` | Use a per-site NICo Core values file (same as initial install). |
+| `--flow-values <file>` | Use a per-site NICo Flow values file (same as initial install). Flow overrides applied outside `setup.sh` are reset by the upgrade unless they are in this file. |
 | `--metallb-config <path>` | Use a site-specific MetalLB manifest or kustomize dir (same as initial install). |
 
 ### Estimated upgrade time
@@ -365,6 +371,49 @@ Migrating an existing site's credentials from Vault to Postgres is a configurati
 Once the writer is Postgres, the KEK backup above belongs in every pre-upgrade checklist.
 
 ## Version-specific upgrade notes
+
+### Upgrades That Introduce Asynchronous Peering Deletion
+
+Follow these steps the first time you upgrade to the peering deletion behavior
+added in [#6917](https://github.com/dsx-ai-factory/infra-controller/pull/6917).
+You can upgrade directly; no intermediate release is required.
+
+The new API waits for DPUs to stop allowing a peering before deleting it. An
+old API can still tell those DPUs to allow the connection, making the new API
+mistakenly treat deletion as finished. Stop every old API before starting any
+new one. The Helm chart's default `RollingUpdate` can run both versions at once,
+even with just one replica.
+
+During your API maintenance window:
+
+1. Record the namespace, Deployment name, and desired replica count for every
+   `nico-api` Deployment serving the site. Pause any automation that would
+   restore the old replicas during the maintenance window.
+2. Scale those Deployments to zero. Wait for all old API pods and any API
+   processes outside those Deployments to exit and their requests to drain.
+3. Run the normal upgrade with the new image and desired replica count. With
+   `setup.sh`, set `nico-api.replicas` in the Core values file to that count.
+   Phase 6 runs the Core migration Job and starts the new API pods. Keep the
+   old processes stopped.
+4. Check the API pods in each namespace before restoring automation:
+
+   ```bash
+   kubectl get pods -n <namespace> -l app.kubernetes.io/name=nico-api \
+     -o 'custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[*].image'
+   ```
+
+   Every expected API pod must be present, and its `nico-api` container must use
+   the new image. The selector uses the chart's default name; replace `nico-api`
+   if you set `nameOverride`. For API processes outside those Deployments,
+   check their container image or executable version through their service
+   manager, and confirm that every old process has stopped. Follow the
+   [peering deletion guide](vpc/vpc_peering_management.md#deleting-vpc-peering-connections)
+   to confirm any pending deletions finish.
+
+Do not roll back to an API that lacks this behavior. It deletes peerings without
+waiting for the DPUs, and restoring a database backup does not undo their network
+changes. For the network-version and migration details, refer to the
+[configuration reference](https://github.com/dsx-ai-factory/infra-controller/blob/main/crates/api-core/src/cfg/README.md#vpc-peering-deletion).
 
 ### 2.2 → 2.3: Core components are mandatory
 
@@ -471,6 +520,19 @@ described in the [quick start](../getting-started/quick-start.md) and retire the
 Kustomize overlays. The `rest-api/deploy/kustomize` bases that `setup.sh` uses
 for cert-manager, PostgreSQL, and Temporal are not affected.
 
+### 2.3 → 2.4: Kustomize deployment removed
+
+The Kustomize deployment under `deploy/` is removed in 2.4. Install and
+upgrade NICo Core with the Helm charts under `helm/`, either through
+`setup.sh` as described in the [quick start](../getting-started/quick-start.md)
+or directly as described in [`helm/README.md`](../../helm/README.md). Sites
+still running the Kustomize manifests must move to the Helm charts before
+upgrading to 2.4. The annotated site configuration example now lives at
+[`helm/examples/nico-api-site-config.toml`](../../helm/examples/nico-api-site-config.toml),
+and the `.nico` service endpoint reference moved to
+[DNS Service Endpoints](../configuration/dns-service-endpoints.md). The
+`rest-api/deploy/kustomize` bases that `setup.sh` uses are not affected.
+
 ## Rollback
 
 <Warning>
@@ -480,13 +542,18 @@ Downgrades are **not a supported version move**. The [release policy](../../RELE
 `setup.sh` does not have a built-in rollback mechanism. Rollback consists of:
 
 1. Checking out the prior release branch or tag.
-1. Re-running `setup.sh` with the prior image tags.
+2. Re-running `setup.sh` with the prior image tags.
 
 For NICo Core and REST, the Helm release is rolled back in-place, and the database migration Jobs for the prior version run on startup. NICo's database migrations are designed to be forward-compatible; rolling back does not guarantee schema compatibility if the new version added non-nullable columns. This is why a pre-upgrade database backup is essential.
 
 The database dumps from the [pre-upgrade checklist](#back-up-the-databases) are the rollback foundation: `nico-pg-cluster` holds `nico_system_nico` (NICo Core), `nico_rest` (NICo REST), `flow`, and any retained `psm` or `nsm` databases from a predecessor bundled-manager deployment, while the plain `postgres` StatefulSet holds `temporal`, `temporal_visibility`, and `keycloak`. Restoring means replaying the SQL against a clean instance (`psql -f <dump>.sql`).
 
 Re-running `setup.sh` with the prior image tags alone is **not** a complete rollback if the new version's migrations already ran. Restore the database dumps first, then deploy the prior version.
+
+If you have upgraded to
+[asynchronous peering deletion](#upgrades-that-introduce-asynchronous-peering-deletion),
+do not return to an API that lacks it, even after restoring the database. Fix
+the newer version instead.
 
 For DPF, rolling back to a prior DPF version is not supported by NVIDIA. If DPF fails to upgrade, reach out to NVIDIA support rather than attempting a downgrade.
 
@@ -507,7 +574,7 @@ You can narrow an upgrade to particular components with the `--skip-*` flags. `-
 
 The prerequisite phases therefore run on every invocation. That is by design and is cheap: each one is idempotent, and a phase whose inputs have not changed reconciles to the same state and exits quickly.
 
-For a single-Helm-chart upgrade (such as rotating the NICo Core image tag without going through the full script), run from the **repository root**, matching what `setup.sh` itself executes:
+To upgrade only the NICo Core release without running the prerequisite phases, use a chart and Core image built from the same repository revision, following the [image compatibility policy](https://github.com/dsx-ai-factory/infra-controller/blob/main/helm/README.md#image-configuration). Update both together when moving to a new revision. Run from the **repository root**, matching what `setup.sh` itself executes:
 
 ```bash
 helm upgrade --install nico ./helm \

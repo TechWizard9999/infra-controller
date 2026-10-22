@@ -5,7 +5,6 @@ package operatingsystem
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"time"
 
@@ -133,7 +132,7 @@ func (mos ManageOsImage) UpdateOsImagesInDB(ctx context.Context, siteID uuid.UUI
 
 			ossa, ok := existingOsImageMap[osImageIDStr]
 			if !ok {
-				slogger.Error().Str("OS Image ID", controllerOsImage.Attributes.Id.Value).Msg("OS Image Site Association does not have a record in DB, possibly created directly on Site")
+				slogger.Error().Msg("OS Image Site Association does not have a record in DB, possibly created directly on Site")
 				continue
 			}
 
@@ -166,7 +165,7 @@ func (mos ManageOsImage) UpdateOsImagesInDB(ctx context.Context, siteID uuid.UUI
 
 			ok = ControllerOsImageStatusMap[controllerOsImage.Status]
 			if !ok {
-				slogger.Error().Str("OS Image ID", controllerOsImage.Attributes.Id.Value).Str("OS Image Status", controllerOsImage.Status.String()).Msg("received unknown OS Image status from Site Agent")
+				slogger.Error().Str("OS Image Status", controllerOsImage.Status.String()).Msg("received unknown OS Image status from Site Agent")
 			}
 
 			switch controllerOsImage.Status {
@@ -215,16 +214,20 @@ func (mos ManageOsImage) UpdateOsImagesInDB(ctx context.Context, siteID uuid.UUI
 
 		// Operating System was not found on Site
 		if ossa.Status == cdbm.OperatingSystemSiteAssociationStatusDeleting {
-			// If the OperatingSystemSiteAssociation was being deleted, we can proceed with removing it from the DB
-			serr := ossaDAO.Delete(ctx, nil, ossa.ID)
+			// Keep the association available for the next inventory if locking or finalization fails.
+			serr := cdb.WithTx(ctx, mos.dbSession, func(tx *cdb.Tx) error {
+				err := tx.TryAcquireAdvisoryLock(ctx, cdb.GetAdvisoryLockIDFromString(ossa.OperatingSystemID.String()), nil)
+				if err != nil {
+					return err
+				}
+				err = ossaDAO.Delete(ctx, tx, ossa.ID)
+				if err != nil {
+					return err
+				}
+				return mos.updateOperatingSystemStatusInDB(ctx, tx, ossa.OperatingSystemID)
+			})
 			if serr != nil {
-				slogger.Error().Err(serr).Msg("failed to delete Operating System Site Association from DB")
-				continue
-			}
-			// Trigger re-evaluation of Operating System status (delete if no association exists)
-			serr = mos.UpdateOperatingSystemStatusInDB(ctx, ossa.OperatingSystemID)
-			if serr != nil {
-				slogger.Error().Err(serr).Msg("failed to trigger Operating System status update in DB")
+				slogger.Error().Err(serr).Msg("failed to delete Operating System Site Association and update Operating System status in DB")
 			}
 		} else {
 			// Was this created within inventory receipt interval? If so, we may be processing an older inventory
@@ -295,16 +298,39 @@ func (mos ManageOsImage) UpdateOperatingSystemStatusInDB(ctx context.Context, os
 
 	logger.Info().Msg("starting activity")
 
+	err := cdb.WithTx(ctx, mos.dbSession, func(tx *cdb.Tx) error {
+		// Share the API delete lock before reading status. Otherwise a readiness
+		// update can wait behind deletion, then overwrite Deleting with stale Ready.
+		err := tx.TryAcquireAdvisoryLock(ctx, cdb.GetAdvisoryLockIDFromString(osID.String()), nil)
+		if err != nil {
+			return err
+		}
+
+		return mos.updateOperatingSystemStatusInDB(ctx, tx, osID)
+	})
+	if err != nil {
+		return err
+	}
+
+	logger.Info().Msg("successfully completed activity")
+
+	return nil
+}
+
+// updateOperatingSystemStatusInDB requires the caller to hold the OS advisory lock in tx.
+func (mos ManageOsImage) updateOperatingSystemStatusInDB(ctx context.Context, tx *cdb.Tx, osID uuid.UUID) error {
+	logger := log.With().Str("Activity", "UpdateOperatingSystemStatusInDB").Str("Operating System ID", osID.String()).Logger()
+
 	osDAO := cdbm.NewOperatingSystemDAO(mos.dbSession)
 
-	os, err := osDAO.GetByID(ctx, nil, osID, nil)
+	os, err := osDAO.GetByID(ctx, tx, osID, nil)
 	if err != nil {
-		if err == cdb.ErrDoesNotExist {
+		if errors.Is(err, cdb.ErrDoesNotExist) {
 			logger.Warn().Err(err).Msg("received request for unknown or deleted Operating System")
-		} else {
-			logger.Error().Err(err).Msg("failed to retrieve Operating System from DB")
+			return nil
 		}
-		return nil
+		logger.Error().Err(err).Msg("failed to retrieve Operating System from DB")
+		return err
 	}
 
 	logger.Info().Msg("retrieved Operating System from DB")
@@ -315,7 +341,7 @@ func (mos ManageOsImage) UpdateOperatingSystemStatusInDB(ctx context.Context, os
 	ossaDAO := cdbm.NewOperatingSystemSiteAssociationDAO(mos.dbSession)
 	ossas, ossaTotal, err := ossaDAO.GetAll(
 		ctx,
-		nil,
+		tx,
 		cdbm.OperatingSystemSiteAssociationFilterInput{
 			OperatingSystemIDs: []uuid.UUID{osID},
 		},
@@ -330,73 +356,37 @@ func (mos ManageOsImage) UpdateOperatingSystemStatusInDB(ctx context.Context, os
 	// Operating System is in deleting state
 	if os.Status == cdbm.OperatingSystemStatusDeleting {
 		if ossaTotal == 0 {
-			// Start a db tx
-			tx, err := cdb.BeginTx(ctx, mos.dbSession, &sql.TxOptions{})
-			if err != nil {
-				logger.Error().Err(err).Msg("failed to start transaction")
-				return err
-			}
-
-			// No more associations left, we can delete the Operating System
-			serr := osDAO.Delete(ctx, tx, osID)
-			if serr != nil {
-				logger.Error().Err(serr).Msg("failed to delete Operating System from DB")
-				terr := tx.Rollback()
-				if terr != nil {
-					logger.Error().Err(terr).Msg("failed to rollback transaction")
-				}
-				return serr
-			}
-
-			// Commit transaction
-			err = tx.Commit()
-			if err != nil {
-				logger.Error().Err(err).Msg("error committing transaction to DB")
-				return err
-			}
+			return osDAO.Delete(ctx, tx, osID)
 		}
 
 		// One or more associations left to delete from Sites
 		return nil
 	}
 
-	if ossaTotal == 0 {
-		if os.Status == cdbm.OperatingSystemStatusReady {
-			return nil
-		}
+	statusCountMap := map[string]int{}
+	for _, dbossa := range ossas {
+		statusCountMap[dbossa.Status]++
+	}
+
+	switch {
+	case statusCountMap[cdbm.OperatingSystemSiteAssociationStatusError] > 0:
+		osStatus = cutil.GetPtr(cdbm.OperatingSystemStatusError)
+		osMessage = cutil.GetPtr("Failed to sync Operating System to one or more Sites")
+	case statusCountMap[cdbm.OperatingSystemSiteAssociationStatusSyncing] > 0:
+		osStatus = cutil.GetPtr(cdbm.OperatingSystemStatusSyncing)
+		osMessage = cutil.GetPtr("Operating System syncing to one or more Sites")
+	default:
 		osStatus = cutil.GetPtr(cdbm.OperatingSystemStatusReady)
 		osMessage = cutil.GetPtr("Operating System successfully synced to all Sites")
-	} else {
-		statusCountMap := map[string]int{}
-		for _, dbossa := range ossas {
-			statusCountMap[dbossa.Status]++
-		}
-
-		if statusCountMap[cdbm.OperatingSystemSiteAssociationStatusError] > 0 {
-			if os.Status == cdbm.OperatingSystemStatusError {
-				return nil
-			}
-			osStatus = cutil.GetPtr(cdbm.OperatingSystemStatusError)
-			osMessage = cutil.GetPtr("Failed to sync Operating System to one or more Sites")
-		} else if statusCountMap[cdbm.OperatingSystemSiteAssociationStatusSyncing] > 0 {
-			if os.Status == cdbm.OperatingSystemStatusSyncing {
-				return nil
-			}
-			osStatus = cutil.GetPtr(cdbm.OperatingSystemStatusSyncing)
-			osMessage = cutil.GetPtr("Operating System syncing to one or more Sites")
-		} else {
-			if os.Status == cdbm.OperatingSystemStatusReady {
-				return nil
-			}
-			osStatus = cutil.GetPtr(cdbm.OperatingSystemStatusReady)
-			osMessage = cutil.GetPtr("Operating System successfully synced to all Sites")
-		}
+	}
+	if os.Status == *osStatus {
+		return nil
 	}
 
 	// Update status
 	_, err = osDAO.Update(
 		ctx,
-		nil,
+		tx,
 		cdbm.OperatingSystemUpdateInput{
 			OperatingSystemId: osID,
 			Status:            osStatus,
@@ -407,12 +397,10 @@ func (mos ManageOsImage) UpdateOperatingSystemStatusInDB(ctx context.Context, os
 	}
 
 	statusDetailDAO := cdbm.NewStatusDetailDAO(mos.dbSession)
-	_, err = statusDetailDAO.Create(ctx, nil, cdbm.StatusDetailCreateInput{EntityID: osID.String(), Status: *osStatus, Message: osMessage})
+	_, err = statusDetailDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: osID.String(), Status: *osStatus, Message: osMessage})
 	if err != nil {
 		return err
 	}
-
-	logger.Info().Msg("successfully completed activity")
 
 	return nil
 }

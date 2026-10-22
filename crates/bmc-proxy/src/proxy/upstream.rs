@@ -38,7 +38,7 @@ use crate::metrics::{
     UpstreamRequestCompleted, UpstreamStatus,
 };
 use crate::proxy::credentials::{
-    BmcCredentials, CredentialCache, REDFISH_AUTH_TOKEN_HEADER, get_bmc_credentials,
+    BmcCredentials, CredentialCache, REDFISH_AUTH_TOKEN_HEADER, SwitchProbe, resolve_credentials,
 };
 use crate::proxy::{BmcProxyError, BmcProxyState, ProxyError, error_response};
 use crate::span_isolation::SpanIsolationMiddleware;
@@ -84,6 +84,30 @@ pub(super) enum UpstreamBody {
 pub(super) struct UpstreamResponse {
     pub(super) response: reqwest::Response,
     pub(super) sensitive_values: Vec<String>,
+}
+
+/// An attempt that got no answer from the BMC: the caller's answer, and how
+/// the BMC failed it, if the proxy did not fail it first.
+pub(super) struct AttemptFailed {
+    pub(super) response: Response<Body>,
+    pub(super) by_bmc: Option<BmcFailure>,
+}
+
+/// How the BMC failed an attempt.
+pub(super) enum BmcFailure {
+    /// The proxy could not connect to it.
+    Unreachable,
+    /// It did not answer within the attempt's `budget`.
+    TimedOut { budget: Duration },
+}
+
+impl From<Response<Body>> for AttemptFailed {
+    fn from(response: Response<Body>) -> Self {
+        Self {
+            response,
+            by_bmc: None,
+        }
+    }
 }
 
 impl UpstreamBody {
@@ -167,13 +191,14 @@ pub(super) async fn send_upstream(
     path_and_query: http::uri::PathAndQuery,
     upstream_body: &mut UpstreamBody,
     deadline: tokio::time::Instant,
-) -> Result<UpstreamResponse, Response<Body>> {
+) -> Result<UpstreamResponse, AttemptFailed> {
     let mut bmc_client_info = tokio::time::timeout_at(
         deadline,
         create_client(
             target_ip,
             &state.api_client,
             &state.credential_cache,
+            &state.switch_probe,
             state.http_client.clone(),
             &state.config.bmc_proxy,
         ),
@@ -209,11 +234,9 @@ pub(super) async fn send_upstream(
         .map_err(|e| {
             error_response((StatusCode::BAD_GATEWAY, format!("invalid credentials: {e}")).into())
         })?;
+    let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
     let upstream_request = upstream_body
-        .attach(
-            upstream_request,
-            deadline.saturating_duration_since(tokio::time::Instant::now()),
-        )
+        .attach(upstream_request, budget)
         .map_err(error_response)?;
 
     let started = Instant::now();
@@ -228,7 +251,18 @@ pub(super) async fn send_upstream(
             response,
             sensitive_values,
         })
-        .map_err(|e| error_response((StatusCode::BAD_GATEWAY, e.to_string()).into()))
+        .map_err(|error| AttemptFailed {
+            by_bmc: match &error {
+                reqwest_middleware::Error::Reqwest(cause) if cause.is_connect() => {
+                    Some(BmcFailure::Unreachable)
+                }
+                reqwest_middleware::Error::Reqwest(cause) if cause.is_timeout() => {
+                    Some(BmcFailure::TimedOut { budget })
+                }
+                _ => None,
+            },
+            response: error_response((StatusCode::BAD_GATEWAY, error.to_string()).into()),
+        })
 }
 
 fn copy_request_headers(source: &HeaderMap, dest: &mut HeaderMap) {
@@ -313,6 +347,7 @@ async fn create_client(
     ip: IpAddr,
     api_client: &ForgeApiClient,
     credential_cache: &CredentialCache,
+    switch_probe: &SwitchProbe,
     http_client: reqwest_middleware::ClientWithMiddleware,
     bmc_proxy: &Option<HostPortPair>,
 ) -> Result<BmcClientInfo, BmcProxyError> {
@@ -336,7 +371,9 @@ async fn create_client(
     if add_custom_header {
         header_map.insert("forwarded", format!("host={ip}").parse().unwrap());
     }
-    let credentials = get_bmc_credentials(ip, api_client, credential_cache).await?;
+    let credentials = resolve_credentials(ip, api_client, credential_cache, switch_probe)
+        .await?
+        .credentials;
 
     let base_authority = build_authority(host, port);
 
@@ -424,9 +461,13 @@ fn redirect_policy(mode: RedirectMode) -> reqwest::redirect::Policy {
 }
 
 /// Classifies a resolved HTTP(S) redirect target against the given origin.
-/// Other schemes are invalid; matching compares scheme, host, and effective port.
+/// Other schemes and URL credentials are invalid. Matching compares scheme,
+/// host, and effective port only after these checks.
 pub(super) fn classify_redirect_target(origin: &Url, target: &Url) -> RedirectTarget {
-    if !matches!(target.scheme(), "http" | "https") {
+    if !matches!(target.scheme(), "http" | "https")
+        || !target.username().is_empty()
+        || target.password().is_some()
+    {
         return RedirectTarget::Invalid;
     }
     if target.scheme() == origin.scheme()
@@ -457,6 +498,8 @@ mod tests {
     use carbide_utils::HostPortPair;
     use rpc::forge_api_client::ForgeApiClient;
     use rpc::forge_tls_client::{ApiConfig, ForgeClientConfig};
+    use tokio::task::JoinSet;
+    use tokio_util::sync::CancellationToken;
     use url::Url;
 
     use super::{
@@ -466,7 +509,9 @@ mod tests {
     };
     use crate::config::RedirectMode;
     use crate::metrics::RedirectTarget;
-    use crate::proxy::credentials::{BmcCredentials, CREDENTIAL_CACHE_IDLE_TTL, CredentialCache};
+    use crate::proxy::credentials::{
+        BmcCredentials, CREDENTIAL_CACHE_IDLE_TTL, CredentialCache, SwitchProbe,
+    };
     use crate::proxy::idle_bounded_cache;
     use crate::proxy::test_support::*;
 
@@ -501,17 +546,34 @@ mod tests {
         credentials: CredentialSummary,
     }
 
-    async fn spawn_http(app: Router) -> std::net::SocketAddr {
+    async fn spawn_http(
+        app: Router,
+        tasks: &mut JoinSet<std::io::Result<()>>,
+        shutdown: CancellationToken,
+    ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test HTTP server");
         let address = listener.local_addr().expect("test server address");
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown.cancelled_owned())
                 .await
-                .expect("test HTTP server runs");
         });
         address
+    }
+
+    async fn stop_http(tasks: &mut JoinSet<std::io::Result<()>>, shutdown: &CancellationToken) {
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(result) = tasks.join_next().await {
+                result
+                    .expect("test HTTP server task did not panic")
+                    .expect("test HTTP server stopped successfully");
+            }
+        })
+        .await
+        .expect("test HTTP servers stop within five seconds");
     }
 
     #[test]
@@ -546,11 +608,23 @@ mod tests {
                 ("https://bmc.example/redfish/v1", "ftp://bmc.example/Systems")
                     => RedirectTarget::Invalid,
             }
+
+            "URL credentials are invalid regardless of origin" {
+                ("https://bmc.example/redfish/v1", "https://user@bmc.example/Systems")
+                    => RedirectTarget::Invalid,
+                ("https://bmc.example/redfish/v1", "https://:password@bmc.example/Systems")
+                    => RedirectTarget::Invalid,
+                ("https://bmc.example/redfish/v1", "https://user@other.example/Systems")
+                    => RedirectTarget::Invalid,
+            }
         );
     }
 
     #[tokio::test]
     async fn upstream_client_does_not_follow_cross_origin_redirect() {
+        let mut servers = JoinSet::new();
+        let shutdown = CancellationToken::new();
+        let _shutdown_guard = shutdown.clone().drop_guard();
         let destination_hits = Arc::new(AtomicUsize::new(0));
         let destination = Router::new()
             .route(
@@ -561,7 +635,7 @@ mod tests {
                 }),
             )
             .with_state(destination_hits.clone());
-        let destination = spawn_http(destination).await;
+        let destination = spawn_http(destination, &mut servers, shutdown.clone()).await;
         let location = format!("http://{destination}/target");
         let source = Router::new().route(
             "/start",
@@ -575,7 +649,7 @@ mod tests {
                 }
             }),
         );
-        let source = spawn_http(source).await;
+        let source = spawn_http(source, &mut servers, shutdown.clone()).await;
 
         let response = build_http_client(RedirectMode::FollowSameOrigin)
             .expect("HTTP client builds")
@@ -587,10 +661,64 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
         assert_eq!(destination_hits.load(Ordering::SeqCst), 0);
+        drop(response);
+        stop_http(&mut servers, &shutdown).await;
+    }
+
+    #[tokio::test]
+    async fn upstream_client_does_not_follow_redirect_userinfo() {
+        let mut servers = JoinSet::new();
+        let shutdown = CancellationToken::new();
+        let _shutdown_guard = shutdown.clone().drop_guard();
+        let destination_hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/start",
+                get(|headers: HeaderMap| async move {
+                    let host = headers
+                        .get(http::header::HOST)
+                        .expect("request host")
+                        .to_str()
+                        .expect("ASCII host");
+                    (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [(
+                            http::header::LOCATION,
+                            format!("http://redirect-user:redirect-password@{host}/target"),
+                        )],
+                    )
+                }),
+            )
+            .route(
+                "/target",
+                get(|State(hits): State<Arc<AtomicUsize>>| async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::OK
+                }),
+            )
+            .with_state(destination_hits.clone());
+        let address = spawn_http(app, &mut servers, shutdown.clone()).await;
+        let response = build_http_client(RedirectMode::FollowSameOrigin)
+            .expect("HTTP client builds")
+            .get(format!("http://{address}/start"))
+            .basic_auth("original-user", Some("original-password"))
+            .header("x-auth-token", "original-token")
+            .send()
+            .await
+            .expect("source response returned");
+
+        let status = response.status();
+        drop(response);
+        stop_http(&mut servers, &shutdown).await;
+        assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(destination_hits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn upstream_client_stops_after_five_same_origin_redirects() {
+        let mut servers = JoinSet::new();
+        let shutdown = CancellationToken::new();
+        let _shutdown_guard = shutdown.clone().drop_guard();
         let requests = Arc::new(AtomicUsize::new(0));
         let chain =
             Router::new()
@@ -613,7 +741,7 @@ mod tests {
                     ),
                 )
                 .with_state(requests.clone());
-        let chain = spawn_http(chain).await;
+        let chain = spawn_http(chain, &mut servers, shutdown.clone()).await;
 
         build_http_client(RedirectMode::FollowSameOrigin)
             .expect("HTTP client builds")
@@ -623,6 +751,7 @@ mod tests {
             .expect_err("sixth redirect exceeds the configured limit");
 
         assert_eq!(requests.load(Ordering::SeqCst), 6);
+        stop_http(&mut servers, &shutdown).await;
     }
 
     fn header_for_copy_case(case: HeaderCopyCase) -> (HeaderName, HeaderValue) {
@@ -719,10 +848,10 @@ mod tests {
         credential_cache
             .insert(
                 ip,
-                BmcCredentials::UsernamePassword {
+                for_bmc(BmcCredentials::UsernamePassword {
                     username: "admin".to_string(),
                     password: "secret".to_string(),
-                },
+                }),
             )
             .await;
         let client_config = ForgeClientConfig::default();
@@ -733,6 +862,7 @@ mod tests {
             ip,
             &api_client,
             &credential_cache,
+            &SwitchProbe::default(),
             build_http_client(RedirectMode::FollowSameOrigin).expect("test HTTP client builds"),
             &proxy_override(case),
         )

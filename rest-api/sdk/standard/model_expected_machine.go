@@ -33,6 +33,8 @@ type ExpectedMachine struct {
 	ChassisSerialNumber *string `json:"chassisSerialNumber,omitempty"`
 	// Serial numbers of the Expected Machine's fallback DPUs (Data Processing Units)
 	FallbackDPUSerialNumbers []string `json:"fallbackDPUSerialNumbers,omitempty"`
+	// Expected host NIC declarations in their configured order
+	Interfaces []ExpectedMachineInterface `json:"interfaces,omitempty"`
 	// Optional ID of the SKU associated with this Expected Machine
 	SkuId NullableString `json:"skuId,omitempty"`
 	// SKU information for this Expected Machine (populated when includeRelation=Sku is specified)
@@ -53,6 +55,8 @@ type ExpectedMachine struct {
 	Model NullableString `json:"model,omitempty"`
 	// Description of this component
 	Description NullableString `json:"description,omitempty"`
+	// Optional server name advertised to connected switches in LLDP responses and used for cable validation.
+	ServerName NullableString `json:"serverName,omitempty"`
 	// Slot ID within the rack
 	SlotId NullableInt32 `json:"slotId,omitempty"`
 	// Tray index within the rack
@@ -246,6 +250,38 @@ func (o *ExpectedMachine) HasFallbackDPUSerialNumbers() bool {
 // SetFallbackDPUSerialNumbers gets a reference to the given []string and assigns it to the FallbackDPUSerialNumbers field.
 func (o *ExpectedMachine) SetFallbackDPUSerialNumbers(v []string) {
 	o.FallbackDPUSerialNumbers = v
+}
+
+// GetInterfaces returns the Interfaces field value if set, zero value otherwise.
+func (o *ExpectedMachine) GetInterfaces() []ExpectedMachineInterface {
+	if o == nil || IsNil(o.Interfaces) {
+		var ret []ExpectedMachineInterface
+		return ret
+	}
+	return o.Interfaces
+}
+
+// GetInterfacesOk returns a tuple with the Interfaces field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *ExpectedMachine) GetInterfacesOk() ([]ExpectedMachineInterface, bool) {
+	if o == nil || IsNil(o.Interfaces) {
+		return nil, false
+	}
+	return o.Interfaces, true
+}
+
+// HasInterfaces returns a boolean if a field has been set.
+func (o *ExpectedMachine) HasInterfaces() bool {
+	if o != nil && !IsNil(o.Interfaces) {
+		return true
+	}
+
+	return false
+}
+
+// SetInterfaces gets a reference to the given []ExpectedMachineInterface and assigns it to the Interfaces field.
+func (o *ExpectedMachine) SetInterfaces(v []ExpectedMachineInterface) {
+	o.Interfaces = v
 }
 
 // GetSkuId returns the SkuId field value if set, zero value otherwise (both if not set or set to explicit null).
@@ -656,6 +692,49 @@ func (o *ExpectedMachine) UnsetDescription() {
 	o.Description.Unset()
 }
 
+// GetServerName returns the ServerName field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *ExpectedMachine) GetServerName() string {
+	if o == nil || IsNil(o.ServerName.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.ServerName.Get()
+}
+
+// GetServerNameOk returns a tuple with the ServerName field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *ExpectedMachine) GetServerNameOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.ServerName.Get(), o.ServerName.IsSet()
+}
+
+// HasServerName returns a boolean if a field has been set.
+func (o *ExpectedMachine) HasServerName() bool {
+	if o != nil && o.ServerName.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetServerName gets a reference to the given NullableString and assigns it to the ServerName field.
+func (o *ExpectedMachine) SetServerName(v string) {
+	o.ServerName.Set(&v)
+}
+
+// SetServerNameNil sets the value for ServerName to be an explicit nil
+func (o *ExpectedMachine) SetServerNameNil() {
+	o.ServerName.Set(nil)
+}
+
+// UnsetServerName ensures that no value is present for ServerName, not even an explicit nil
+func (o *ExpectedMachine) UnsetServerName() {
+	o.ServerName.Unset()
+}
+
 // GetSlotId returns the SlotId field value if set, zero value otherwise (both if not set or set to explicit null).
 func (o *ExpectedMachine) GetSlotId() int32 {
 	if o == nil || IsNil(o.SlotId.Get()) {
@@ -970,6 +1049,9 @@ func (o ExpectedMachine) ToMap() (map[string]interface{}, error) {
 	if !IsNil(o.FallbackDPUSerialNumbers) {
 		toSerialize["fallbackDPUSerialNumbers"] = o.FallbackDPUSerialNumbers
 	}
+	if !IsNil(o.Interfaces) {
+		toSerialize["interfaces"] = o.Interfaces
+	}
 	if o.SkuId.IsSet() {
 		toSerialize["skuId"] = o.SkuId.Get()
 	}
@@ -999,6 +1081,9 @@ func (o ExpectedMachine) ToMap() (map[string]interface{}, error) {
 	}
 	if o.Description.IsSet() {
 		toSerialize["description"] = o.Description.Get()
+	}
+	if o.ServerName.IsSet() {
+		toSerialize["serverName"] = o.ServerName.Get()
 	}
 	if o.SlotId.IsSet() {
 		toSerialize["slotId"] = o.SlotId.Get()

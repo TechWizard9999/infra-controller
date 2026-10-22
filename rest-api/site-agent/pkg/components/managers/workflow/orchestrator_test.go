@@ -139,7 +139,7 @@ func TestWorkflowOrchestrator(t *testing.T) {
 
 			// Omit the CA file to stop after loading the client certificate, before
 			// dialing Temporal. The chain has different leaf and CA expirations.
-			loadErr := workflowOrchestrator()
+			_, loadErr := workflowOrchestrator()
 			if tt.invalidKey {
 				require.ErrorContains(t, loadErr, "PEM data in key input")
 				assert.Zero(t, gaugeValue())
@@ -158,25 +158,26 @@ func TestWorkflowOrchestrator(t *testing.T) {
 			require.Len(t, metrics, 4)
 			var expirationMetric *dto.MetricFamily
 			for _, metric := range metrics {
-				if metric.GetName() == "nico_rest_site_agent_temporal_cert_expiration" {
+				if metric.GetName() == "nico_rest_site_agent_temporal_cert_expiration_timestamp_seconds" {
 					expirationMetric = metric
 					break
 				}
 			}
 			require.NotNil(t, expirationMetric)
+			assert.Equal(t, "Unix timestamp in seconds when the Temporal client certificate expires", expirationMetric.GetHelp())
 			require.Len(t, expirationMetric.GetMetric(), 1)
 			assert.Equal(t, float64(expiration.Unix()), expirationMetric.GetMetric()[0].GetGauge().GetValue())
 			if tt.failedReload {
 				err = os.WriteFile(conf.Temporal.GetTemporalClientKeyFullPath(), []byte("invalid PEM"), 0600)
 				require.NoError(t, err)
-				loadErr = workflowOrchestrator()
+				_, loadErr = workflowOrchestrator()
 				require.ErrorContains(t, loadErr, "PEM data in key input")
 				assert.Equal(t, float64(expiration.Unix()), gaugeValue())
 			}
 			if tt.reload {
 				newExpiration := expiration.Add(24 * time.Hour)
 				writeCertificate(newExpiration)
-				loadErr = workflowOrchestrator()
+				_, loadErr = workflowOrchestrator()
 				require.ErrorAs(t, loadErr, &pathErr)
 				assert.Equal(t, float64(newExpiration.Unix()), gaugeValue())
 			}
@@ -240,7 +241,7 @@ func TestWorkflowOrchestrator(t *testing.T) {
 			registrationErr := errors.New("stop after connecting Temporal clients")
 			api := &managerapi.ManagerAPI{Site: siteRegistrationFailure{err: registrationErr}}
 			NewWorkflowManager(data, api, &managerapi.ManagerConf{EB: conf})
-			err = workflowOrchestrator()
+			_, err = workflowOrchestrator()
 			require.ErrorIs(t, err, registrationErr)
 			assert.EqualValues(t, 2, service.calls.Load())
 			assert.NotNil(t, data.Managers.Workflow.Temporal.Publisher)

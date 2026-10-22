@@ -176,7 +176,22 @@ async fn startup_snapshot_failure_still_processes_dpa_data(pool: sqlx::PgPool) {
         .await
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::Internal);
-    assert!(error.message().contains("test_reject_mlx_observation"));
+    assert_eq!(error.message(), "internal database error");
+    let source = std::error::Error::source(&error)
+        .expect("database status source")
+        .downcast_ref::<crate::errors::CarbideErrorWithLocation>()
+        .expect("Carbide error source");
+    let crate::errors::CarbideError::DBError(annotated) = &source.error else {
+        panic!("expected the original database error: {source:?}");
+    };
+    let database_error = annotated
+        .source
+        .as_database_error()
+        .expect("database constraint error");
+    assert_eq!(
+        database_error.constraint(),
+        Some("test_reject_mlx_observation")
+    );
     assert_eq!(observation(&env.pool, host_machine_id).await, None);
 
     let interfaces = db::dpa_interface::find_by_machine_id(
@@ -334,7 +349,7 @@ async fn device_identity_requests_require_an_existing_host(pool: sqlx::PgPool) {
 
 // Feed the real Tonic decoder so these tests exercise Init authentication and
 // the production forwarding task, not a separate observation-only entry point.
-async fn scout_connection(
+pub(super) async fn scout_connection(
     api: &Api,
     machine_id: MachineId,
     authenticated_machine_id: Option<MachineId>,
@@ -368,7 +383,7 @@ async fn scout_connection(
     Ok((sender, response.into_inner()))
 }
 
-async fn live_report(
+pub(super) async fn live_report(
     api: &Api,
     machine_id: MachineId,
     sender: &mpsc::Sender<ScoutStreamApiBoundMessage>,

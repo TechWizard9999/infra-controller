@@ -1611,6 +1611,13 @@ func TestGetAllSiteHandler_Handle(t *testing.T) {
 	_ = testSiteBuildMachine(t, dbSession, ip2.ID, stdemo2.ID, cdbm.MachineStatusError)
 	_ = testSiteBuildMachine(t, dbSession, ip2.ID, stdemo2.ID, cdbm.MachineStatusError)
 
+	// Privileged Tenant denied at stdemo1 without Allocations
+	blockedTnOrg := "test-blocked-tenant-org"
+	blockedTnu := testSiteBuildUser(t, dbSession, "test-blocked-tenant-user", blockedTnOrg, tnRoles)
+	blockedTn := testSiteBuildTenant(t, dbSession, "Test Blocked Tenant", blockedTnOrg, blockedTnu)
+	common.TestBuildTenantAccountWithTargetedInstanceCreation(t, dbSession, ip2, &blockedTn.ID, blockedTnOrg, cdbm.TenantAccountStatusReady, blockedTnu)
+	cdbm.TestBuildTenantSite(t, dbSession, blockedTn, stdemo1, &cdbm.TenantSiteConfig{TargetedInstanceCreation: cutil.GetPtr(false)}, blockedTnu)
+
 	// Build Site for Service Provider
 	ss := testSiteBuildSite(t, dbSession, sip, "test-service-site", cdbm.SiteStatusRegistered, su, nil, nil, nil)
 	common.TestBuildTenantSite(t, dbSession, stn, ss, su)
@@ -1619,14 +1626,20 @@ func TestGetAllSiteHandler_Handle(t *testing.T) {
 
 	// Update Sites with feature flags
 	stDAO := cdbm.NewSiteDAO(dbSession)
-	stDAO.Update(ctx, nil, cdbm.SiteUpdateInput{Config: &cdbm.SiteConfigUpdateInput{NativeNetworking: cutil.GetPtr(true)}, SiteID: sts[0].ID})
-	stDAO.Update(ctx, nil, cdbm.SiteUpdateInput{Config: &cdbm.SiteConfigUpdateInput{NativeNetworking: cutil.GetPtr(true)}, SiteID: sts[1].ID})
+	_, updateErr := stDAO.Update(ctx, nil, cdbm.SiteUpdateInput{Config: &cdbm.SiteConfigUpdateInput{NativeNetworking: cutil.GetPtr(true)}, SiteID: sts[0].ID})
+	require.NoError(t, updateErr)
+	_, updateErr = stDAO.Update(ctx, nil, cdbm.SiteUpdateInput{Config: &cdbm.SiteConfigUpdateInput{NativeNetworking: cutil.GetPtr(true)}, SiteID: sts[1].ID})
+	require.NoError(t, updateErr)
 
-	stDAO.Update(ctx, nil, cdbm.SiteUpdateInput{Config: &cdbm.SiteConfigUpdateInput{NetworkSecurityGroup: cutil.GetPtr(true)}, SiteID: sts[2].ID})
-	stDAO.Update(ctx, nil, cdbm.SiteUpdateInput{Config: &cdbm.SiteConfigUpdateInput{NetworkSecurityGroup: cutil.GetPtr(true)}, SiteID: sts[3].ID})
+	_, updateErr = stDAO.Update(ctx, nil, cdbm.SiteUpdateInput{Config: &cdbm.SiteConfigUpdateInput{NetworkSecurityGroup: cutil.GetPtr(true)}, SiteID: sts[2].ID})
+	require.NoError(t, updateErr)
+	_, updateErr = stDAO.Update(ctx, nil, cdbm.SiteUpdateInput{Config: &cdbm.SiteConfigUpdateInput{NetworkSecurityGroup: cutil.GetPtr(true)}, SiteID: sts[3].ID})
+	require.NoError(t, updateErr)
 
-	stDAO.Update(ctx, nil, cdbm.SiteUpdateInput{Config: &cdbm.SiteConfigUpdateInput{NativeNetworking: cutil.GetPtr(true), NetworkSecurityGroup: cutil.GetPtr(true), NVLinkPartition: cutil.GetPtr(true), Flow: cutil.GetPtr(true)}, SiteID: sts[4].ID})
-	stDAO.Update(ctx, nil, cdbm.SiteUpdateInput{Config: &cdbm.SiteConfigUpdateInput{NativeNetworking: cutil.GetPtr(true), NetworkSecurityGroup: cutil.GetPtr(true), NVLinkPartition: cutil.GetPtr(true), Flow: cutil.GetPtr(true)}, SiteID: sts[5].ID})
+	_, updateErr = stDAO.Update(ctx, nil, cdbm.SiteUpdateInput{Config: &cdbm.SiteConfigUpdateInput{NativeNetworking: cutil.GetPtr(true), NetworkSecurityGroup: cutil.GetPtr(true), NVLinkPartition: cutil.GetPtr(true), Flow: cutil.GetPtr(true)}, SiteID: sts[4].ID})
+	require.NoError(t, updateErr)
+	_, updateErr = stDAO.Update(ctx, nil, cdbm.SiteUpdateInput{Config: &cdbm.SiteConfigUpdateInput{NativeNetworking: cutil.GetPtr(true), NetworkSecurityGroup: cutil.GetPtr(true), NVLinkPartition: cutil.GetPtr(true), Flow: cutil.GetPtr(true)}, SiteID: sts[5].ID})
+	require.NoError(t, updateErr)
 
 	// Setup echo server/context
 	e := echo.New()
@@ -1953,6 +1966,22 @@ func TestGetAllSiteHandler_Handle(t *testing.T) {
 			wantCount:              20,
 			wantTotalCount:         totalCount / 2,
 			wantRespCode:           http.StatusOK,
+		},
+		{
+			name: "get all Sites by privileged Tenant excludes Site denied without Allocations",
+			fields: fields{
+				dbSession: dbSession,
+				tc:        &tmocks.Client{},
+				cfg:       cfg,
+			},
+			args: args{
+				org:  blockedTnOrg,
+				user: blockedTnu,
+			},
+			wantCount:      1,
+			wantTotalCount: 1,
+			wantRespCode:   http.StatusOK,
+			wantFirstEntry: stdemo2,
 		},
 		{
 			name: "get all Sites by Service Account success",

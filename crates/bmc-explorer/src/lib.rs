@@ -15,6 +15,32 @@
  * limitations under the License.
  */
 
+//! Collects Redfish inventory into exploration reports.
+//!
+//! When extending exploration, separate resource collection, model conversion,
+//! and report analysis. Collect the required resources into `Explored*` objects
+//! before constructing model records. Their `to_model()` methods operate on
+//! collected data without BMC requests; derived report values are computed by
+//! the consumers that need them.
+//!
+//! Use configuration to control which resources and links are explored, reusing
+//! the same collection path for a resource kind across use cases. Keep collected
+//! inventory independent of which member a particular consumer will use. For
+//! optional inventory, preserve the distinction between collection that was not
+//! requested and requested collection with no usable members.
+//!
+//! Prefer `nv_redfish` resource accessors, including OEM accessors. Where an
+//! accessor is missing, use the typed SDK schema exposed by `raw()` rather than
+//! defining a parallel payload schema. If `nv-redfish` does not support a
+//! required resource, add that support to `nv-redfish` first, then use it in
+//! `bmc-explorer`. Decode vendor/OEM data in the explorer and pass normalized
+//! values to the model, retaining only fields needed by report consumers.
+//!
+//! Resource selection, precedence between sources, and decisions spanning
+//! resources belong to consumers of the completed report. Individual resource
+//! conversion normalizes its own fields; `Explored*` objects retain the inputs
+//! rather than caching the outcome of a report-level decision.
+
 mod chassis;
 mod component_integrity;
 mod computer_system;
@@ -23,6 +49,7 @@ pub mod hw;
 mod inventories;
 mod manager;
 mod network_adapter;
+mod processors;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 use std::collections::HashMap;
@@ -31,6 +58,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chassis::ExploredChassisCollection;
+use component_integrity::ExploredComponentIntegrity;
 use computer_system::ExploredComputerSystem;
 pub use error::Error;
 use inventories::ExploredInventories;
@@ -55,6 +83,7 @@ use nv_redfish::oem::supermicro::Privilege as SupermicroPrivilege;
 pub use nv_redfish::service_root::Product;
 use nv_redfish::service_root::Vendor;
 use nv_redfish::{Bmc, ServiceRoot};
+pub use processors::ProcessorExt;
 
 #[derive(PartialEq, Eq)]
 pub enum ErrorClass {
@@ -114,8 +143,14 @@ fn build_chassis_explore_config<B: Bmc>(root: &ServiceRoot<B>) -> chassis::Confi
         // of BlueField_ERoT. Because carbide doesn't need
         // BlueField_ERoT we just skip it.
         // BlueField-4: skip IRoT NIC (invalid STATIC UUID breaks parsing).
+        // GB200/GB300 host BMCs: the BMC's ERoT chassis intermittently
+        // times out the same way, and carbide doesn't need it either.
         lazy_fetch: if is_nvidia_vendor && is_bf4_product(root.product()) {
             Some(should_fetch_bf4_chassis_except_irot_nic)
+        } else if root.vendor() == Some(Vendor::new("NVIDIA"))
+            && root.product() == Some(Product::new("GB BMC"))
+        {
+            Some(|odata_id| odata_id.last_segment() != Some("ERoT_BMC_0"))
         } else {
             (root.vendor() == Some(Vendor::new("Nvidia"))
                 && root.product() == Some(Product::new("BlueField-3 DPU")))
@@ -124,11 +159,8 @@ fn build_chassis_explore_config<B: Bmc>(root: &ServiceRoot<B>) -> chassis::Confi
     }
 }
 
-/// `bmc` is the client `root` was fetched through. It is passed separately
-/// because nv-redfish keeps the service root's client private, and the
-/// `ComponentIntegrity` collection is a resource nv-redfish does not model.
+/// Collects required resources, then converts them into an exploration report.
 pub async fn nv_generate_exploration_report<B: Bmc>(
-    bmc: &B,
     mut root: Arc<ServiceRoot<B>>,
     config: &Config<'_, B>,
 ) -> Result<EndpointExplorationReport, Error<B>> {
@@ -136,7 +168,7 @@ pub async fn nv_generate_exploration_report<B: Bmc>(
     let mut explored_chassis =
         ExploredChassisCollection::explore(&root, &chassis_explore_config).await?;
     let explored_inventories = ExploredInventories::explore(&root).await?;
-    let component_integrities = component_integrity::explore(bmc, &root).await;
+    let explored_component_integrities = ExploredComponentIntegrity::explore(&root).await;
 
     // Delta power shelves do not expose a `/redfish/v1/Systems` collection (and
     // report no vendor in the service root, so nv-redfish fabricates the path
@@ -147,7 +179,7 @@ pub async fn nv_generate_exploration_report<B: Bmc>(
             &root,
             explored_chassis,
             explored_inventories,
-            component_integrities,
+            explored_component_integrities,
         )
         .await;
     }
@@ -156,21 +188,56 @@ pub async fn nv_generate_exploration_report<B: Bmc>(
         root = root.as_ref().clone().restrict_expand().into();
     }
 
-    let mut systems_iter = root
+    let systems = root
         .systems()
         .await
         .map_err(Error::nv_redfish("systems"))?
         .ok_or_else(Error::bmc_not_provided("systems"))?
         .members()
         .await
-        .map_err(Error::nv_redfish("systems members"))?
-        .into_iter();
+        .map_err(Error::nv_redfish("systems members"))?;
 
-    let first_system = systems_iter
-        .next()
-        .ok_or_else(Error::bmc_not_provided("at least one computer system"))?;
-    let other_system_with_bios = systems_iter.find(|system| system.raw().bios.is_some());
-    let system = other_system_with_bios.unwrap_or(first_system);
+    let primary_index = systems
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, system)| system.raw().bios.is_some())
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    if systems.is_empty() {
+        return Err(Error::bmc_not_provided("at least one computer system")());
+    }
+    let mut systems = systems;
+    let system = systems.swap_remove(primary_index);
+    let primary_system_id = system.raw().id.clone();
+    let systems = std::iter::once(system).chain(
+        systems
+            .into_iter()
+            .filter(|other| other.raw().id != primary_system_id)
+            .sorted_by(|left, right| left.raw().id.cmp(&right.raw().id))
+            .dedup_by(|left, right| left.raw().id == right.raw().id),
+    );
+    let mut explored_systems = Vec::new();
+    for (index, system) in systems.enumerate() {
+        let need_inventory = index == 0;
+        let is_bluefield_system = need_inventory && is_bluefield_system_id(&system.raw().id);
+        let system_explore_config = computer_system::Config {
+            need_bios: need_inventory,
+            need_boot_options: need_inventory,
+            need_ethernet_interfaces: need_inventory,
+            need_secure_boot: need_inventory,
+            need_processors: root.vendor() == Some(Vendor::new("NVIDIA"))
+                && root.product() == Some(Product::new("VR NVL72"))
+                && system.raw().id == "HGX_Baseboard_0",
+            need_oem_nvidia_bluefield: is_bluefield_system,
+            ignore_500_on_bios_fetch: is_bluefield_system,
+            retry_404_on_eth_interfaces: is_bluefield_system,
+            explore: config,
+        };
+        explored_systems
+            .push(ExploredComputerSystem::explore(system, &system_explore_config).await?);
+    }
+    let explored_system = &explored_systems[0];
 
     let manager = root
         .managers()
@@ -184,16 +251,7 @@ pub async fn nv_generate_exploration_report<B: Bmc>(
         .next()
         .ok_or_else(Error::bmc_not_provided("at least one manager"))?;
 
-    let is_bluefield_system = is_bluefield_system_id(&system.raw().id);
-    let system_explore_config = computer_system::Config {
-        need_oem_nvidia_bluefield: is_bluefield_system,
-        ignore_500_on_bios_fetch: is_bluefield_system,
-        retry_404_on_eth_interfaces: is_bluefield_system,
-        explore: config,
-    };
-    let explored_system = ExploredComputerSystem::explore(system, &system_explore_config).await?;
-
-    let hw_type = hw_type(&root, &explored_system, &explored_chassis);
+    let hw_type = hw_type(&root, explored_system, &explored_chassis);
     let linked_chassis_ids = explored_system.linked_chassis_ids();
     let has_system_mac_address = explored_system.has_usable_ethernet_mac_address();
     if should_use_network_adapter_port_fallback(
@@ -272,7 +330,8 @@ pub async fn nv_generate_exploration_report<B: Bmc>(
                 | hw::HwType::Gb200
                 | hw::HwType::LiteonPowerShelf
                 | hw::HwType::DeltaPowerShelf
-                | hw::HwType::NvSwitch,
+                | hw::HwType::NvSwitch
+                | hw::HwType::Sushy,
             ) => false,
             None => false,
         })
@@ -282,7 +341,7 @@ pub async fn nv_generate_exploration_report<B: Bmc>(
         .map(|hw_type| {
             lockdown_status(
                 &hw_type,
-                &explored_system,
+                explored_system,
                 &explored_manager,
                 &explored_chassis,
             )
@@ -299,7 +358,8 @@ pub async fn nv_generate_exploration_report<B: Bmc>(
             .inspect_err(
                 |error| tracing::warn!(%error, "Failed to fetch forge secure boot status."),
             )
-            .ok(),
+            .ok()
+            .flatten(),
     };
 
     let machine_setup_status = hw_type
@@ -308,7 +368,7 @@ pub async fn nv_generate_exploration_report<B: Bmc>(
                 &hw_type,
                 &explored_manager,
                 &explored_chassis,
-                &explored_system,
+                explored_system,
                 &lockdown_status,
                 config.boot_interface_mac,
             )
@@ -323,19 +383,31 @@ pub async fn nv_generate_exploration_report<B: Bmc>(
             evaluated_boot_interface: None,
         });
 
-    let system = explored_system.to_model(hw_type, &explored_chassis, &pcie_devices)?;
+    let systems = explored_systems
+        .iter()
+        .enumerate()
+        .map(|(index, system)| {
+            let is_primary = index == 0;
+            system.to_model(
+                hw_type.filter(|_| is_primary),
+                is_primary.then_some(&explored_chassis),
+                if is_primary { &pcie_devices } else { &[] },
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let manager = explored_manager.to_model()?;
     let service = explored_inventories.to_model(hw_type);
-    let hardware_class = hardware_class(&root, &system);
-
+    let hardware_class = hardware_class(&root, &systems[0]);
+    let chassis = explored_chassis.to_model();
+    let component_integrities = explored_component_integrities.to_model();
     Ok(EndpointExplorationReport {
         endpoint_type: EndpointType::Bmc,
         last_exploration_error: None,
         last_exploration_latency: None,
         machine_id: None,
         managers: vec![manager],
-        systems: vec![system],
-        chassis: explored_chassis.to_model(),
+        systems,
+        chassis,
         service,
         component_integrities: component_integrities.entries,
         component_integrity_unavailable: component_integrities.unavailable,
@@ -348,11 +420,8 @@ pub async fn nv_generate_exploration_report<B: Bmc>(
         machine_setup_status: Some(machine_setup_status),
         secure_boot_status,
         lockdown_status,
-        physical_slot_number: None,
-        compute_tray_index: None,
-        topology_id: None,
-        revision_id: None,
         remediation_error: None,
+        ..Default::default()
     })
 }
 
@@ -389,7 +458,7 @@ async fn build_delta_powershelf_report<B: Bmc>(
     root: &ServiceRoot<B>,
     explored_chassis: ExploredChassisCollection<B>,
     explored_inventories: ExploredInventories<B>,
-    component_integrities: component_integrity::Observation,
+    explored_component_integrities: ExploredComponentIntegrity<B>,
 ) -> Result<EndpointExplorationReport, Error<B>> {
     let hw_type = hw::HwType::DeltaPowerShelf;
 
@@ -408,6 +477,7 @@ async fn build_delta_powershelf_report<B: Bmc>(
 
     let system = explored_chassis.synthesized_powershelf_system();
     let hardware_class = hardware_class(root, &system);
+    let component_integrities = explored_component_integrities.to_model();
 
     Ok(EndpointExplorationReport {
         endpoint_type: EndpointType::Bmc,
@@ -433,11 +503,8 @@ async fn build_delta_powershelf_report<B: Bmc>(
         }),
         secure_boot_status: None,
         lockdown_status: None,
-        physical_slot_number: None,
-        compute_tray_index: None,
-        topology_id: None,
-        revision_id: None,
         remediation_error: None,
+        ..Default::default()
     })
 }
 
@@ -510,6 +577,7 @@ pub(crate) fn hw_type<B: Bmc>(
                 Some(hw::HwType::Gb200)
             }
             "NVIDIA" if root.product() == Some(Product::new("P3809")) => Some(hw::HwType::NvSwitch),
+            "Contoso" | "Sushy" | "RedVirt" => Some(hw::HwType::Sushy),
             _ => None,
         })
         .or_else(|| {
@@ -854,6 +922,7 @@ fn machine_setup_status<B: Bmc>(
         hw::HwType::LiteonPowerShelf => (),
         hw::HwType::DeltaPowerShelf => (),
         hw::HwType::NvSwitch => (),
+        hw::HwType::Sushy => (),
         hw::HwType::Viking => {
             diffs.extend(
                 hw::viking::EXPECTED_BIOS_ATTRS
@@ -954,14 +1023,18 @@ fn machine_setup_status<B: Bmc>(
                             actual: actual.str_value().unwrap_or("unexpected type").to_string(),
                         })
                     }
-                    explored_system.boot_options.iter().find(|option| {
-                        option
-                            .raw()
-                            .related_item
-                            .iter()
-                            .flatten()
-                            .any(|v| v.odata_id == function.raw().odata_id)
-                    })
+                    explored_system
+                        .boot_options
+                        .iter()
+                        .flatten()
+                        .find(|option| {
+                            option
+                                .raw()
+                                .related_item
+                                .iter()
+                                .flatten()
+                                .any(|v| v.odata_id == function.raw().odata_id)
+                        })
                 } else {
                     None
                 };
@@ -1065,13 +1138,17 @@ fn machine_setup_status<B: Bmc>(
                 let mac_str = mac.to_string();
                 const MELLANOX_UEFI_HTTP_IPV4: &str = "UEFI HTTP IPv4 Mellanox Network Adapter";
                 const NVIDIA_UEFI_HTTP_IPV4: &str = "UEFI HTTP IPv4 Nvidia Network Adapter";
-                let expected = explored_system.boot_options.iter().find(|boot_opt| {
-                    boot_opt.display_name().is_some_and(|v| {
-                        (v.inner().contains(MELLANOX_UEFI_HTTP_IPV4)
-                            || v.inner().contains(NVIDIA_UEFI_HTTP_IPV4))
-                            && v.inner().contains(&mac_str)
-                    })
-                });
+                let expected = explored_system
+                    .boot_options
+                    .iter()
+                    .flatten()
+                    .find(|boot_opt| {
+                        boot_opt.display_name().is_some_and(|v| {
+                            (v.inner().contains(MELLANOX_UEFI_HTTP_IPV4)
+                                || v.inner().contains(NVIDIA_UEFI_HTTP_IPV4))
+                                && v.inner().contains(&mac_str)
+                        })
+                    });
                 let actual = explored_system.boot_order_first_option();
                 if let Some(diff) = compare_boot_options(expected, actual) {
                     diffs.push(diff);
@@ -1082,7 +1159,7 @@ fn machine_setup_status<B: Bmc>(
         hw::HwType::Gb200 => {
             if explored_system
                 .secure_boot_status()
-                .is_ok_and(|s| s.is_enabled)
+                .is_ok_and(|s| s.is_some_and(|s| s.is_enabled))
             {
                 diffs.push(MachineSetupDiff {
                     key: "SecureBoot".to_string(),
@@ -1102,13 +1179,17 @@ fn machine_setup_status<B: Bmc>(
                 // VenHw(REDACTED)/MemoryMapped(REDACTED)/PciRoot(0x6)/Pci(0x0,0x0)/Pci(0x0,0x0)/Pci(0x0,0x0)/Pci(0x0,0x0)/MAC(020304050607,0x1)/IPv4(0.0.0.0)/Uri()
                 let actual = explored_system.boot_order_first_option();
                 let mac_str = format!("/MAC({},", mac.to_string().replace(":", ""));
-                let expected = explored_system.boot_options.iter().find(|option| {
-                    option.uefi_device_path().is_some_and(|path| {
-                        path.inner().contains(&mac_str)
-                            && path.inner().contains("/IPv4(")
-                            && path.inner().ends_with("/Uri()")
-                    })
-                });
+                let expected = explored_system
+                    .boot_options
+                    .iter()
+                    .flatten()
+                    .find(|option| {
+                        option.uefi_device_path().is_some_and(|path| {
+                            path.inner().contains(&mac_str)
+                                && path.inner().contains("/IPv4(")
+                                && path.inner().ends_with("/Uri()")
+                        })
+                    });
                 if let Some(diff) = compare_boot_options(expected, actual) {
                     diffs.push(diff)
                 }
@@ -1118,7 +1199,7 @@ fn machine_setup_status<B: Bmc>(
         hw::HwType::VeraRubin => {
             if explored_system
                 .secure_boot_status()
-                .is_ok_and(|s| s.is_enabled)
+                .is_ok_and(|s| s.is_some_and(|s| s.is_enabled))
             {
                 diffs.push(MachineSetupDiff {
                     key: "SecureBoot".to_string(),
@@ -1136,13 +1217,17 @@ fn machine_setup_status<B: Bmc>(
                 // VenHw(...)/.../MAC(020304050607,0x1)/IPv4(0.0.0.0)/Uri()
                 let actual = explored_system.boot_order_first_option();
                 let mac_str = format!("/MAC({},", mac.to_string().replace(":", ""));
-                let expected = explored_system.boot_options.iter().find(|option| {
-                    option.uefi_device_path().is_some_and(|path| {
-                        path.inner().contains(&mac_str)
-                            && path.inner().contains("/IPv4(")
-                            && path.inner().ends_with("/Uri()")
-                    })
-                });
+                let expected = explored_system
+                    .boot_options
+                    .iter()
+                    .flatten()
+                    .find(|option| {
+                        option.uefi_device_path().is_some_and(|path| {
+                            path.inner().contains(&mac_str)
+                                && path.inner().contains("/IPv4(")
+                                && path.inner().ends_with("/Uri()")
+                        })
+                    });
                 if let Some(diff) = compare_boot_options(expected, actual) {
                     diffs.push(diff)
                 }
@@ -1155,7 +1240,7 @@ fn machine_setup_status<B: Bmc>(
             // TODO(dgx-gb300): add EXPECTED_BIOS_ATTRS once the tray BIOS is characterized.
             if explored_system
                 .secure_boot_status()
-                .is_ok_and(|s| s.is_enabled)
+                .is_ok_and(|s| s.is_some_and(|s| s.is_enabled))
             {
                 diffs.push(MachineSetupDiff {
                     key: "SecureBoot".to_string(),
@@ -1166,13 +1251,17 @@ fn machine_setup_status<B: Bmc>(
             if let Some(mac) = boot_interface_mac {
                 let actual = explored_system.boot_order_first_option();
                 let mac_str = format!("/MAC({},", mac.to_string().replace(":", ""));
-                let expected = explored_system.boot_options.iter().find(|option| {
-                    option.uefi_device_path().is_some_and(|path| {
-                        path.inner().contains(&mac_str)
-                            && path.inner().contains("/IPv4(")
-                            && path.inner().ends_with("/Uri()")
-                    })
-                });
+                let expected = explored_system
+                    .boot_options
+                    .iter()
+                    .flatten()
+                    .find(|option| {
+                        option.uefi_device_path().is_some_and(|path| {
+                            path.inner().contains(&mac_str)
+                                && path.inner().contains("/IPv4(")
+                                && path.inner().ends_with("/Uri()")
+                        })
+                    });
                 if let Some(diff) = compare_boot_options(expected, actual) {
                     diffs.push(diff)
                 }
@@ -1191,13 +1280,17 @@ fn machine_setup_status<B: Bmc>(
             if let Some(mac) = boot_interface_mac {
                 let actual = explored_system.boot_order_first_option();
                 let mac_str = format!("/MAC({},", mac.to_string().replace(":", ""));
-                let expected = explored_system.boot_options.iter().find(|option| {
-                    option.uefi_device_path().is_some_and(|path| {
-                        path.inner().contains(&mac_str)
-                            && path.inner().contains("/IPv4(")
-                            && path.inner().ends_with("/Uri()")
-                    })
-                });
+                let expected = explored_system
+                    .boot_options
+                    .iter()
+                    .flatten()
+                    .find(|option| {
+                        option.uefi_device_path().is_some_and(|path| {
+                            path.inner().contains(&mac_str)
+                                && path.inner().contains("/IPv4(")
+                                && path.inner().ends_with("/Uri()")
+                        })
+                    });
                 if let Some(diff) = compare_boot_options(expected, actual) {
                     diffs.push(diff)
                 }
