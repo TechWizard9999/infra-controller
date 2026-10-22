@@ -543,9 +543,19 @@ async fn test_preingestion_time_sync_reset_accepts_paused_power_state_for_dpu(
         "host must not power on while the BMC reset is still in progress"
     );
 
-    // The paused DPU has been in the reset window long enough to restart it.
+    // Keep the timestamp past the restart grace period but inside the 30-minute
+    // reset-cycle timeout so a transient restart failure remains retryable.
     let mut txn = pool.begin().await?;
-    db::explored_endpoints::pregestion_hostboot_time_test(dpu_ip, &mut txn).await?;
+    let last_time = (chrono::Utc::now() - chrono::TimeDelta::minutes(10)).to_rfc3339();
+    sqlx::query(
+        "UPDATE explored_endpoints SET preingestion_state = \
+         jsonb_set(preingestion_state, '{last_time}', to_jsonb($2::text)) \
+         WHERE address = $1",
+    )
+    .bind(dpu_ip)
+    .bind(last_time)
+    .execute(&mut *txn)
+    .await?;
     txn.commit().await?;
 
     // A failed restart must leave recovery retryable, not advance past Paused.
