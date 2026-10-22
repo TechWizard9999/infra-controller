@@ -278,10 +278,12 @@ This ordering gives the operator a reliable place to:
   contradicts an operator override, because the override is evaluated
   first and decides the packet.
 
-> **Warning:** `policy_overrides` are stateless, even when
-> `stateful_acls_enabled = true`. They are evaluated before tenant NSGs,
-> so tenant `stateful_egress` cannot allow a reply denied by an override.
-> Add an explicit opposite-direction rule for return traffic.
+<Warning>
+`policy_overrides` are stateless, even when
+`stateful_acls_enabled = true`. They are evaluated before tenant NSGs,
+so tenant `stateful_egress` cannot allow a reply denied by an override.
+Add an explicit opposite-direction rule for return traffic.
+</Warning>
 
 Each entry follows the same JSON / TOML structure as a tenant rule. A
 worked example:
