@@ -56,10 +56,8 @@ pub(crate) const CREDENTIAL_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 const CIRCUIT_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
 /// Upper bound on the circuit backoff window.
 const CIRCUIT_MAX_BACKOFF: Duration = Duration::from_secs(300);
-/// How long a single half-open probe is allowed to run before the circuit lets
-/// another caller probe. This only matters if a probe is lost (e.g. its future
-/// is cancelled) — it stops the circuit from latching half-open forever. It is
-/// deliberately longer than a BMC connect timeout.
+/// How long a connection or authentication probe is allowed to run before
+/// another caller may probe.
 const CIRCUIT_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long a credential generation stays marked as known-bad after a
@@ -163,6 +161,7 @@ enum AuthCircuitState {
     Probing {
         generation: u64,
         probe_id: u64,
+        deadline: Instant,
     },
 }
 
@@ -211,6 +210,7 @@ impl AuthenticationCircuit {
         *state = AuthCircuitState::Probing {
             generation,
             probe_id: token.probe_id,
+            deadline: Instant::now() + CIRCUIT_PROBE_TIMEOUT,
         };
         AuthProbe {
             circuit: Arc::clone(self),
@@ -230,6 +230,13 @@ impl AuthenticationCircuit {
                 refresh_generation,
             } if probe_eligible && generation >= rejected_generation => {
                 AuthAdmission::Probe(self.begin_probe(&mut state, generation, refresh_generation))
+            }
+            AuthCircuitState::Probing {
+                generation: probe_generation,
+                deadline,
+                ..
+            } if probe_eligible && Instant::now() >= deadline => {
+                AuthAdmission::Probe(self.begin_probe(&mut state, generation, probe_generation))
             }
             AuthCircuitState::Open { open } if probe_eligible && generation > open.generation => {
                 AuthAdmission::Probe(self.begin_probe(&mut state, generation, open.generation))
@@ -263,6 +270,13 @@ impl AuthenticationCircuit {
                 generation,
                 pending_refresh_generation,
             )),
+            AuthCircuitState::Probing {
+                generation: probe_generation,
+                deadline,
+                ..
+            } if Instant::now() >= deadline => {
+                AuthAdmission::Probe(self.begin_probe(&mut state, generation, probe_generation))
+            }
             AuthCircuitState::Open { open } if generation > open.generation => {
                 AuthAdmission::Probe(self.begin_probe(&mut state, generation, open.generation))
             }
@@ -323,8 +337,13 @@ impl AuthenticationCircuit {
         let probe = AUTH_PROBE_TOKEN.try_with(|token| *token).ok();
         match *self.state.lock().expect("BMC auth circuit mutex poisoned") {
             AuthCircuitState::Closed => true,
-            AuthCircuitState::Probing { probe_id, .. } => {
-                probe.is_some_and(|token| token.circuit_id == self.id && token.probe_id == probe_id)
+            AuthCircuitState::Probing {
+                probe_id, deadline, ..
+            } => {
+                Instant::now() < deadline
+                    && probe.is_some_and(|token| {
+                        token.circuit_id == self.id && token.probe_id == probe_id
+                    })
             }
             AuthCircuitState::Pending { .. } | AuthCircuitState::Open { .. } => false,
         }
@@ -411,6 +430,7 @@ impl AuthProbe {
             AuthCircuitState::Probing {
                 generation,
                 probe_id: self.token.probe_id,
+                deadline: Instant::now() + CIRCUIT_PROBE_TIMEOUT,
             },
         );
     }
@@ -4041,6 +4061,54 @@ mod tests {
             "the next caller must stay suppressed, not join a fan-out"
         );
         drop(probe);
+    }
+
+    #[tokio::test]
+    async fn an_expired_auth_probe_allows_a_new_probe_without_admitting_the_old_one() {
+        let generation = Arc::new(AtomicU64::new(1));
+        let circuit = Arc::new(AuthenticationCircuit::new(generation));
+        circuit.note_credential_rejection(1);
+        let AuthAdmission::Probe(expired_probe) = circuit.admit_read(1, true) else {
+            panic!("pending recovery admits one probe");
+        };
+        let expired_probe_id = match *circuit.state.lock().expect("auth circuit mutex") {
+            AuthCircuitState::Probing { probe_id, .. } => probe_id,
+            _ => panic!("probe admission enters Probing"),
+        };
+        *circuit.state.lock().expect("auth circuit mutex") = AuthCircuitState::Probing {
+            generation: 1,
+            probe_id: expired_probe_id,
+            deadline: Instant::now() - Duration::from_secs(1),
+        };
+
+        assert!(
+            !expired_probe
+                .scope(async { circuit.request_allowed() })
+                .await,
+            "an expired probe token cannot start more transport"
+        );
+        let AuthAdmission::Probe(next_probe) = circuit.admit_read(1, true) else {
+            panic!("an expired probe admits one replacement probe");
+        };
+        assert!(
+            !expired_probe
+                .scope(async { circuit.request_allowed() })
+                .await,
+            "the replaced probe token stays invalid"
+        );
+        assert!(
+            next_probe.scope(async { circuit.request_allowed() }).await,
+            "only the replacement token may use the transport"
+        );
+
+        drop(expired_probe);
+        assert!(
+            matches!(
+                *circuit.state.lock().expect("auth circuit mutex"),
+                AuthCircuitState::Probing { probe_id, .. } if probe_id == next_probe.token.probe_id
+            ),
+            "dropping an expired probe cannot overwrite its replacement"
+        );
     }
 
     const ENTITY_BODY: &str = r#"{"@odata.id":"/redfish/v1"}"#;
