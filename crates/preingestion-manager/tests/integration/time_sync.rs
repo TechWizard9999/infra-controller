@@ -626,6 +626,170 @@ async fn test_preingestion_time_sync_reset_accepts_paused_power_state_for_dpu(
     Ok(())
 }
 
+/// A successful ForceRestart request is not enough to proceed without observing On.
+#[sqlx_test]
+async fn test_preingestion_time_sync_reset_retries_until_host_reaches_on(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = TestHarness::builder(pool.clone()).build().await;
+    let domain = env.test_domain().await;
+    let nc = env.network_controller();
+    let underlay_segment = nc.create_underlay_segment(&domain).await;
+    let mut config = default_config::get();
+    config.ntp_servers.clear();
+
+    let redfish_sim = Arc::new(RedfishSim::default());
+    redfish_sim.set_bmc_time_offset_seconds(600);
+    redfish_sim.set_paused_when_off(true);
+    redfish_sim.set_force_restart_leaves_power_unchanged(true);
+    let mgr = PreingestionManager::new(
+        pool.clone(),
+        config.preingestion_manager(),
+        redfish_sim.clone(),
+        env.test_meter.meter(),
+        None,
+        None,
+        None,
+        env.api().work_lock_manager_handle(),
+        config.ntp_servers,
+    );
+    let dpu_ip = prepare_time_sync_endpoint(
+        &env,
+        &pool,
+        underlay_segment.relay_address,
+        "b8:3f:d2:90:97:aa",
+        true,
+    )
+    .await?;
+
+    for attempt in 0_u32..3 {
+        mgr.run_single_iteration().await?;
+        assert!(matches!(
+            preingestion_state(&pool, dpu_ip).await?,
+            PreingestionState::TimeSyncReset {
+                phase: TimeSyncResetPhase::BMCWasReset,
+                attempt: current_attempt,
+                ..
+            } if current_attempt == attempt
+        ));
+
+        let mut txn = pool.begin().await?;
+        db::explored_endpoints::pregestion_hostboot_time_test(dpu_ip, &mut txn).await?;
+        txn.commit().await?;
+        let before_restart = redfish_sim.timepoint();
+        mgr.run_single_iteration().await?;
+        assert!(matches!(
+            preingestion_state(&pool, dpu_ip).await?,
+            PreingestionState::TimeSyncReset {
+                phase: TimeSyncResetPhase::WaitHostBoot,
+                attempt: current_attempt,
+                ..
+            } if current_attempt == attempt
+        ));
+        let restart_actions = redfish_sim
+            .actions_since(&before_restart)
+            .for_host(&dpu_ip.to_string());
+        assert_eq!(
+            restart_actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    RedfishSimAction::Power(SystemPowerControl::ForceRestart)
+                ))
+                .count(),
+            1,
+            "each failed cycle should issue exactly one ForceRestart"
+        );
+
+        let wait_host_boot_timepoint = redfish_sim.timepoint();
+        mgr.run_single_iteration().await?;
+        assert!(matches!(
+            preingestion_state(&pool, dpu_ip).await?,
+            PreingestionState::TimeSyncReset {
+                phase: TimeSyncResetPhase::WaitHostBoot,
+                attempt: current_attempt,
+                ..
+            } if current_attempt == attempt
+        ));
+        assert!(
+            redfish_sim
+                .actions_since(&wait_host_boot_timepoint)
+                .for_host(&dpu_ip.to_string())
+                .iter()
+                .all(|action| !matches!(
+                    action,
+                    RedfishSimAction::Power(SystemPowerControl::ForceRestart)
+                )),
+            "ForceRestart must not be repeated while waiting for host boot"
+        );
+
+        let mut txn = pool.begin().await?;
+        db::explored_endpoints::pregestion_hostboot_time_test(dpu_ip, &mut txn).await?;
+        txn.commit().await?;
+        if attempt == 0 {
+            redfish_sim.fail_next_power_state_read("transient power-state read failure");
+            mgr.run_single_iteration().await?;
+            assert!(matches!(
+                preingestion_state(&pool, dpu_ip).await?,
+                PreingestionState::TimeSyncReset {
+                    phase: TimeSyncResetPhase::WaitHostBoot,
+                    attempt: 0,
+                    ..
+                }
+            ));
+            assert!(
+                redfish_sim
+                    .actions_since(&wait_host_boot_timepoint)
+                    .for_host(&dpu_ip.to_string())
+                    .iter()
+                    .all(|action| !matches!(
+                        action,
+                        RedfishSimAction::Power(SystemPowerControl::ForceRestart)
+                    )),
+                "a power-state read error must not trigger another restart"
+            );
+        }
+
+        let mut txn = pool.begin().await?;
+        db::explored_endpoints::pregestion_hostboot_time_test(dpu_ip, &mut txn).await?;
+        txn.commit().await?;
+        mgr.run_single_iteration().await?;
+
+        let state = preingestion_state(&pool, dpu_ip).await?;
+        if attempt < 2 {
+            assert!(matches!(
+                state,
+                PreingestionState::TimeSyncReset {
+                    phase: TimeSyncResetPhase::Start,
+                    attempt: next_attempt,
+                    ..
+                } if next_attempt == attempt + 1
+            ));
+        } else {
+            match state {
+                PreingestionState::Failed { reason } => assert_eq!(
+                    reason,
+                    "Host never reached On after restart in 3 time-sync reset attempts"
+                ),
+                other => panic!("expected Failed after exhausting retries, got: {other:?}"),
+            }
+        }
+        assert!(
+            redfish_sim
+                .actions_since(&wait_host_boot_timepoint)
+                .for_host(&dpu_ip.to_string())
+                .iter()
+                .all(|action| !matches!(
+                    action,
+                    RedfishSimAction::Power(SystemPowerControl::ForceRestart)
+                )),
+            "ForceRestart must not be repeated during the WaitHostBoot check"
+        );
+    }
+
+    Ok(())
+}
+
 /// A paused BlueField-3 may be booting, so it is not restarted within the grace period.
 #[sqlx_test]
 async fn test_preingestion_time_sync_reset_waits_grace_before_restarting_paused_dpu(

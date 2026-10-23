@@ -2098,6 +2098,37 @@ impl PreingestionManagerStatic {
                 if !self.should_proceed_after_boot_wait(last_time, endpoint) {
                     return Ok(());
                 }
+                let power_state = match redfish_client.get_power_state().await {
+                    Ok(power_state) => power_state,
+                    Err(error) => {
+                        tracing::warn!(
+                            bmc_ip_address = %endpoint.address,
+                            error = %error,
+                            "Could not verify host power state after restart"
+                        );
+                        return Ok(());
+                    }
+                };
+                if power_state != PowerState::On {
+                    let reason =
+                        "Host never reached On after restart during firmware pre-update reset";
+                    tracing::error!(
+                        bmc_ip_address = %endpoint.address,
+                        power_state = %power_state,
+                        reason,
+                        "Host did not reach On after restart during pre-update reset"
+                    );
+                    db.with_txn(|txn| {
+                        db::explored_endpoints::set_preingestion_failed(
+                            endpoint.address,
+                            reason.to_string(),
+                            txn,
+                        )
+                        .boxed()
+                    })
+                    .await??;
+                    return Ok(());
+                }
                 // Now we can actually proceed with the upgrade.  Go back to checking firmware so we don't have to store all of that info.
                 tracing::info!(bmc_ip_address = %endpoint.address, "Initial reset complete");
                 db.with_txn(|txn| {
@@ -2227,6 +2258,61 @@ impl PreingestionManagerStatic {
             }
             TimeSyncResetPhase::WaitHostBoot => {
                 if !self.should_proceed_after_boot_wait(last_time, endpoint) {
+                    return Ok(false);
+                }
+
+                let power_state = match redfish_client.get_power_state().await {
+                    Ok(power_state) => power_state,
+                    Err(error) => {
+                        tracing::warn!(
+                            bmc_ip_address = %endpoint.address,
+                            error = %error,
+                            "Could not verify host power state after restart"
+                        );
+                        return Ok(false);
+                    }
+                };
+                if power_state != PowerState::On {
+                    let attempts_done = attempt + 1;
+                    if attempts_done < MAX_TIME_SYNC_RESET_ATTEMPTS {
+                        tracing::warn!(
+                            bmc_ip_address = %endpoint.address,
+                            power_state = %power_state,
+                            attempt = attempts_done,
+                            max_attempts = MAX_TIME_SYNC_RESET_ATTEMPTS,
+                            "Host did not reach On after restart; retrying time-sync reset"
+                        );
+                        db.with_txn(|txn| {
+                            db::explored_endpoints::set_preingestion_time_sync_reset(
+                                endpoint.address,
+                                TimeSyncResetPhase::Start,
+                                attempts_done,
+                                txn,
+                            )
+                            .boxed()
+                        })
+                        .await??;
+                    } else {
+                        let reason = format!(
+                            "Host never reached On after restart in {attempts_done} time-sync reset attempts"
+                        );
+                        tracing::error!(
+                            bmc_ip_address = %endpoint.address,
+                            power_state = %power_state,
+                            attempt = attempts_done,
+                            max_attempts = MAX_TIME_SYNC_RESET_ATTEMPTS,
+                            "Host did not reach On after restart; failing preingestion"
+                        );
+                        db.with_txn(|txn| {
+                            db::explored_endpoints::set_preingestion_failed(
+                                endpoint.address,
+                                reason,
+                                txn,
+                            )
+                            .boxed()
+                        })
+                        .await??;
+                    }
                     return Ok(false);
                 }
 

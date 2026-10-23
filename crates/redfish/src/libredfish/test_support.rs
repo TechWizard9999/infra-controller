@@ -78,6 +78,8 @@ struct RedfishSimState {
     /// When enabled, powered-off hosts report the stable BlueField-3
     /// StandbyOffline state as `Paused`.
     paused_when_off: bool,
+    /// When enabled, successful `ForceRestart` requests leave power unchanged.
+    force_restart_leaves_power_unchanged: bool,
     /// Number of `get_tasks` calls to fail after a BMC reset, modelling the
     /// interval before the reset service is reachable again.
     bmc_reset_unavailable_polls: usize,
@@ -449,6 +451,14 @@ impl RedfishSim {
     /// a restart is required to boot again.
     pub fn set_paused_when_off(&self, paused: bool) {
         self.state.lock().unwrap().paused_when_off = paused;
+    }
+
+    /// Model a BMC accepting `ForceRestart` without changing host power.
+    pub fn set_force_restart_leaves_power_unchanged(&self, enabled: bool) {
+        self.state
+            .lock()
+            .unwrap()
+            .force_restart_leaves_power_unchanged = enabled;
     }
 
     /// Returns a snapshot of every `create_client` call made through this sim,
@@ -845,10 +855,13 @@ impl Redfish for RedfishSimClient {
                 return Err(RedfishError::GenericError { error });
             }
             let paused_when_off = state.paused_when_off;
+            let force_restart_leaves_power_unchanged = state.force_restart_leaves_power_unchanged;
             let host_state = state.hosts.get_mut(&self._host).unwrap();
             if !(paused_when_off
                 && host_state.power == PowerState::Off
                 && action == SystemPowerControl::On)
+                && !(force_restart_leaves_power_unchanged
+                    && action == SystemPowerControl::ForceRestart)
             {
                 host_state.power = power_state;
             }
