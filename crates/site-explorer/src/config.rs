@@ -47,6 +47,10 @@ pub struct SiteExplorerConfig {
     /// honor the same knob as DHCP.
     #[serde(skip)]
     pub retained_boot_interface_window: Option<chrono::Duration>,
+    /// Whether proactive host discovery can use IPv6-only admin segments. Setup copies
+    /// `[fnn.admin_vpc].enabled`; this is not an independent `[site_explorer]` setting.
+    #[serde(skip)]
+    pub admin_fnn_enabled: bool,
     /// The interval at which site explorer runs.
     #[serde(
         default = "SiteExplorerConfig::default_run_interval",
@@ -63,11 +67,14 @@ pub struct SiteExplorerConfig {
     /// `exploration_requested` flag set are always attempted, regardless of this
     /// value, because operators rely on that flag for guaranteed next-tick attempts.
     /// Within the budget, three tiers share the slots: 70 percent for unexplored
-    /// endpoints (oldest interface first), 20 percent for endpoints preingestion
-    /// parked with `waiting_for_explorer_refresh` in a state that reads the next
-    /// report (oldest report first), and 10 percent for the routine refresh of
-    /// the oldest reports. Slots a tier cannot fill go to the other tiers in
-    /// that order, so no slot is left unused while any tier has candidates.
+    /// endpoints (oldest interface first), 20 percent for endpoints waiting on
+    /// their next report, those at an expected machine, switch or power shelf
+    /// BMC MAC never explored successfully and those preingestion parked with
+    /// `waiting_for_explorer_refresh` in a state that reads the next report
+    /// (oldest report first), and 10 percent for the routine refresh of the
+    /// oldest reports, among them every undeclared endpoint that never answered.
+    /// Slots a tier cannot fill go to the other tiers in that order, so no slot
+    /// is left unused while any tier has candidates.
     /// Below a budget of ten the smaller shares round to zero.
     /// Parallelism for every kind of exploration is still bounded by
     /// `concurrent_explorations`.
@@ -192,11 +199,27 @@ pub struct SiteExplorerConfig {
     pub explore_mode: SiteExplorerExploreMode,
 }
 
+impl From<&SiteExplorerConfig> for crate::inventory_creator::Config {
+    fn from(config: &SiteExplorerConfig) -> Self {
+        Self {
+            create_machines: config.create_machines.clone(),
+            machines_created_per_run: config.machines_created_per_run,
+            create_power_shelves: config.create_power_shelves.clone(),
+            power_shelves_created_per_run: config.power_shelves_created_per_run,
+            create_switches: config.create_switches.clone(),
+            switches_created_per_run: config.switches_created_per_run,
+            admin_fnn_enabled: config.admin_fnn_enabled,
+            retained_boot_interface_window: config.retained_boot_interface_window,
+        }
+    }
+}
+
 impl Default for SiteExplorerConfig {
     fn default() -> Self {
         SiteExplorerConfig {
             enabled: Self::default_enabled(),
             retained_boot_interface_window: None,
+            admin_fnn_enabled: false,
             run_interval: Self::default_run_interval(),
             concurrent_explorations: Self::default_concurrent_explorations(),
             explorations_per_run: Self::default_explorations_per_run(),
@@ -227,6 +250,7 @@ impl PartialEq for SiteExplorerConfig {
         let Self {
             enabled,
             retained_boot_interface_window,
+            admin_fnn_enabled,
             run_interval,
             concurrent_explorations,
             explorations_per_run,
@@ -250,6 +274,7 @@ impl PartialEq for SiteExplorerConfig {
 
         enabled.load(AtomicOrdering::Relaxed) == other.enabled.load(AtomicOrdering::Relaxed)
             && *retained_boot_interface_window == other.retained_boot_interface_window
+            && *admin_fnn_enabled == other.admin_fnn_enabled
             && *run_interval == other.run_interval
             && *concurrent_explorations == other.concurrent_explorations
             && *explorations_per_run == other.explorations_per_run

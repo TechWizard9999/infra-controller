@@ -221,7 +221,7 @@ Output formatting and pagination flags live on individual commands, not on the r
 
 | Flag | Where | Description |
 |------|-------|-------------|
-| `--output` | every command | Output format: `json`, `yaml`, or `table`. Defaults to `json`, except `vpc-peering list`, which defaults to `table`. |
+| `--output` | every command | Output format: `json`, `yaml`, or `table`. Defaults to `json`. `vpc-peering list` defaults to `table`. |
 | `--all` | list commands | Fetch every page instead of just the first |
 | `--data` | create/update commands | Request body as inline JSON |
 | `--data-file` | create/update commands | Path to a JSON file (use `-` for stdin) |

@@ -260,7 +260,8 @@ func TestSession_fetchMachineChassis(t *testing.T) {
 	}
 }
 
-func TestRunGeneratedTUICommand_ResourceSelectors(t *testing.T) {
+func testRunGeneratedTUICommand_ResourceSelectors(t *testing.T) {
+	t.Helper()
 	for _, test := range []struct {
 		name            string
 		command         string
@@ -435,7 +436,8 @@ func TestRunGeneratedTUICommand_DomainBodyScope(t *testing.T) {
 	}
 }
 
-func TestResolveGeneratedPathParameters_ExplicitDiscoveryValues(t *testing.T) {
+func testResolveGeneratedPathParameters_ExplicitDiscoveryValues(t *testing.T) {
+	t.Helper()
 	for _, test := range []struct {
 		command string
 		args    []string
@@ -452,7 +454,7 @@ func TestResolveGeneratedPathParameters_ExplicitDiscoveryValues(t *testing.T) {
 			defer server.Close()
 			session := NewSession(appcli.NewClient(server.URL, "acme", "token", nil, false), "acme", "")
 			session.Cache.Set("machine", []NamedItem{{Name: "host", ID: "machine-1"}})
-			got, err := resolveGeneratedPathParameters(session, requireGeneratedInfo(t, test.command), test.args)
+			got, _, err := resolveGeneratedPathParameters(session, requireGeneratedInfo(t, test.command), test.args)
 			require.NoError(t, err)
 			assert.Equal(t, test.args, got)
 		})
