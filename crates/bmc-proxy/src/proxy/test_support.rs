@@ -24,8 +24,13 @@ use std::sync::Arc;
 use rpc::forge::find_bmc_ips_request::LookupBy;
 use rpc::forge_api_client::ForgeApiClient;
 use rpc::forge_tls_client::{ApiConfig, ForgeClientConfig};
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
-use crate::proxy::credentials::{BmcCredentials, CREDENTIAL_CACHE_IDLE_TTL};
+use crate::proxy::admission::Admission;
+use crate::proxy::credentials::{
+    BmcCredentials, CREDENTIAL_CACHE_IDLE_TTL, SwitchProbe, TargetCredentials, TargetKind,
+};
 use crate::proxy::target::IP_CACHE_TTL;
 use crate::proxy::upstream::build_http_client;
 use crate::proxy::{BmcProxyState, bounded_cache, idle_bounded_cache};
@@ -49,13 +54,25 @@ pub(super) enum CredentialSummary {
 pub(super) fn test_state_with_config(config: &str) -> BmcProxyState {
     let client_config = ForgeClientConfig::default();
     let api_config = ApiConfig::new("https://example.com", &client_config);
+    let config = Arc::new(crate::Config::parse(config).expect("test config should parse"));
 
+    // A test's admission tasks run until its runtime stops.
+    let mut tasks = JoinSet::new();
+    let admission = Admission::start(
+        &config.classes,
+        &config.admission,
+        CancellationToken::new(),
+        &mut tasks,
+    );
+    tasks.detach_all();
     BmcProxyState {
-        config: Arc::new(crate::Config::parse(config).expect("test config should parse")),
+        http_client: build_http_client(config.redirects.mode).expect("test HTTP client builds"),
+        config,
         api_client: ForgeApiClient::new(&api_config),
         credential_cache: idle_bounded_cache(CREDENTIAL_CACHE_IDLE_TTL),
-        http_client: build_http_client().expect("test HTTP client builds"),
         ip_cache: bounded_cache(IP_CACHE_TTL),
+        admission,
+        switch_probe: Arc::new(SwitchProbe::default()),
     }
 }
 
@@ -67,6 +84,14 @@ pub(super) async fn test_state_with_ip_cache(
         state.ip_cache.insert(lookup_by, ip).await;
     }
     state
+}
+
+/// `credentials` as the cache holds them for a BMC's address.
+pub(super) fn for_bmc(credentials: BmcCredentials) -> TargetCredentials {
+    TargetCredentials {
+        target: TargetKind::Bmc,
+        credentials,
+    }
 }
 
 pub(super) fn summarize_credentials(credentials: BmcCredentials) -> CredentialSummary {

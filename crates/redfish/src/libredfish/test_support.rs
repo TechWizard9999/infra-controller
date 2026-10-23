@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -101,6 +101,10 @@ struct RedfishSimState {
     /// When set, overrides the `Product` field returned by `get_service_root`.
     /// Tests use this to model a specific DPU generation.
     service_root_product: Option<String>,
+    systems_collection_uri: Option<String>,
+    resources: HashMap<String, String>,
+    resource_requests: Vec<String>,
+    resource_failures: HashSet<String>,
     /// When set, overrides the `Manufacturer` returned by `get_chassis`, so
     /// tests can drive `probe_bmc_vendor`'s Lite-On/Delta chassis fallback.
     chassis_manufacturer: Option<String>,
@@ -110,9 +114,11 @@ struct RedfishSimState {
     machine_setup_status_targets: HashMap<String, Vec<Option<RedfishSimBootInterfaceRef>>>,
     /// Opt-in authentication enforcement. Off by default so existing tests
     /// (which pass arbitrary or anonymous credentials) are undisturbed. When on,
-    /// `get_accounts` returns `401` unless the client was created with a
-    /// `Direct` credential whose password matches the seeded `users` entry, so
-    /// credential-probe paths (e.g. `bmc_credentials_valid`) can be exercised.
+    /// `get_accounts`, `change_password`, `change_password_by_id`,
+    /// `get_systems`, and `get_power_state` return `401` unless the client was
+    /// created with a `Direct` credential whose password matches the seeded
+    /// `users` entry. This makes credential selection and rejection observable
+    /// in callers such as `bmc_credentials_valid`.
     enforce_auth: bool,
     auth_attempts: Vec<RedfishSimAuthAttempt>,
     /// When set, `get_accounts` fails with a non-authentication transport error
@@ -423,6 +429,18 @@ impl RedfishSim {
         self.state.lock().unwrap().next_lockdown_status_error = Some(error);
     }
 
+    /// Set one simulated host's power state, as a BMC would report it; the
+    /// host entry is created if no client has touched it yet.
+    pub fn set_power_state(&self, host: &str, power: PowerState) {
+        self.state
+            .lock()
+            .unwrap()
+            .hosts
+            .entry(host.to_string())
+            .or_default()
+            .power = power;
+    }
+
     /// Inject a transient error into the next power-state read only.
     pub fn fail_next_power_state_read(&self, error: &str) {
         self.state.lock().unwrap().next_power_state_error = Some(error.to_string());
@@ -502,8 +520,9 @@ impl RedfishSim {
     }
 
     /// Enable opt-in authentication enforcement (see [`RedfishSimState::enforce_auth`]):
-    /// once on, `get_accounts` authorizes against the seeded `users` map, so
-    /// credential-probe paths can distinguish valid from rejected credentials.
+    /// `get_accounts`, `change_password`, `change_password_by_id`,
+    /// `get_systems`, and `get_power_state` authorize against the seeded `users`
+    /// map, so callers can distinguish valid from rejected credentials.
     pub fn set_enforce_auth(&self, enforce: bool) {
         self.state.lock().unwrap().enforce_auth = enforce;
     }
@@ -581,6 +600,34 @@ impl RedfishSim {
         (credentials, resume)
     }
 
+    /// Sets the Systems collection link advertised by the simulated service root.
+    pub fn set_systems_collection_uri(&self, uri: impl Into<String>) {
+        self.state.lock().unwrap().systems_collection_uri = Some(uri.into());
+    }
+
+    /// Supplies the body returned by generic resource reads at the given URI.
+    pub fn set_resource(&self, uri: impl Into<String>, body: serde_json::Value) {
+        self.state
+            .lock()
+            .unwrap()
+            .resources
+            .insert(uri.into(), body.to_string());
+    }
+
+    /// Makes generic reads of the given URI fail with a simulated transport error.
+    pub fn fail_resource(&self, uri: impl Into<String>) {
+        self.state
+            .lock()
+            .unwrap()
+            .resource_failures
+            .insert(uri.into());
+    }
+
+    /// Returns the URIs requested through the generic resource API, in call order.
+    pub fn resource_requests(&self) -> Vec<String> {
+        self.state.lock().unwrap().resource_requests.clone()
+    }
+
     /// Set the BIOS attribute map returned by the sim client's `bios()`,
     /// which is otherwise unimplemented.
     pub fn set_bios_attributes(&self, attributes: HashMap<String, serde_json::Value>) {
@@ -651,10 +698,22 @@ pub struct RedfishSimTimepoint {
 /// Platform-configuration calls recorded separately from power actions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RedfishSimPlatformAction {
-    SetHostRshim { host: String },
-    SetHostPrivilegeLevel { host: String },
-    IsBiosSetup { host: String },
-    UefiSetup { dpu: bool },
+    SetHostRshim {
+        host: String,
+    },
+    SetIdracLockdown {
+        host: String,
+        enabled: EnabledDisabled,
+    },
+    SetHostPrivilegeLevel {
+        host: String,
+    },
+    IsBiosSetup {
+        host: String,
+    },
+    UefiSetup {
+        dpu: bool,
+    },
 }
 
 /// Owned form of the boot-interface reference observed by the Redfish
@@ -811,6 +870,7 @@ impl Redfish for RedfishSimClient {
     ) -> libredfish::RedfishFuture<'a, Result<libredfish::PowerState, RedfishError>> {
         Box::pin(async move {
             let mut state = self.state.lock().unwrap();
+            self.authorize(&mut state, "Systems/System.Embedded.1")?;
             if let Some(error) = state.next_power_state_error.take() {
                 return Err(RedfishError::GenericError { error });
             }
@@ -1472,6 +1532,10 @@ impl Redfish for RedfishSimClient {
                 })
                 .collect::<Vec<_>>();
             Ok(libredfish::model::ComputerSystem {
+                odata: libredfish::model::OData {
+                    odata_id: format!("/redfish/v1/Systems/{id}"),
+                    ..Default::default()
+                },
                 id,
                 links: (!chassis.is_empty()).then_some(
                     libredfish::model::system::ComputerSystemLinks {
@@ -1704,6 +1768,7 @@ impl Redfish for RedfishSimClient {
             Ok(ServiceRoot {
                 vendor: Some(vendor),
                 product: Some(product),
+                systems: state.systems_collection_uri.clone().map(ODataId::from),
                 component_integrity: Some(ODataId {
                     odata_id: "Valid Data".to_string(),
                 }),
@@ -1977,25 +2042,56 @@ impl Redfish for RedfishSimClient {
 
     fn get_collection<'a>(
         &'a self,
-        _id: ODataId,
+        id: ODataId,
     ) -> libredfish::RedfishFuture<'a, Result<Collection, RedfishError>> {
         Box::pin(async move {
+            let mut state = self.state.lock().unwrap();
+            state.resource_requests.push(id.odata_id.clone());
+            if state.resource_failures.contains(&id.odata_id) {
+                return Err(RedfishError::GenericError {
+                    error: format!("resource {} is unavailable", id.odata_id),
+                });
+            }
+            let body = match state.resources.get(&id.odata_id) {
+                Some(body) => serde_json::from_str(body).map_err(|source| {
+                    RedfishError::JsonDeserializeError {
+                        url: id.odata_id.clone(),
+                        body: body.clone(),
+                        source,
+                    }
+                })?,
+                None => HashMap::new(),
+            };
             Ok(Collection {
-                url: String::new(),
-                body: HashMap::new(),
+                url: id.odata_id,
+                body,
             })
         })
     }
 
     fn get_resource<'a>(
         &'a self,
-        _id: ODataId,
+        id: ODataId,
     ) -> libredfish::RedfishFuture<'a, Result<Resource, RedfishError>> {
         Box::pin(async move {
-            Ok(Resource {
-                url: String::new(),
-                raw: Default::default(),
-            })
+            let mut state = self.state.lock().unwrap();
+            state.resource_requests.push(id.odata_id.clone());
+            if state.resource_failures.contains(&id.odata_id) {
+                return Err(RedfishError::GenericError {
+                    error: format!("resource {} is unavailable", id.odata_id),
+                });
+            }
+            match state.resources.get(&id.odata_id) {
+                Some(body) => Ok(Resource {
+                    url: id.odata_id,
+                    raw: serde_json::value::RawValue::from_string(body.clone())
+                        .expect("configured resource is valid JSON"),
+                }),
+                None => Ok(Resource {
+                    url: String::new(),
+                    raw: Default::default(),
+                }),
+            }
         })
     }
 
@@ -2178,9 +2274,17 @@ impl Redfish for RedfishSimClient {
 
     fn set_idrac_lockdown<'a>(
         &'a self,
-        _enabled: EnabledDisabled,
+        enabled: EnabledDisabled,
     ) -> libredfish::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move {
+            let mut state = self.state.lock().unwrap();
+            let host = self._host.clone();
+            state.hosts.get_mut(&host).unwrap().lockdown = enabled;
+            state
+                .platform_actions
+                .push(RedfishSimPlatformAction::SetIdracLockdown { host, enabled });
+            Ok(())
+        })
     }
 
     fn get_boss_controller<'a>(

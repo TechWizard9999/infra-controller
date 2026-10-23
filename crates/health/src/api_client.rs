@@ -288,38 +288,19 @@ impl CredentialProvider for ApiCredentialProvider {
     }
 }
 
-fn switch_endpoint_metadata(
-    switch: &rpc::forge::Switch,
-    endpoint_role: SwitchEndpointRole,
-    nmxt_enabled: bool,
-) -> Result<EndpointMetadata, HealthError> {
-    if switch.config.is_none() {
-        return Err(HealthError::GenericError(
-            "switch endpoint does not have serial".into(),
-        ));
-    }
-
-    Ok(EndpointMetadata::Switch(switch_data(
-        switch,
-        endpoint_role,
-        nmxt_enabled,
-    )))
-}
-
 fn switch_data(
     switch: &rpc::forge::Switch,
     endpoint_role: SwitchEndpointRole,
     nmxt_enabled: bool,
 ) -> SwitchData {
-    let serial = switch
-        .config
-        .as_ref()
-        .map(|config| config.name.clone())
-        .unwrap_or_default();
-
     SwitchData {
+        log_checkpoint_identity: switch.config.as_ref().map(|config| config.name.clone()),
         id: switch.id,
-        serial,
+        serial: switch
+            .status
+            .as_ref()
+            .and_then(|status| status.serial_number.clone())
+            .filter(|serial| !serial.is_empty()),
         slot_number: switch
             .placement_in_rack
             .as_ref()
@@ -523,6 +504,11 @@ impl ApiEndpointSource {
         }
     }
 
+    /// Returns usable endpoints after all component queries succeed.
+    ///
+    /// Query failures and incomplete detail pages return an error.
+    /// Individual endpoint extraction failures are logged and skipped.
+    /// Inventory-only metadata errors do not discard usable collector endpoints.
     pub async fn fetch_bmc_hosts(&self) -> Result<Vec<Arc<BmcEndpoint>>, HealthError> {
         Ok(self.fetch_component_endpoints().await?.endpoints)
     }
@@ -534,35 +520,23 @@ impl ApiEndpointSource {
             mut inventory_error,
         } = self.fetch_machine_endpoints().await?;
 
-        match self.fetch_power_shelf_endpoints().await {
-            Ok(power_shelves) => {
-                endpoints.extend(power_shelves.endpoints);
-                components.extend(power_shelves.components);
-                if inventory_error.is_none() {
-                    inventory_error = power_shelves.inventory_error;
-                }
-            }
-            Err(error) => {
-                tracing::warn!(?error, "Failed to fetch power shelf endpoints");
-                if inventory_error.is_none() {
-                    inventory_error = Some(error);
-                }
-            }
+        // Prune cached clients only after all component queries and detail-page
+        // checks succeed. Endpoint extraction can still skip individual records.
+        // Inventory-only projection errors are tracked separately.
+        let power_shelves = self.fetch_power_shelf_endpoints().await?;
+        endpoints.extend(power_shelves.endpoints);
+        components.extend(power_shelves.components);
+
+        if inventory_error.is_none() {
+            inventory_error = power_shelves.inventory_error;
         }
-        match self.fetch_switch_endpoints().await {
-            Ok(switches) => {
-                endpoints.extend(switches.endpoints);
-                components.extend(switches.components);
-                if inventory_error.is_none() {
-                    inventory_error = switches.inventory_error;
-                }
-            }
-            Err(error) => {
-                tracing::warn!(?error, "Failed to fetch switch endpoints");
-                if inventory_error.is_none() {
-                    inventory_error = Some(error);
-                }
-            }
+
+        let switches = self.fetch_switch_endpoints().await?;
+        endpoints.extend(switches.endpoints);
+        components.extend(switches.components);
+
+        if inventory_error.is_none() {
+            inventory_error = switches.inventory_error;
         }
 
         self.prune_bmc_client_cache(&endpoints);
@@ -724,8 +698,9 @@ impl ApiEndpointSource {
                 requested_machine_count = ids_chunk.len(),
                 "Fetched machine details"
             );
-            if machines.machines.len() != ids_chunk.len() && inventory_error.is_none() {
-                inventory_error = Some(HealthError::GenericError(format!(
+
+            if machines.machines.len() != ids_chunk.len() {
+                return Err(HealthError::GenericError(format!(
                     "machine inventory response returned {} of {} requested components",
                     machines.machines.len(),
                     ids_chunk.len()
@@ -919,8 +894,11 @@ impl ApiEndpointSource {
                 "Could not extract switch endpoint without BMC Info".to_string(),
             ));
         };
+
         let addr = BmcAddr::try_from(bmc_info)?;
-        let metadata = switch_endpoint_metadata(switch, SwitchEndpointRole::Bmc, false)?;
+
+        let metadata =
+            EndpointMetadata::Switch(switch_data(switch, SwitchEndpointRole::Bmc, false));
 
         self.endpoint_for(
             addr,
@@ -941,9 +919,14 @@ impl ApiEndpointSource {
         let switch_id = switch.id.ok_or_else(|| {
             HealthError::GenericError("switch host endpoint missing switch ID".to_string())
         })?;
+
         let addr = BmcAddr::try_from(nvos_info)?;
-        let metadata =
-            switch_endpoint_metadata(switch, SwitchEndpointRole::Host, switch.is_primary)?;
+
+        let metadata = EndpointMetadata::Switch(switch_data(
+            switch,
+            SwitchEndpointRole::Host,
+            switch.is_primary,
+        ));
 
         let endpoint = self.endpoint_for(
             addr,
@@ -1173,14 +1156,21 @@ impl From<rpc::forge::bmc_credentials::Type> for BmcCredentials {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
 
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{Request, Response};
     use carbide_test_support::{Check, check_values, value_scenarios};
     use carbide_uuid::machine::{MachineId, MachineIdSource, MachineType};
     use carbide_uuid::nvlink::NvLinkDomainId;
     use carbide_uuid::power_shelf::{PowerShelfId, PowerShelfIdSource, PowerShelfType};
     use carbide_uuid::switch::{SwitchId, SwitchIdSource, SwitchType};
     use nv_redfish::bmc_http::reqwest::ClientParams as ReqwestClientParams;
+    use prost::Message;
+    use tokio::task::JoinSet;
+    use tokio::time::timeout;
 
     use super::*;
     use crate::bmc::FixedCredentialProvider;
@@ -1285,6 +1275,109 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
+    fn switch_discovery_exports_hardware_serial() {
+        use crate::otlp::convert::build_metrics_export_request;
+        use crate::sink::{EventContext, MetricSample};
+
+        let client = ForgeApiClient::new(&ApiConfig::new(
+            "http://127.0.0.1:1079",
+            &ForgeClientConfig::default(),
+        ));
+
+        let source = ApiEndpointSource::new(
+            Arc::new(ApiClientWrapper { client }),
+            reqwest(),
+            None,
+            10,
+            None,
+        );
+
+        for (serial, expected) in [
+            (Some(Some("MT2515600ZYB")), Some("MT2515600ZYB")),
+            (Some(None), None),
+            (Some(Some("")), None),
+            (None, None),
+        ] {
+            let switch = rpc::forge::Switch {
+                id: Some(test_switch_id()),
+                status: serial.map(|serial| rpc::forge::SwitchStatus {
+                    serial_number: serial.map(str::to_string),
+                    ..Default::default()
+                }),
+                config: Some(rpc::forge::SwitchConfig {
+                    name: "switch-name".to_string(),
+                    ..Default::default()
+                }),
+                bmc_info: Some(rpc::forge::BmcInfo {
+                    ip: Some("192.0.2.1".to_string()),
+                    mac: Some("02:00:00:00:00:01".to_string()),
+                    ..Default::default()
+                }),
+                nvos_info: Some(rpc::forge::SwitchNvosInfo {
+                    ip: Some("192.0.2.2".to_string()),
+                    mac: Some("02:00:00:00:00:02".to_string()),
+                    ..Default::default()
+                }),
+                rack_id: Some(RackId::new("RACK_1")),
+                ..Default::default()
+            };
+
+            let inventory = switch_component_inventory(&switch).unwrap().unwrap();
+
+            assert_eq!(inventory.metadata.serial_number(), expected);
+
+            for endpoint in [
+                source.extract_switch_endpoint(&switch).unwrap(),
+                source
+                    .extract_switch_host_endpoint(&switch)
+                    .unwrap()
+                    .unwrap(),
+            ] {
+                let context = EventContext::from_endpoint(&endpoint, "nvue_gnmi");
+
+                let sample = MetricSample {
+                    semantics: crate::sink::MetricSemantics::Gauge,
+                    key: "temperature".to_string(),
+                    name: "nvue_gnmi".to_string(),
+                    metric_type: "temperature".to_string(),
+                    unit: "celsius".to_string(),
+                    value: 25.0,
+                    labels: vec![],
+                    context: None,
+                };
+
+                let exported = build_metrics_export_request(
+                    &[(context, sample)],
+                    1,
+                    "carbide_hardware_health",
+                );
+
+                let attributes = &exported.resource_metrics[0]
+                    .resource
+                    .as_ref()
+                    .unwrap()
+                    .attributes;
+
+                let actual = attributes
+                    .iter()
+                    .find(|attr| attr.key == "switch_serial_number")
+                    .and_then(|attr| attr.value.as_ref())
+                    .and_then(|value| value.value.as_ref());
+
+                let expected_value = expected.map(|serial| {
+                    opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
+                        serial.to_string(),
+                    )
+                });
+
+                assert_eq!(actual, expected_value.as_ref());
+                assert_eq!(endpoint.log_identity(), "switch-name");
+            }
+        }
+    }
+
+    #[test]
     fn inventory_page_size_honors_server_limit() {
         check_values(
             [
@@ -1380,7 +1473,7 @@ mod tests {
     }
 
     #[test]
-    fn switch_endpoint_metadata_uses_non_nil_api_domain() {
+    fn switch_data_uses_non_nil_api_domain() {
         let domain = NvLinkDomainId::from_str("9f4b45ec-705a-4af4-89f7-a112bc9c8f4e")
             .expect("valid domain UUID");
 
@@ -1403,7 +1496,7 @@ mod tests {
                 },
             ],
             |nvlink_domain_uuid| {
-                let metadata = switch_endpoint_metadata(
+                let switch = switch_data(
                     &rpc::forge::Switch {
                         config: Some(rpc::forge::SwitchConfig {
                             name: "switch-a".to_string(),
@@ -1414,12 +1507,7 @@ mod tests {
                     },
                     SwitchEndpointRole::Bmc,
                     false,
-                )
-                .expect("switch metadata");
-
-                let EndpointMetadata::Switch(switch) = metadata else {
-                    panic!("expected switch metadata");
-                };
+                );
 
                 switch.nvlink_domain_uuid
             },
@@ -1466,8 +1554,8 @@ mod tests {
     }
 
     #[test]
-    fn switch_endpoint_metadata_enables_nmxc_for_primary_switch() {
-        let metadata = switch_endpoint_metadata(
+    fn switch_data_enables_nmxc_for_primary_switch() {
+        let switch = switch_data(
             &rpc::forge::Switch {
                 config: Some(rpc::forge::SwitchConfig {
                     name: "switch-a".to_string(),
@@ -1478,12 +1566,7 @@ mod tests {
             },
             SwitchEndpointRole::Host,
             false,
-        )
-        .expect("switch metadata");
-
-        let EndpointMetadata::Switch(switch) = metadata else {
-            panic!("expected switch metadata");
-        };
+        );
 
         assert!(switch.nmxc_enabled);
     }
@@ -1685,5 +1768,262 @@ mod tests {
             .get(&test_mac())
             .expect("cached entry not removed by failed registration");
         assert_eq!(still_cached.kind, ApiCredentialKind::Bmc);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum MembershipScenario {
+        PowerShelfFailure,
+        SwitchFailure,
+        ShortMachinePage,
+        CompleteEmpty,
+        RackInventoryFailure,
+    }
+
+    /// Serves only the RPCs used by discovery, without a production API seam.
+    async fn membership_response(
+        State((scenario, reached)): State<(MembershipScenario, Arc<AtomicBool>)>,
+        request: Request<Body>,
+    ) -> Response<Body> {
+        let method = request.uri().path().rsplit('/').next().expect("RPC path");
+
+        let target = match scenario {
+            MembershipScenario::PowerShelfFailure => "FindPowerShelfIds",
+            MembershipScenario::SwitchFailure => "FindSwitchIds",
+            MembershipScenario::ShortMachinePage => "FindMachinesByIds",
+            MembershipScenario::CompleteEmpty | MembershipScenario::RackInventoryFailure => {
+                "FindRackIds"
+            }
+        };
+
+        if method == target {
+            reached.store(true, Ordering::SeqCst);
+        }
+
+        let failed = matches!(
+            (scenario, method),
+            (MembershipScenario::PowerShelfFailure, "FindPowerShelfIds")
+                | (MembershipScenario::SwitchFailure, "FindSwitchIds")
+                | (MembershipScenario::RackInventoryFailure, "FindRackIds")
+        );
+
+        let status = if failed {
+            "13"
+        } else if matches!(
+            method,
+            "FindMachineIds"
+                | "FindMachinesByIds"
+                | "FindPowerShelfIds"
+                | "FindSwitchIds"
+                | "FindRackIds"
+                | "Version"
+        ) {
+            "0"
+        } else {
+            "12"
+        };
+
+        let bytes = if matches!(scenario, MembershipScenario::ShortMachinePage)
+            && method == "FindMachineIds"
+        {
+            rpc::common::MachineIdList {
+                machine_ids: vec![test_machine_id()],
+            }
+            .encode_to_vec()
+        } else {
+            Vec::new()
+        };
+
+        // A unary gRPC success has a compression byte and a big-endian length.
+        // Empty protobuf messages represent complete empty lists and defaults.
+        let mut frame = vec![0];
+
+        frame.extend_from_slice(
+            &u32::try_from(bytes.len())
+                .expect("small fixture")
+                .to_be_bytes(),
+        );
+
+        frame.extend(bytes);
+
+        Response::builder()
+            .header("content-type", "application/grpc")
+            .header("grpc-status", status)
+            .header("grpc-message", "discovery fixture failure")
+            .body(Body::from(if status == "0" { frame } else { Vec::new() }))
+            .expect("valid gRPC response")
+    }
+
+    /// Owns a bounded RPC fixture and observes the production snapshot and cache.
+    async fn membership_observation(
+        scenario: MembershipScenario,
+    ) -> (&'static str, usize, bool, bool) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind discovery fixture");
+
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+
+        let reached = Arc::new(AtomicBool::new(false));
+
+        let app = axum::Router::new()
+            .fallback(membership_response)
+            .with_state((scenario, reached.clone()));
+
+        // JoinSet aborts the owned server even if setup or an assertion panics.
+        let mut server = JoinSet::new();
+        server.spawn(async move { axum::serve(listener, app).await });
+
+        let client = ForgeApiClient::new(&ApiConfig::new(&url, &ForgeClientConfig::default()));
+
+        let source = ApiEndpointSource::new(
+            Arc::new(ApiClientWrapper { client }),
+            reqwest(),
+            None,
+            10,
+            None,
+        );
+
+        let cached_client = {
+            let mut cache = source.bmc_client_cache.lock().expect("cache lock");
+
+            cache_or_create_bmc_client(
+                &mut cache,
+                test_mac(),
+                ApiCredentialKind::Bmc,
+                make_test_client,
+            )
+            .expect("seed cached client")
+            .client
+        };
+
+        let result = timeout(Duration::from_secs(10), source.fetch_endpoint_snapshot()).await;
+
+        // Finish owned cleanup before checking the response, including timeouts.
+        server.abort_all();
+
+        let server_result = timeout(Duration::from_secs(10), server.join_next())
+            .await
+            .expect("bounded server cleanup");
+
+        assert!(
+            matches!(server_result, Some(Err(error)) if error.is_cancelled()),
+            "{scenario:?}: server failed before cleanup"
+        );
+
+        let result = result.expect("bounded discovery request");
+
+        let outcome = match &result {
+            Err(HealthError::ApiInvocationError(status))
+                if status.code() == tonic::Code::Internal
+                    && status.message() == "discovery fixture failure" =>
+            {
+                "membership error"
+            }
+            Err(HealthError::GenericError(message))
+                if message == "machine inventory response returned 0 of 1 requested components" =>
+            {
+                "short machine page"
+            }
+            Ok(snapshot) if snapshot.endpoints.is_empty() => match &snapshot.inventory {
+                Ok(Some(inventory))
+                    if inventory.racks.is_empty() && inventory.components.is_empty() =>
+                {
+                    "complete empty"
+                }
+                Err(HealthError::ApiInvocationError(status))
+                    if status.code() == tonic::Code::Internal
+                        && status.message() == "discovery fixture failure" =>
+                {
+                    "inventory error"
+                }
+                _ => "unexpected inventory",
+            },
+            _ => "unexpected discovery result",
+        };
+
+        let (cache_len, same_client) = {
+            let cache = source.bmc_client_cache.lock().expect("cache lock");
+
+            (
+                cache.len(),
+                cache
+                    .get(&test_mac())
+                    .is_some_and(|cached| Arc::ptr_eq(&cached.client, &cached_client)),
+            )
+        };
+
+        println!(
+            "{scenario:?}: outcome={outcome}, cache_len={cache_len}, same_client={same_client}"
+        );
+
+        (
+            outcome,
+            cache_len,
+            same_client,
+            reached.load(Ordering::SeqCst),
+        )
+    }
+
+    #[tokio::test]
+    async fn endpoint_snapshot_retains_clients_until_membership_is_complete() {
+        let cases = [
+            (
+                "power-shelf membership failure",
+                MembershipScenario::PowerShelfFailure,
+                "membership error",
+                1,
+                true,
+            ),
+            (
+                "switch membership failure",
+                MembershipScenario::SwitchFailure,
+                "membership error",
+                1,
+                true,
+            ),
+            (
+                "short machine detail page",
+                MembershipScenario::ShortMachinePage,
+                "short machine page",
+                1,
+                true,
+            ),
+            (
+                "complete empty membership",
+                MembershipScenario::CompleteEmpty,
+                "complete empty",
+                0,
+                false,
+            ),
+            (
+                "inventory-only failure",
+                MembershipScenario::RackInventoryFailure,
+                "inventory error",
+                0,
+                false,
+            ),
+        ];
+
+        let mut checks = Vec::new();
+
+        for (label, scenario, expected_outcome, expected_cache_len, expected_identity) in cases {
+            let observed = membership_observation(scenario).await;
+
+            checks.push(Check {
+                scenario: label,
+                input: observed,
+                expect: (
+                    expected_outcome,
+                    expected_cache_len,
+                    expected_identity,
+                    true,
+                ),
+            });
+        }
+
+        check_values(checks, |observed| observed);
     }
 }

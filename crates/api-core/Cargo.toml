@@ -27,6 +27,7 @@ repository.workspace = true
 name = "carbide_api_core"
 
 [dependencies]
+cert-manager = { path = "../cert-manager" }
 # External dependencies. PLEASE KEEP ALPHABETIZED ORDER.
 bmc-vendor = { path = "../bmc-vendor" }
 carbide-api-model = { path = "../api-model", default-features = false }
@@ -47,8 +48,10 @@ carbide-ib-fabric = { path = "../ib-fabric" }
 carbide-ib-partition-controller = { path = "../ib-partition-controller" }
 carbide-ipmi = { path = "../ipmi" }
 carbide-ipxe-renderer = { path = "../ipxe-renderer" }
+carbide-kmip = { path = "../kmip" }
 carbide-kms-provider = { path = "../kms-provider" }
 carbide-libmlx = { path = "../libmlx" }
+carbide-libmlx-model = { path = "../libmlx-model" }
 carbide-machine-controller = { path = "../machine-controller" }
 carbide-measured-boot = { path = "../measured-boot", features = ["sqlx"] }
 carbide-metrics-utils = { path = "../metrics-utils" }
@@ -61,6 +64,8 @@ carbide-preingestion-manager = { path = "../preingestion-manager" }
 carbide-rack = { path = "../rack" }
 carbide-rack-controller = { path = "../rack-controller" }
 carbide-redfish = { path = "../redfish" }
+carbide-resource-pool = { path = "../resource-pool" }
+carbide-resource-pool-api = { path = "../resource-pool-api" }
 carbide-rpc = { path = "../rpc", features = ["sqlx", "model"] }
 carbide-secrets = { path = "../secrets" }
 carbide-site-explorer = { path = "../site-explorer" }
@@ -77,6 +82,7 @@ dns-record = { path = "../dns-record" }
 libnmxc = { path = "../libnmxc" }
 mqttea = { path = "../mqttea" }
 nras = { path = "../nras" }
+rms-observability = { path = "../rms-observability" }
 spancounter = { path = "../spancounter" }
 state-controller = { path = "../state-controller" }
 sqlx-query-tracing = { path = "../sqlx-query-tracing" }
@@ -103,7 +109,7 @@ hkdf = { workspace = true }
 hostname = { workspace = true }
 http = { workspace = true }
 hyper = { workspace = true, features = ["full"] }
-hyper-util = { workspace = true }
+hyper-util = { workspace = true, features = ["server-graceful"] }
 ipnetwork = { workspace = true, features = ["serde"] }
 itertools = { workspace = true }
 jsonwebtoken = { workspace = true, features = ["rust_crypto"] }
@@ -226,6 +232,7 @@ carbide-nvlink-manager = { path = "../nvlink-manager", features = [
 carbide-rack = { path = "../rack", features = ["test-support"] }
 carbide-redfish = { path = "../redfish", features = ["test-support"] }
 carbide-rpc = { path = "../rpc", features = ["model", "sqlx", "test-support"] }
+carbide-rpc-utils = { path = "../rpc-utils" }
 carbide-secrets = { path = "../secrets", features = ["test-support"] }
 carbide-site-explorer = { path = "../site-explorer", features = [
   "test-support",

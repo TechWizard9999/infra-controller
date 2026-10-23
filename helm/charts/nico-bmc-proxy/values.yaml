@@ -107,12 +107,18 @@ auth:
   ## SPIFFE service-id of the API allowed full access (allowed_principals + ACL).
   apiPrincipal: nico-api
 
+## nico-api Service the default config dials,
+## configFiles.nicoBmcProxyConfig replaces the default config
+apiServiceName: nico-api
+
 configFiles:
   nicoBmcProxyConfig: ""
 
 bmcProxy:
   listen: "[::]:1079"
   allowedPrincipals: []
+  ## Redirect handling mode: follow_same_origin (default) or return_to_client (experimental).
+  redirectMode: follow_same_origin
 
 vaultClusterInfo: {}
 

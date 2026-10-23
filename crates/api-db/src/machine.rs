@@ -54,14 +54,15 @@ use model::machine::spx::MachineSpxStatusObservation;
 use model::machine::status::MlxDeviceObservation;
 use model::machine::upgrade_policy::AgentUpgradePolicy;
 use model::machine::{
-    AnyMachine, CURRENT_STATE_MODEL_VERSION, Dpf, DpuInfo, DpuInfoStatusObservation, DpuMachine,
-    DpuOsOperationalState, DpuRepresentorStatus, FailureDetails, HostMachine, HostProfile, Machine,
-    MachineInterfaceSnapshot, MachineLastRebootRequested, MachineLastRebootRequestedMode,
-    MachineMaintenanceOperation, MachineValidationContext, ManagedHostState, ReprovisionRequest,
-    ResetRequest, UpgradeDecision,
+    AnyMachine, CURRENT_STATE_MODEL_VERSION, Dpf, DpuAgentUpgradeStatus, DpuInfo,
+    DpuInfoStatusObservation, DpuMachine, DpuOsOperationalState, DpuRepresentorStatus,
+    FailureDetails, HostMachine, HostProfile, Machine, MachineInterfaceSnapshot,
+    MachineLastRebootRequested, MachineLastRebootRequestedMode, MachineMaintenanceOperation,
+    MachineValidationContext, ManagedHostState, ReprovisionRequest, ResetRequest, UpgradeDecision,
 };
 use model::machine_interface_address::MachineInterfaceAssociation;
 use model::metadata::Metadata;
+use model::nic_firmware::NicFirmwareProfileId;
 use model::resource_pool;
 use model::resource_pool::ResourcePoolError;
 use model::resource_pool::common::{CommonPools, LOOPBACK_IP_V6};
@@ -231,6 +232,58 @@ where
     Ok(find(txn, ObjectFilter::One(*id), search_config)
         .await?
         .pop())
+}
+
+/// `find_dpu_id` returns the requested DPU's ID, or `None` if its row is absent.
+/// Other snapshot fields are neither read nor decoded.
+pub async fn find_dpu_id(
+    conn: impl DbReader<'_>,
+    id: &DpuMachineId,
+) -> DatabaseResult<Option<DpuMachineId>> {
+    let query = "SELECT id FROM machines WHERE id = $1";
+    sqlx::query_scalar(query)
+        .bind(id)
+        .fetch_optional(conn)
+        .await
+        .map_err(|error| DatabaseError::query(query, error))
+}
+
+pub(crate) async fn find_by_nic_firmware_profile(
+    db: impl DbReader<'_>,
+    profile_id: &NicFirmwareProfileId,
+) -> DatabaseResult<Vec<HostMachine>> {
+    let query = format!(
+        "{} WHERE m.id IN (\
+            SELECT id FROM machines WHERE nic_firmware_profile_id = $1 \
+            UNION \
+            SELECT machine_id FROM machine_nic_firmware_overrides WHERE profile_id = $1\
+        )",
+        JSON_MACHINE_SNAPSHOT_QUERY.as_str()
+    );
+    let machines: Vec<AnyMachine> = sqlx::query_as(sqlx::AssertSqlSafe(query.as_str()))
+        .bind(profile_id)
+        .fetch_all(db)
+        .await
+        .map_err(|error| DatabaseError::query(&query, error))?;
+    machines
+        .into_iter()
+        .map(|machine| machine.try_into_subtype().map_err(Into::into))
+        .collect()
+}
+
+/// Lock the machine row before reading its mutable request state. A separate
+/// read after this query sees changes committed by the previous lock holder.
+pub async fn lock_by_id_for_update(
+    txn: &mut PgConnection,
+    id: &MachineId,
+) -> Result<(), DatabaseError> {
+    let query = "SELECT id FROM machines WHERE id = $1 FOR UPDATE";
+    sqlx::query_scalar::<_, MachineId>(query)
+        .bind(id)
+        .fetch_optional(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+    Ok(())
 }
 
 pub async fn find_existing_machine(
@@ -966,6 +1019,35 @@ pub async fn find_host_by_dpu_machine_id(
         .map_err(|e| DatabaseError::query(query.as_str(), e))?;
 
     Ok(machine)
+}
+
+/// `lookup_host_state_by_dpu_machine_id` returns the associated host's state
+/// by reading only `id` and `controller_state` through a non-BMC interface
+/// owned by a machine other than the requested DPU.
+///
+/// The owner must have a stable or predicted [`HostMachineId`]. Invalid IDs
+/// or state data return decoding errors; no matching association returns `None`.
+/// Selection is unspecified when multiple hosts match. Other snapshot fields
+/// are neither read nor decoded; use [`find_host_by_dpu_machine_id`] for those.
+pub async fn lookup_host_state_by_dpu_machine_id(
+    conn: impl DbReader<'_>,
+    dpu_machine_id: &DpuMachineId,
+) -> DatabaseResult<Option<ManagedHostState>> {
+    let query = r#"SELECT m.id, m.controller_state
+        FROM machines m
+        INNER JOIN machine_interfaces mi ON m.id = mi.machine_id
+        WHERE mi.attached_dpu_machine_id = $1
+          AND mi.interface_type != 'Bmc'
+          AND mi.attached_dpu_machine_id != mi.machine_id
+        LIMIT 1"#;
+
+    let host: Option<(HostMachineId, sqlx::types::Json<ManagedHostState>)> = sqlx::query_as(query)
+        .bind(dpu_machine_id)
+        .fetch_optional(conn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+
+    Ok(host.map(|(_, state)| state.0))
 }
 
 pub async fn lookup_host_machine_ids_by_dpu_ids(
@@ -1846,9 +1928,8 @@ pub async fn try_sync_stable_id_with_current_machine_id_for_host(
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
 
-    // machine_interfaces and dpa_interfaces both carry a machines(id) FK with
-    // ON UPDATE CASCADE, so their machine_id rows follow this rename
-    // automatically.
+    // Interface and NIC firmware selection rows reference machines(id) with
+    // ON UPDATE CASCADE, so their machine_id follows this rename automatically.
     let query = "UPDATE machines SET id=$1 WHERE id=$2 RETURNING id";
     let machine_id = sqlx::query_as(query)
         .bind(stable_machine_id)
@@ -2413,38 +2494,71 @@ pub async fn list_machines_requested_for_reset(
         .map_err(|e| DatabaseError::query(query.as_str(), e))
 }
 
-/// Apply dpu agent upgrade policy to a single DPU.
-/// Returns Ok(true) if it needs upgrading, Ok(false) otherwise.
+/// `find_dpu_agent_upgrade_status` reads the current upgrade inputs for an attached DPU.
+/// Returns `None` if the DPU, its host, or their non-BMC attachment is absent.
+pub async fn find_dpu_agent_upgrade_status<DB>(
+    conn: &mut DB,
+    dpu_machine_id: &DpuMachineId,
+) -> DatabaseResult<Option<DpuAgentUpgradeStatus>>
+where
+    for<'db> &'db mut DB: DbReader<'db>,
+{
+    let host_ids =
+        lookup_host_machine_ids_by_dpu_ids(&mut *conn, std::slice::from_ref(dpu_machine_id))
+            .await?;
+    let Some(host_machine_id) = host_ids.get(dpu_machine_id) else {
+        return Ok(None);
+    };
+
+    // Recheck the attachment in this read, since it can change after the host lookup.
+    // EXISTS avoids duplicate rows when several host interfaces attach to the DPU.
+    let query = r#"
+        SELECT dpu.id,
+               dpu.network_status_observation->>'agent_version' AS agent_version,
+               COALESCE((dpu.dpu_agent_upgrade_requested->>'should_upgrade')::bool, false)
+                   AS upgrade_requested,
+               (host.dpf->>'used_for_ingestion')::bool AS host_dpf_used_for_ingestion
+        FROM machines dpu
+        JOIN machines host ON host.id = $2
+        WHERE dpu.id = $1
+          AND EXISTS (
+              SELECT 1 FROM machine_interfaces mi
+              WHERE mi.machine_id = host.id
+                AND mi.attached_dpu_machine_id = dpu.id
+                AND mi.attached_dpu_machine_id != mi.machine_id
+                AND mi.interface_type != 'Bmc'
+          )"#;
+    sqlx::query_as(query)
+        .bind(dpu_machine_id)
+        .bind(host_machine_id)
+        .fetch_optional(conn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))
+}
+
+/// `apply_agent_upgrade_policy` evaluates the supplied agent version and upgrade request.
+/// The caller handles hosts ingested through DPF before calling this helper.
+/// An `Off` policy or an absent version leaves the upgrade decision unchanged.
 pub async fn apply_agent_upgrade_policy(
     txn: &mut PgConnection,
     policy: AgentUpgradePolicy,
-    machine: &DpuMachine,
-) -> Result<bool, DatabaseError> {
+    status: &DpuAgentUpgradeStatus,
+) -> Result<(), DatabaseError> {
     if policy == AgentUpgradePolicy::Off {
-        return Ok(false);
+        return Ok(());
     }
 
-    match machine.network_status_observation.as_ref() {
-        None => Ok(false),
-        Some(obs) => {
-            let carbide_api_version = carbide_version::v!(build_version);
-            let Some(agent_version) = obs.agent_version.clone() else {
-                return Ok(false);
-            };
-            let should_upgrade = policy.should_upgrade(&agent_version, carbide_api_version);
-            if should_upgrade != machine.needs_agent_upgrade() {
-                set_dpu_agent_upgrade_requested(
-                    txn,
-                    &machine.id,
-                    should_upgrade,
-                    carbide_api_version,
-                )
-                .await?;
-            }
-
-            Ok(true)
-        }
+    let Some(agent_version) = status.agent_version.as_deref() else {
+        return Ok(());
+    };
+    let carbide_api_version = carbide_version::v!(build_version);
+    let should_upgrade = policy.should_upgrade(agent_version, carbide_api_version);
+    if should_upgrade != status.upgrade_requested {
+        set_dpu_agent_upgrade_requested(txn, &status.id, should_upgrade, carbide_api_version)
+            .await?;
     }
+
+    Ok(())
 }
 
 pub async fn set_dpu_agent_upgrade_requested(
@@ -2533,7 +2647,10 @@ where
     }
 
     if let Some(ovrrd_str) = &search_config.only_with_health_alert {
-        qb.push(" AND health_reports->'merges' ? ");
+        // Match the machine_health_source_keys_gin_idx index.
+        qb.push(
+            " AND jsonb_path_query_array(health_reports, '$.merges.keyvalue().key'::jsonpath) ? ",
+        );
         qb.push_bind(ovrrd_str.clone());
         qb.push(" AND jsonb_array_length(health_reports->'merges'->");
         qb.push_bind(ovrrd_str);
@@ -3629,6 +3746,37 @@ pub async fn find_machine_ids_by_sku_ids(
         .collect())
 }
 
+/// Records whether force deletion was asked to wait for an Admin acknowledgement.
+/// A true requirement survives retries; false only preserves an existing choice
+/// or records that no wait was requested. The caller must hold the host row lock
+/// and commit this together with `ForceDeletion` and any Admin request.
+pub async fn record_force_delete_admin_ack_requirement(
+    txn: &mut PgConnection,
+    machine_id: &HostMachineId,
+    requires_admin_ack: bool,
+) -> DatabaseResult<bool> {
+    let query = "SELECT force_delete_requires_admin_ack FROM machines WHERE id = $1";
+    let recorded: Option<bool> = sqlx::query_scalar(query)
+        .bind(machine_id)
+        .fetch_one(&mut *txn)
+        .await
+        .map_err(|error| DatabaseError::query(query, error))?;
+    if let Some(recorded) = recorded
+        && (recorded || !requires_admin_ack)
+    {
+        return Ok(recorded);
+    }
+
+    let query = "UPDATE machines SET force_delete_requires_admin_ack = $2 WHERE id = $1
+                 RETURNING force_delete_requires_admin_ack";
+    sqlx::query_scalar(query)
+        .bind(machine_id)
+        .bind(requires_admin_ack)
+        .fetch_one(txn)
+        .await
+        .map_err(|error| DatabaseError::query(query, error))
+}
+
 pub async fn get_network_config(
     txn: impl DbReader<'_>,
     machine_id: &MachineId,
@@ -3854,16 +4002,17 @@ mod test {
 
     use carbide_instrument::testing::{MetricsCapture, capture_logs_async};
     use carbide_uuid::machine::{
-        HostMachineId, HostMachineIdSubtypeTrait, MachineId, MachineInterfaceId,
+        DpuMachineId, HostMachineId, HostMachineIdSubtypeTrait, MachineId, MachineInterfaceId,
         StableHostMachineId,
     };
     use carbide_uuid::network::NetworkSegmentId;
     use model::allocation_type::AllocationType;
     use model::bmc_info::BmcInfo;
     use model::hardware_info::HardwareInfo;
-    use model::machine::ManagedHostState;
     use model::machine::machine_search_config::MachineSearchConfig;
     use model::machine::topology::{DiscoveryData, TopologyData};
+    use model::machine::{MachineState, ManagedHostState};
+    use model::machine_interface::InterfaceType;
     use model::resource_pool::common::{
         CommonPools, DPA_VNI, EXTERNAL_VPC_VNI, EthernetPools, FNN_ASN, IbPools, LOOPBACK_IP,
         LOOPBACK_IP_V6, VLANID, VNI, VPC_DPU_LOOPBACK, VPC_VNI,
@@ -3871,6 +4020,392 @@ mod test {
     use model::resource_pool::define::{Range, ResourcePoolDef, ResourcePoolType};
     use model::resource_pool::{ResourcePool, ValueType};
     use tokio::sync::oneshot;
+
+    #[crate::sqlx_test]
+    async fn host_state_lookup_preserves_association_and_decode_checks(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let host_id: HostMachineId =
+            "fm100htes3rn1npvbtm5qd57dkilaag7ljugl1llmm7rfuq1ov50i0rpl30".parse()?;
+        let dpu_id: DpuMachineId =
+            "fm100dskla0ihp0pn4tv7v1js2k2mo37sl0jjr8141okqg8pjpdpfihaa80".parse()?;
+        let other_dpu_id: DpuMachineId =
+            "fm100ds7blqjsadm2uuh3qqbf1h7k8pmf47um6v9uckrg7l03po8mhqgvng".parse()?;
+        let host_state = ManagedHostState::HostInit {
+            machine_state: MachineState::WaitingForPlatformConfiguration { retry_count: 3 },
+        };
+        let mut txn = pool.begin().await?;
+        for (machine_id, state) in [
+            (MachineId::from(host_id), host_state.clone()),
+            (MachineId::from(dpu_id), ManagedHostState::Ready),
+            (MachineId::from(other_dpu_id), ManagedHostState::Ready),
+        ] {
+            super::create(txn.as_mut(), None, &machine_id, state, None, 2).await?;
+        }
+        let segment_id: NetworkSegmentId = sqlx::query_scalar(
+            "INSERT INTO network_segments (name, version)
+             VALUES ('host-state-lookup', 'V1-T0') RETURNING id",
+        )
+        .fetch_one(txn.as_mut())
+        .await?;
+
+        // Keep excluded interfaces present when adding the valid attachment.
+        for (index, (scenario, machine_id, interface_type, expected)) in [
+            (
+                "self attachment",
+                MachineId::from(dpu_id),
+                InterfaceType::Data,
+                None,
+            ),
+            (
+                "BMC attachment",
+                MachineId::from(host_id),
+                InterfaceType::Bmc,
+                None,
+            ),
+            (
+                "data attachment",
+                MachineId::from(host_id),
+                InterfaceType::Data,
+                Some(&host_state),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO machine_interfaces
+                    (machine_id, attached_dpu_machine_id, association_type, segment_id,
+                     mac_address, primary_interface, hostname, interface_type)
+                 VALUES ($1, $2, 'Machine', $3, $4::macaddr, false, 'host-state-lookup', $5)",
+            )
+            .bind(machine_id)
+            .bind(dpu_id)
+            .bind(segment_id)
+            .bind(format!("02:00:00:00:21:{index:02x}"))
+            .bind(interface_type)
+            .execute(txn.as_mut())
+            .await?;
+            let state = super::lookup_host_state_by_dpu_machine_id(txn.as_mut(), &dpu_id).await?;
+            assert_eq!(state.as_ref(), expected, "{scenario}");
+        }
+        assert_eq!(
+            super::lookup_host_state_by_dpu_machine_id(txn.as_mut(), &other_dpu_id).await?,
+            None,
+            "an attachment to one DPU must not match another DPU"
+        );
+
+        for (scenario, owner_id, state, column) in [
+            (
+                "DPU-typed owner is a decode error",
+                MachineId::from(other_dpu_id),
+                serde_json::to_value(ManagedHostState::Ready)?,
+                "0",
+            ),
+            (
+                "malformed host state is not a missing association",
+                MachineId::from(host_id),
+                serde_json::json!({}),
+                "1",
+            ),
+        ] {
+            sqlx::query(
+                "UPDATE machine_interfaces SET machine_id = $1
+                 WHERE attached_dpu_machine_id = $2 AND machine_id != $2
+                   AND interface_type != 'Bmc'",
+            )
+            .bind(owner_id)
+            .bind(dpu_id)
+            .execute(txn.as_mut())
+            .await?;
+            sqlx::query("UPDATE machines SET controller_state = $2 WHERE id = $1")
+                .bind(owner_id)
+                .bind(state)
+                .execute(txn.as_mut())
+                .await?;
+
+            let error = super::lookup_host_state_by_dpu_machine_id(txn.as_mut(), &dpu_id)
+                .await
+                .expect_err(scenario);
+            let crate::DatabaseError::Sqlx(annotated) = &error else {
+                panic!("{scenario}: expected Sqlx, got {error:?}");
+            };
+            let sqlx::Error::ColumnDecode { index, .. } = &annotated.source else {
+                panic!("{scenario}: expected ColumnDecode, got {error:?}");
+            };
+            assert_eq!(index, column, "{scenario}");
+        }
+        txn.rollback().await?;
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn health_alert_search_uses_source_keys(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let machine_id: HostMachineId =
+            "fm100htes3rn1npvbtm5qd57dkilaag7ljugl1llmm7rfuq1ov50i0rpl30".parse()?;
+        let source = "future.source with 'quotes' and \"double quotes\"";
+        let populated = serde_json::json!({
+            "merges": {
+                source: {"alerts": [{"id": "leak", "message": "nested payload"}]},
+                "empty": {"alerts": []}
+            }
+        });
+        let mut txn = pool.begin().await?;
+        super::create(
+            txn.as_mut(),
+            None,
+            &machine_id,
+            ManagedHostState::Ready,
+            None,
+            2,
+        )
+        .await?;
+        sqlx::query("UPDATE machines SET health_reports = $1 WHERE id = $2")
+            .bind(&populated)
+            .bind(machine_id)
+            .execute(txn.as_mut())
+            .await?;
+        txn.commit().await?;
+
+        // Reconstruct the predecessor index with populated data, then apply the
+        // shipped replacement outside a transaction, as the migrator does.
+        sqlx::raw_sql(
+            "DROP INDEX machine_health_source_keys_gin_idx;
+             CREATE INDEX machine_health_reports_merges_gin_idx ON machines
+             USING gin ((health_reports->'merges'));",
+        )
+        .execute(&pool)
+        .await?;
+        for migration in [
+            include_str!("../migrations/20261013175247_machine_health_source_keys_gin.sql"),
+            include_str!("../migrations/20261013175248_drop_machine_health_reports_merges_gin.sql"),
+        ] {
+            sqlx::raw_sql(migration).execute(&pool).await?;
+        }
+
+        for (scenario, reports, searched_source, expected) in [
+            ("arbitrary source", Some(populated.clone()), source, true),
+            ("empty alerts", Some(populated.clone()), "empty", false),
+            (
+                "nested value is not a source",
+                Some(populated),
+                "leak",
+                false,
+            ),
+            ("absent reports", None, source, false),
+            ("absent merges", Some(serde_json::json!({})), source, false),
+        ] {
+            sqlx::query("UPDATE machines SET health_reports = $1 WHERE id = $2")
+                .bind(reports)
+                .bind(machine_id)
+                .execute(&pool)
+                .await?;
+            let ids: Vec<HostMachineId> = super::find_machine_ids(
+                &pool,
+                MachineSearchConfig {
+                    only_with_health_alert: Some(searched_source.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            assert_eq!(ids.contains(&machine_id), expected, "{scenario}");
+        }
+
+        // A generic prepared plan must match the expression index even when
+        // the report source is supplied as a parameter.
+        let mut txn = pool.begin().await?;
+        sqlx::raw_sql(
+            "SET LOCAL enable_seqscan = off; SET LOCAL plan_cache_mode = force_generic_plan",
+        )
+        .execute(txn.as_mut())
+        .await?;
+        let _: Vec<HostMachineId> = super::find_machine_ids(
+            txn.as_mut(),
+            MachineSearchConfig {
+                only_with_health_alert: Some(source.to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let statement: String = sqlx::query_scalar(
+            "SELECT statement FROM pg_prepared_statements
+             WHERE statement LIKE 'SELECT id FROM machines%'
+             AND statement LIKE '%jsonb_array_length%'",
+        )
+        .fetch_one(txn.as_mut())
+        .await?;
+        let plan: Vec<String> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXPLAIN {statement}")))
+                .bind(source)
+                .bind(source)
+                .fetch_all(txn.as_mut())
+                .await?;
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("machine_health_source_keys_gin_idx")),
+            "source-key index missing from plan: {plan:?}"
+        );
+        txn.rollback().await?;
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn dpu_agent_upgrade_status_reads_current_attached_host_data(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let host_id: HostMachineId =
+            "fm100htes3rn1npvbtm5qd57dkilaag7ljugl1llmm7rfuq1ov50i0rpl30".parse()?;
+        let dpu_id: DpuMachineId =
+            "fm100dskla0ihp0pn4tv7v1js2k2mo37sl0jjr8141okqg8pjpdpfihaa80".parse()?;
+        let mut txn = pool.begin().await?;
+        assert!(
+            super::find_dpu_agent_upgrade_status(txn.as_mut(), &dpu_id)
+                .await?
+                .is_none()
+        );
+        for machine_id in [MachineId::from(host_id), MachineId::from(dpu_id)] {
+            super::create(
+                txn.as_mut(),
+                None,
+                &machine_id,
+                ManagedHostState::Ready,
+                None,
+                2,
+            )
+            .await?;
+        }
+        let segment_id: NetworkSegmentId = sqlx::query_scalar(
+            "INSERT INTO network_segments (name, version)
+             VALUES ('agent-upgrade-status', 'V1-T0') RETURNING id",
+        )
+        .fetch_one(txn.as_mut())
+        .await?;
+
+        // Add one interface at a time. BMC and self links must not attach a host;
+        // multiple data interfaces on that host are a valid attachment.
+        for (index, (scenario, machine_id, interface_type, attached)) in [
+            ("self link", MachineId::from(dpu_id), "Data", false),
+            ("BMC link", MachineId::from(host_id), "Bmc", false),
+            ("data link", MachineId::from(host_id), "Data", true),
+            ("second data link", MachineId::from(host_id), "Data", true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO machine_interfaces
+                    (machine_id, attached_dpu_machine_id, association_type, segment_id,
+                     mac_address, primary_interface, hostname, interface_type)
+                 VALUES ($1, $2, 'Machine', $3, $4::macaddr, false, 'upgrade-status',
+                         $5::text::interface_type)",
+            )
+            .bind(machine_id)
+            .bind(dpu_id)
+            .bind(segment_id)
+            .bind(format!("02:00:00:00:20:{index:02x}"))
+            .bind(interface_type)
+            .execute(txn.as_mut())
+            .await?;
+            let status = super::find_dpu_agent_upgrade_status(txn.as_mut(), &dpu_id).await?;
+            assert_eq!(status.is_some(), attached, "{scenario}");
+        }
+        txn.commit().await?;
+
+        let mut reader = pool.begin().await?;
+        let status = super::find_dpu_agent_upgrade_status(reader.as_mut(), &dpu_id)
+            .await?
+            .expect("data interfaces attach the DPU");
+        assert_eq!(status.id, dpu_id);
+        assert_eq!(status.agent_version, None);
+        assert!(!status.upgrade_requested);
+        assert!(!status.host_dpf_used_for_ingestion);
+        reader.commit().await?;
+
+        let mut writer = pool.begin().await?;
+        let observation = model::machine::network::MachineNetworkStatusObservation {
+            machine_id: dpu_id,
+            agent_version: Some("v2026.10".to_string()),
+            observed_at: chrono::Utc::now(),
+            network_config_version: None,
+            client_certificate_expiry: None,
+            agent_version_superseded_at: None,
+            instance_network_observation: None,
+            fabric_interfaces: Vec::new(),
+        };
+        assert!(matches!(
+            super::update_network_status_observation(writer.as_mut(), &dpu_id, &observation)
+                .await?,
+            crate::ConditionalWrite::Applied(())
+        ));
+        super::set_dpu_agent_upgrade_requested(writer.as_mut(), &dpu_id, true, "v2026.11").await?;
+        super::mark_machine_ingestion_done_with_dpf(writer.as_mut(), &host_id).await?;
+        writer.commit().await?;
+
+        let mut reader = pool.begin().await?;
+        let status = super::find_dpu_agent_upgrade_status(reader.as_mut(), &dpu_id)
+            .await?
+            .expect("data interfaces still attach the DPU");
+        assert_eq!(status.agent_version.as_deref(), Some("v2026.10"));
+        assert!(status.upgrade_requested);
+        assert!(status.host_dpf_used_for_ingestion);
+        reader.commit().await?;
+        Ok(())
+    }
+
+    /// A retry may opt in after an earlier request omitted the option, but later
+    /// requests cannot cancel a wait once it has been recorded.
+    #[crate::sqlx_test]
+    async fn force_delete_ack_requirement_only_becomes_stricter(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let machine_id: HostMachineId =
+            "fm100htes3rn1npvbtm5qd57dkilaag7ljugl1llmm7rfuq1ov50i0rpl30".parse()?;
+        let mut txn = pool.begin().await?;
+        super::create(
+            txn.as_mut(),
+            None,
+            &machine_id,
+            ManagedHostState::ForceDeletion,
+            None,
+            2,
+        )
+        .await?;
+        txn.commit().await?;
+
+        for (requested, expected) in [(false, false), (true, true), (false, true)] {
+            let mut txn = pool.begin().await?;
+            super::find_one(
+                txn.as_mut(),
+                &machine_id,
+                MachineSearchConfig {
+                    for_update: true,
+                    ..Default::default()
+                },
+            )
+            .await?
+            .expect("fixture host must remain available");
+            assert_eq!(
+                super::record_force_delete_admin_ack_requirement(
+                    txn.as_mut(),
+                    &machine_id,
+                    requested,
+                )
+                .await?,
+                expected,
+            );
+            txn.commit().await?;
+            let stored: Option<bool> = sqlx::query_scalar(
+                "SELECT force_delete_requires_admin_ack FROM machines WHERE id = $1",
+            )
+            .bind(machine_id)
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(stored, Some(expected));
+        }
+        Ok(())
+    }
 
     #[crate::sqlx_test]
     async fn machine_observations_compare_timestamps_chronologically(
@@ -4755,7 +5290,7 @@ mod test {
     }
 
     #[crate::sqlx_test]
-    async fn dpu_creation_keeps_exhausted_fnn_asn_nonfatal(
+    async fn dpu_creation_keeps_unavailable_fnn_asn_nonfatal(
         pool: sqlx::PgPool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         const RESOURCE_POOL_LIFECYCLE_FAILURES_METRIC: &str =
@@ -4764,49 +5299,83 @@ mod test {
         let common_pools = common_pools_without_seeded_values();
         let dpu_id =
             MachineId::from_str("fm100ds7blqjsadm2uuh3qqbf1h7k8pmf47um6v9uckrg7l03po8mhqgvng")?;
-        let mut connection = pool.acquire().await?;
-        let metrics = MetricsCapture::start();
+        for (scenario, exhaust_pool, expected_failure) in [
+            ("exhausted", true, "exhausted"),
+            ("unconfigured", false, "configuration"),
+        ] {
+            let mut txn = pool.begin().await?;
+            let asn_pool = &common_pools.ethernet.pool_fnn_asn;
+            if exhaust_pool {
+                crate::resource_pool::populate(asn_pool, txn.as_mut(), vec![64512], true).await?;
+                crate::resource_pool::allocate(
+                    asn_pool,
+                    txn.as_mut(),
+                    model::resource_pool::OwnerType::Machine,
+                    "existing-dpu",
+                    None,
+                )
+                .await?;
+            }
+            let stats = crate::resource_pool::stats(txn.as_mut(), asn_pool.name()).await?;
+            assert_eq!(
+                (stats.auto_assign_free, stats.auto_assign_used),
+                (0, usize::from(exhaust_pool)),
+                "{scenario}: verify the pool state before creating the DPU"
+            );
+            let metrics = MetricsCapture::start();
 
-        let (machine, logs) = capture_logs_async(super::create(
-            connection.as_mut(),
-            Some(&common_pools),
-            &dpu_id,
-            ManagedHostState::Ready,
-            None,
-            2,
-        ))
-        .await;
-        let machine = machine?;
+            let (machine, logs) = capture_logs_async(super::create(
+                txn.as_mut(),
+                Some(&common_pools),
+                &dpu_id,
+                ManagedHostState::Ready,
+                None,
+                2,
+            ))
+            .await;
+            let machine = machine?;
 
-        assert_eq!(machine.asn, None);
-        let event_logs = logs
-            .iter()
-            .filter(|log| log.metadata_name == "dpu_asn_allocation_failed")
-            .collect::<Vec<_>>();
-        assert_eq!(event_logs.len(), 1);
-        let log = event_logs[0];
-        assert_eq!(log.level, tracing::Level::INFO);
-        assert_eq!(log.message, "Failed to allocate asn for dpu");
-        assert_eq!(
-            log.field("stable_machine_id"),
-            Some(dpu_id.to_string().as_str())
-        );
-        assert_eq!(log.field("failure"), Some("exhausted"));
-        assert_eq!(log.field("failure_policy"), Some("best_effort"));
-        assert_eq!(log.field("allocation_mode"), Some("automatic"));
-        assert_eq!(
-            metrics.counter_delta(
-                RESOURCE_POOL_LIFECYCLE_FAILURES_METRIC,
-                &[
-                    ("operation", "allocate"),
-                    ("failure", "exhausted"),
-                    ("failure_policy", "best_effort"),
-                    ("allocation_mode", "automatic"),
-                    ("value_type", "integer"),
-                ],
-            ),
-            1.0
-        );
+            assert_eq!(machine.asn, None, "{scenario}");
+            let event_logs = logs
+                .iter()
+                .filter(|log| log.metadata_name == "dpu_asn_allocation_failed")
+                .collect::<Vec<_>>();
+            assert_eq!(event_logs.len(), 1, "{scenario}");
+            let log = event_logs[0];
+            assert_eq!(log.level, tracing::Level::INFO, "{scenario}");
+            assert_eq!(log.message, "Failed to allocate asn for dpu", "{scenario}");
+            assert_eq!(
+                log.field("stable_machine_id"),
+                Some(dpu_id.to_string().as_str()),
+                "{scenario}"
+            );
+            assert_eq!(log.field("failure"), Some(expected_failure), "{scenario}");
+            assert_eq!(
+                log.field("failure_policy"),
+                Some("best_effort"),
+                "{scenario}"
+            );
+            assert_eq!(
+                log.field("allocation_mode"),
+                Some("automatic"),
+                "{scenario}"
+            );
+            assert_eq!(
+                metrics.counter_delta(
+                    RESOURCE_POOL_LIFECYCLE_FAILURES_METRIC,
+                    &[
+                        ("operation", "allocate"),
+                        ("failure", expected_failure),
+                        ("failure_policy", "best_effort"),
+                        ("allocation_mode", "automatic"),
+                        ("value_type", "integer"),
+                    ],
+                ),
+                1.0,
+                "{scenario}"
+            );
+            txn.rollback().await?;
+        }
 
         Ok(())
     }

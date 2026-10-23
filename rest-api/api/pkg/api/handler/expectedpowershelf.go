@@ -144,6 +144,9 @@ func (cepsh CreateExpectedPowerShelfHandler) Handle(c echo.Context) error {
 	}
 
 	expectedPowerShelf, err := cdb.WithTxResult(ctx, cepsh.dbSession, func(tx *cdb.Tx) (*cdbm.ExpectedPowerShelf, error) {
+		if apiErr := acquireExpectedInventorySharedMutationLock(ctx, logger, tx, site.ID); apiErr != nil {
+			return nil, apiErr
+		}
 		// Note: DefaultBmcUsername and BmcPassword are not stored in DB, only passed to workflow
 		eps, err := epsDAO.Create(
 			ctx,
@@ -587,7 +590,16 @@ func (uepsh UpdateExpectedPowerShelfHandler) Handle(c echo.Context) error {
 		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Failed to validate Expected Power Shelf update data", validationErrors)
 	}
 
+	bmcIPAddress := apiRequest.BmcIpAddress
+	clearBmcIPAddress := bmcIPAddress != nil && *bmcIPAddress == ""
+	if clearBmcIPAddress {
+		bmcIPAddress = nil
+	}
+
 	updatedExpectedPowerShelf, err := cdb.WithTxResult(ctx, uepsh.dbSession, func(tx *cdb.Tx) (*cdbm.ExpectedPowerShelf, error) {
+		if apiErr := acquireExpectedInventorySharedMutationLock(ctx, logger, tx, site.ID); apiErr != nil {
+			return nil, apiErr
+		}
 		// Note: DefaultBmcUsername and BmcPassword are not stored in DB, only passed to workflow
 		eps, err := epsDAO.Update(
 			ctx,
@@ -595,7 +607,7 @@ func (uepsh UpdateExpectedPowerShelfHandler) Handle(c echo.Context) error {
 			cdbm.ExpectedPowerShelfUpdateInput{
 				ExpectedPowerShelfID: expectedPowerShelf.ID,
 				ShelfSerialNumber:    apiRequest.ShelfSerialNumber,
-				BmcIpAddress:         apiRequest.BmcIpAddress,
+				BmcIpAddress:         bmcIPAddress,
 				RackID:               apiRequest.RackID,
 				Name:                 apiRequest.Name,
 				Manufacturer:         apiRequest.Manufacturer,
@@ -610,6 +622,17 @@ func (uepsh UpdateExpectedPowerShelfHandler) Handle(c echo.Context) error {
 		if err != nil {
 			logger.Error().Err(err).Msg("failed to update ExpectedPowerShelf record in DB")
 			return nil, cutil.NewAPIError(http.StatusInternalServerError, "Failed to update Expected Power Shelf due to DB error", nil)
+		}
+
+		if clearBmcIPAddress {
+			eps, err = epsDAO.Clear(ctx, tx, cdbm.ExpectedPowerShelfClearInput{
+				ExpectedPowerShelfID: expectedPowerShelf.ID,
+				BmcIpAddress:         true,
+			})
+			if err != nil {
+				logger.Error().Err(err).Msg("failed to clear ExpectedPowerShelf BMC IP address in DB")
+				return nil, cutil.NewAPIError(http.StatusInternalServerError, "Failed to update Expected Power Shelf due to DB error", nil)
+			}
 		}
 
 		patchExpectedPowerShelfRequest := apiRequest.ToProto(eps)
@@ -726,6 +749,9 @@ func (depsh DeleteExpectedPowerShelfHandler) Handle(c echo.Context) error {
 	}
 
 	err = cdb.WithTx(ctx, depsh.dbSession, func(tx *cdb.Tx) error {
+		if apiErr := acquireExpectedInventorySharedMutationLock(ctx, logger, tx, site.ID); apiErr != nil {
+			return apiErr
+		}
 		if err := epsDAO.Delete(ctx, tx, expectedPowerShelf.ID); err != nil {
 			logger.Error().Err(err).Msg("unable to delete ExpectedPowerShelf record from DB")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to delete Expected Power Shelf due to DB error", nil)
@@ -765,11 +791,11 @@ func (depsh DeleteExpectedPowerShelfHandler) Handle(c echo.Context) error {
 }
 
 // ReplaceAllExpectedPowerShelvesHandler replaces the complete ExpectedPowerShelf set for one Site.
-type ReplaceAllExpectedPowerShelvesHandler struct{ expectedInventoryBulkBase }
+type ReplaceAllExpectedPowerShelvesHandler struct{ expectedInventoryBatchBase }
 
 // NewReplaceAllExpectedPowerShelvesHandler creates a full-Site ExpectedPowerShelf replacement handler.
 func NewReplaceAllExpectedPowerShelvesHandler(dbSession *cdb.Session, scp *sc.ClientPool, cfg *config.Config) ReplaceAllExpectedPowerShelvesHandler {
-	return ReplaceAllExpectedPowerShelvesHandler{newExpectedInventoryBulkBase(dbSession, scp, cfg)}
+	return ReplaceAllExpectedPowerShelvesHandler{newExpectedInventoryBatchBase(dbSession, scp, cfg)}
 }
 
 // Handle godoc
@@ -823,6 +849,10 @@ func (h ReplaceAllExpectedPowerShelvesHandler) Handle(c echo.Context) error {
 	}
 	dao := cdbm.NewExpectedPowerShelfDAO(h.dbSession)
 	replaced, err := cdb.WithTxResult(ctx, h.dbSession, func(tx *cdb.Tx) ([]cdbm.ExpectedPowerShelf, error) {
+		apiErr := acquireExpectedInventoryExclusiveMutationLock(ctx, logger, tx, site.ID)
+		if apiErr != nil {
+			return nil, apiErr
+		}
 		shelves, derr := dao.ReplaceAll(ctx, tx, cdbm.ExpectedPowerShelfFilterInput{SiteIDs: []uuid.UUID{site.ID}}, inputs)
 		if derr != nil {
 			logger.Error().Err(derr).Msg("error replacing ExpectedPowerShelf records in DB")
@@ -839,7 +869,7 @@ func (h ReplaceAllExpectedPowerShelvesHandler) Handle(c echo.Context) error {
 		}) {
 			secretFields = []string{"expectedPowerShelves"}
 		}
-		apiErr := common.ExecuteCoreGRPC(ctx, stc, corev1.Forge_ReplaceAllExpectedPowerShelves_FullMethodName, coreRequest, nil, site.ID.String(), secretFields...)
+		apiErr = common.ExecuteCoreGRPC(ctx, stc, corev1.Forge_ReplaceAllExpectedPowerShelves_FullMethodName, coreRequest, nil, site.ID.String(), secretFields...)
 		if apiErr != nil {
 			return nil, apiErr
 		}
@@ -856,11 +886,11 @@ func (h ReplaceAllExpectedPowerShelvesHandler) Handle(c echo.Context) error {
 }
 
 // DeleteAllExpectedPowerShelvesHandler deletes the complete ExpectedPowerShelf set for one Site.
-type DeleteAllExpectedPowerShelvesHandler struct{ expectedInventoryBulkBase }
+type DeleteAllExpectedPowerShelvesHandler struct{ expectedInventoryBatchBase }
 
 // NewDeleteAllExpectedPowerShelvesHandler creates a full-Site ExpectedPowerShelf deletion handler.
 func NewDeleteAllExpectedPowerShelvesHandler(dbSession *cdb.Session, scp *sc.ClientPool, cfg *config.Config) DeleteAllExpectedPowerShelvesHandler {
-	return DeleteAllExpectedPowerShelvesHandler{newExpectedInventoryBulkBase(dbSession, scp, cfg)}
+	return DeleteAllExpectedPowerShelvesHandler{newExpectedInventoryBatchBase(dbSession, scp, cfg)}
 }
 
 // Handle godoc

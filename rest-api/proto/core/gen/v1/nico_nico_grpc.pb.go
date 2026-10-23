@@ -24,6 +24,7 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	Forge_Version_FullMethodName                                            = "/forge.Forge/Version"
+	Forge_GetRmsVersion_FullMethodName                                      = "/forge.Forge/GetRmsVersion"
 	Forge_StreamConsoleLogs_FullMethodName                                  = "/forge.Forge/StreamConsoleLogs"
 	Forge_CreateDomain_FullMethodName                                       = "/forge.Forge/CreateDomain"
 	Forge_UpdateDomain_FullMethodName                                       = "/forge.Forge/UpdateDomain"
@@ -197,6 +198,7 @@ const (
 	Forge_AdminReleaseReservedAddresses_FullMethodName                      = "/forge.Forge/AdminReleaseReservedAddresses"
 	Forge_DecommissionManagedHost_FullMethodName                            = "/forge.Forge/DecommissionManagedHost"
 	Forge_AdminListResourcePools_FullMethodName                             = "/forge.Forge/AdminListResourcePools"
+	Forge_AdminInspectResourcePools_FullMethodName                          = "/forge.Forge/AdminInspectResourcePools"
 	Forge_AdminGrowResourcePool_FullMethodName                              = "/forge.Forge/AdminGrowResourcePool"
 	Forge_UpdateMachineMetadata_FullMethodName                              = "/forge.Forge/UpdateMachineMetadata"
 	Forge_UpdateRackMetadata_FullMethodName                                 = "/forge.Forge/UpdateRackMetadata"
@@ -277,6 +279,11 @@ const (
 	Forge_GetAllExpectedRacks_FullMethodName                                = "/forge.Forge/GetAllExpectedRacks"
 	Forge_ReplaceAllExpectedRacks_FullMethodName                            = "/forge.Forge/ReplaceAllExpectedRacks"
 	Forge_DeleteAllExpectedRacks_FullMethodName                             = "/forge.Forge/DeleteAllExpectedRacks"
+	Forge_CreateExpectedNvLinkDomain_FullMethodName                         = "/forge.Forge/CreateExpectedNvLinkDomain"
+	Forge_DeleteExpectedNvLinkDomain_FullMethodName                         = "/forge.Forge/DeleteExpectedNvLinkDomain"
+	Forge_GetExpectedNvLinkDomain_FullMethodName                            = "/forge.Forge/GetExpectedNvLinkDomain"
+	Forge_FindExpectedNvLinkDomainIds_FullMethodName                        = "/forge.Forge/FindExpectedNvLinkDomainIds"
+	Forge_FindExpectedNvLinkDomainsByIds_FullMethodName                     = "/forge.Forge/FindExpectedNvLinkDomainsByIds"
 	Forge_AddExpectedRackGroup_FullMethodName                               = "/forge.Forge/AddExpectedRackGroup"
 	Forge_DeleteExpectedRackGroup_FullMethodName                            = "/forge.Forge/DeleteExpectedRackGroup"
 	Forge_UpdateExpectedRackGroup_FullMethodName                            = "/forge.Forge/UpdateExpectedRackGroup"
@@ -407,6 +414,18 @@ const (
 	Forge_GetDesiredFirmwareVersions_FullMethodName                         = "/forge.Forge/GetDesiredFirmwareVersions"
 	Forge_UpsertHostFirmwareConfig_FullMethodName                           = "/forge.Forge/UpsertHostFirmwareConfig"
 	Forge_DeleteHostFirmwareConfig_FullMethodName                           = "/forge.Forge/DeleteHostFirmwareConfig"
+	Forge_CreateNicFirmwareProfile_FullMethodName                           = "/forge.Forge/CreateNicFirmwareProfile"
+	Forge_FindNicFirmwareProfileIds_FullMethodName                          = "/forge.Forge/FindNicFirmwareProfileIds"
+	Forge_FindNicFirmwareProfilesByIds_FullMethodName                       = "/forge.Forge/FindNicFirmwareProfilesByIds"
+	Forge_UpdateNicFirmwareProfile_FullMethodName                           = "/forge.Forge/UpdateNicFirmwareProfile"
+	Forge_DeleteNicFirmwareProfile_FullMethodName                           = "/forge.Forge/DeleteNicFirmwareProfile"
+	Forge_SetNicFirmwareSiteSelection_FullMethodName                        = "/forge.Forge/SetNicFirmwareSiteSelection"
+	Forge_FindNicFirmwareSiteSelectionIds_FullMethodName                    = "/forge.Forge/FindNicFirmwareSiteSelectionIds"
+	Forge_FindNicFirmwareSiteSelectionsByIds_FullMethodName                 = "/forge.Forge/FindNicFirmwareSiteSelectionsByIds"
+	Forge_SetMachineNicFirmwareConfig_FullMethodName                        = "/forge.Forge/SetMachineNicFirmwareConfig"
+	Forge_GetTenantNicFirmwareConfig_FullMethodName                         = "/forge.Forge/GetTenantNicFirmwareConfig"
+	Forge_SetTenantNicFirmwareConfig_FullMethodName                         = "/forge.Forge/SetTenantNicFirmwareConfig"
+	Forge_GetDesiredNicFirmware_FullMethodName                              = "/forge.Forge/GetDesiredNicFirmware"
 	Forge_CreateSku_FullMethodName                                          = "/forge.Forge/CreateSku"
 	Forge_GenerateSkuFromMachine_FullMethodName                             = "/forge.Forge/GenerateSkuFromMachine"
 	Forge_VerifySkuForMachine_FullMethodName                                = "/forge.Forge/VerifySkuForMachine"
@@ -505,6 +524,7 @@ const (
 	Forge_MlxAdminLockdownStatus_FullMethodName                             = "/forge.Forge/MlxAdminLockdownStatus"
 	Forge_MlxAdminShowDevice_FullMethodName                                 = "/forge.Forge/MlxAdminShowDevice"
 	Forge_MlxAdminShowMachine_FullMethodName                                = "/forge.Forge/MlxAdminShowMachine"
+	Forge_MlxAdminShowDeviceIdentities_FullMethodName                       = "/forge.Forge/MlxAdminShowDeviceIdentities"
 	Forge_MlxAdminRegistryList_FullMethodName                               = "/forge.Forge/MlxAdminRegistryList"
 	Forge_MlxAdminRegistryShow_FullMethodName                               = "/forge.Forge/MlxAdminRegistryShow"
 	Forge_MlxAdminConfigQuery_FullMethodName                                = "/forge.Forge/MlxAdminConfigQuery"
@@ -531,6 +551,7 @@ const (
 	Forge_ListDPUServiceSyncHistory_FullMethodName                          = "/forge.Forge/ListDPUServiceSyncHistory"
 	Forge_ReleaseDPUServiceSyncHold_FullMethodName                          = "/forge.Forge/ReleaseDPUServiceSyncHold"
 	Forge_ComponentPowerControl_FullMethodName                              = "/forge.Forge/ComponentPowerControl"
+	Forge_GetComponentPowerDetails_FullMethodName                           = "/forge.Forge/GetComponentPowerDetails"
 	Forge_ComponentConfigureSwitchCertificate_FullMethodName                = "/forge.Forge/ComponentConfigureSwitchCertificate"
 	Forge_GetComponentInventory_FullMethodName                              = "/forge.Forge/GetComponentInventory"
 	Forge_UpdateComponentFirmware_FullMethodName                            = "/forge.Forge/UpdateComponentFirmware"
@@ -553,6 +574,12 @@ const (
 type ForgeClient interface {
 	// What version of NICo is this service running? Matches `--version` command line.
 	Version(ctx context.Context, in *VersionRequest, opts ...grpc.CallOption) (*BuildInfo, error)
+	// What version is the RMS backend running?
+	// Returns Unavailable if RMS is not configured on this nico-api instance.
+	// Returns PermissionDenied on older nico-api servers that predate this RPC:
+	// the RBAC middleware rejects unknown RPC names with HTTP 403 before gRPC
+	// dispatch, so Unimplemented is never reached on those servers.
+	GetRmsVersion(ctx context.Context, in *GetRmsVersionRequest, opts ...grpc.CallOption) (*GetRmsVersionResponse, error)
 	// Stream recent and live machine console output.
 	StreamConsoleLogs(ctx context.Context, in *StreamConsoleLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ConsoleLogLine], error)
 	// Domain
@@ -582,13 +609,19 @@ type ForgeClient interface {
 	UpdateVpcVirtualization(ctx context.Context, in *VpcUpdateVirtualizationRequest, opts ...grpc.CallOption) (*VpcUpdateVirtualizationResult, error)
 	// Deletion does not release a retained VNI implicitly. Call
 	// ReleaseVpcInactiveVni after verifying convergence before deleting the VPC.
-	// Retained or inconsistent owned allocations cause FailedPrecondition.
+	// Retained or inconsistent owned allocations cause FailedPrecondition, as do
+	// live DNS domains owned by this VPC. Deleted domains do not block deletion.
 	DeleteVpc(ctx context.Context, in *VpcDeletionRequest, opts ...grpc.CallOption) (*VpcDeletionResult, error)
 	FindVpcIds(ctx context.Context, in *VpcSearchFilter, opts ...grpc.CallOption) (*VpcIdList, error)
 	FindVpcsByIds(ctx context.Context, in *VpcsByIdsRequest, opts ...grpc.CallOption) (*VpcList, error)
 	// Reads persisted VPC routing and allocation state without changing it.
 	GetVpcRoutingState(ctx context.Context, in *VpcRoutingStateRequest, opts ...grpc.CallOption) (*VpcRoutingState, error)
 	CreateSpxPartition(ctx context.Context, in *SpxPartitionCreationRequest, opts ...grpc.CallOption) (*SpxPartition, error)
+	// Marks the partition deleted and releases its VNI if the partition still owns
+	// that reservation, committing both changes together. Repeating the request
+	// for a deleted, unreferenced partition succeeds. Returns FailedPrecondition
+	// while any instance, including a terminating one, still references it.
+	// An omitted id returns InvalidArgument; an unknown partition returns Internal.
 	DeleteSpxPartition(ctx context.Context, in *SpxPartitionDeletionRequest, opts ...grpc.CallOption) (*SpxPartitionDeletionResult, error)
 	FindSpxPartitionIds(ctx context.Context, in *SpxPartitionSearchFilter, opts ...grpc.CallOption) (*SpxPartitionIdList, error)
 	FindSpxPartitionsByIds(ctx context.Context, in *SpxPartitionsByIdsRequest, opts ...grpc.CallOption) (*SpxPartitionList, error)
@@ -821,6 +854,9 @@ type ForgeClient interface {
 	// picks up the freshly persisted report for downstream processing (pairing,
 	// remediation, audit). Returns AlreadyExists
 	// if a concurrent refresh or periodic probe is already in progress.
+	// During DPF provisioning, queues exploration and returns the cached report
+	// with exploration_requested=true. The queued refresh runs after all Site
+	// Explorer suppressions are cleared. Non-DPF suppressions alone return FailedPrecondition.
 	RefreshEndpointReport(ctx context.Context, in *RefreshEndpointReportRequest, opts ...grpc.CallOption) (*ExploredEndpoint, error)
 	// Delete an explored endpoint from the database
 	DeleteExploredEndpoint(ctx context.Context, in *DeleteExploredEndpointRequest, opts ...grpc.CallOption) (*DeleteExploredEndpointResponse, error)
@@ -841,9 +877,17 @@ type ForgeClient interface {
 	UpdateMachineHardwareInfo(ctx context.Context, in *UpdateMachineHardwareInfoRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Force deletes a Machine and the associated DPU from NICo databases,
 	// with the intention of rediscovering the host later on.
-	// The command will not stop a running tenant instance. Only a reboot that forces
-	// the NICo PXE boot process again would stop the image and run the discovery
-	// process again.
+	// By default, cleanup does not wait for DPU network acknowledgement. Set
+	// wait_for_instance_dpu to request Admin networking when an Instance exists
+	// and retain the records until every attached DPU acknowledges it. While
+	// waiting, return all_done=false; poll to finish deletion. An unreachable DPU
+	// can block an opted-in deletion indefinitely, and omitting the option on a
+	// retry does not cancel an already-recorded wait.
+	// Only servers supporting this option enforce the recorded wait. An older
+	// server can complete cleanup without acknowledgement, including on a retry.
+	// The request remains in ForceDeletion across API restarts and cannot be canceled.
+	// Returning to Admin stops tenant networking through the DPUs, but does not shut
+	// down or wipe the tenant's operating system. A later PXE boot runs discovery again.
 	//
 	// Due to the not well defined state that hosts are in after calling this command,
 	// it should not be used by Tenants or Site Providers to release instances. Those
@@ -865,8 +909,12 @@ type ForgeClient interface {
 	AdminReleaseReservedAddresses(ctx context.Context, in *AdminReleaseReservedAddressesRequest, opts ...grpc.CallOption) (*AdminReleaseReservedAddressesResponse, error)
 	// Starts the managed host decommissioning workflow. The host must be Ready.
 	DecommissionManagedHost(ctx context.Context, in *DecommissionManagedHostRequest, opts ...grpc.CallOption) (*DecommissionManagedHostResponse, error)
-	// List existing resource pools and their stats
+	// Lists local inventory counts and bounds, including IPv6 prefixes with their lengths.
+	// Any saved gRPC binding makes the whole call fail with FailedPrecondition;
+	// use AdminInspectResourcePools to inspect every backend.
 	AdminListResourcePools(ctx context.Context, in *ListResourcePoolsRequest, opts ...grpc.CallOption) (*ResourcePools, error)
+	// Inspects local and remote pools without treating unknown capacity as zero.
+	AdminInspectResourcePools(ctx context.Context, in *InspectResourcePoolsRequest, opts ...grpc.CallOption) (*InspectResourcePoolsResponse, error)
 	// Add capacity to a resource pool
 	AdminGrowResourcePool(ctx context.Context, in *GrowResourcePoolRequest, opts ...grpc.CallOption) (*GrowResourcePoolResponse, error)
 	// Update the Metadata of a Machine
@@ -891,8 +939,11 @@ type ForgeClient interface {
 	TriggerHostReprovisioning(ctx context.Context, in *HostReprovisioningRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// List hosts waiting for reprovisioning
 	ListHostsWaitingForReprovisioning(ctx context.Context, in *HostReprovisioningListRequest, opts ...grpc.CallOption) (*HostReprovisioningListResponse, error)
-	// Trigger a reset of a managed host: tear down its instance and DPF
+	// Trigger a reset of a managed host: tear down its Instance and DPF
 	// resources, then re-ingest it from DPU discovery.
+	// With an Instance present, retain it and its network resources until every
+	// DPU attached to the host acknowledges Admin networking. An unreachable DPU
+	// keeps the reset waiting; hosts without an Instance skip this network wait.
 	TriggerManagedHostReset(ctx context.Context, in *ManagedHostResetRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// List managed hosts waiting for reset
 	ListManagedHostsWaitingForReset(ctx context.Context, in *ManagedHostResetListRequest, opts ...grpc.CallOption) (*ManagedHostResetListResponse, error)
@@ -958,7 +1009,8 @@ type ForgeClient interface {
 	ReplaceRouteServers(ctx context.Context, in *RouteServers, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// MachineInventory
 	UpdateAgentReportedInventory(ctx context.Context, in *DpuAgentInventoryReport, opts ...grpc.CallOption) (*emptypb.Empty, error)
-	// Periodic LLDP neighbor report from a running agent (DPU agent or scout).
+	// Periodic LLDP neighbor report from scout. The DPU agent reports through
+	// RecordDpuNetworkStatus instead.
 	ReportLldpNeighbors(ctx context.Context, in *LldpNeighborReport, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Phone Home
 	UpdateInstancePhoneHomeLastContact(ctx context.Context, in *InstancePhoneHomeLastContactRequest, opts ...grpc.CallOption) (*InstancePhoneHomeLastContactResponse, error)
@@ -1053,10 +1105,23 @@ type ForgeClient interface {
 	ReplaceAllExpectedRacks(ctx context.Context, in *ExpectedRackList, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Delete all expected racks in site
 	DeleteAllExpectedRacks(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Administrator-managed expected NVLink domain inventory
+	// Declare immutable expected membership. This does not configure hardware or validate
+	// physical NVLink connectivity. Unknown/ambiguous members and wrong-group racks are rejected.
+	CreateExpectedNvLinkDomain(ctx context.Context, in *CreateExpectedNvLinkDomainRequest, opts ...grpc.CallOption) (*ExpectedNvLinkDomain, error)
+	// Delete only the declaration and release its MAC claims; no hardware operations occur.
+	// Missing declarations return NOT_FOUND. Observed domains and health reports are untouched.
+	DeleteExpectedNvLinkDomain(ctx context.Context, in *ExpectedNvLinkDomainRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	GetExpectedNvLinkDomain(ctx context.Context, in *ExpectedNvLinkDomainRequest, opts ...grpc.CallOption) (*ExpectedNvLinkDomain, error)
+	FindExpectedNvLinkDomainIds(ctx context.Context, in *ExpectedNvLinkDomainSearchFilter, opts ...grpc.CallOption) (*ExpectedNvLinkDomainIdList, error)
+	FindExpectedNvLinkDomainsByIds(ctx context.Context, in *ExpectedNvLinkDomainsByIdsRequest, opts ...grpc.CallOption) (*ExpectedNvLinkDomainList, error)
 	// Expected Rack Group Management
 	AddExpectedRackGroup(ctx context.Context, in *ExpectedRackGroup, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Fails with FAILED_PRECONDITION if expected NVLink domains reference this group.
 	DeleteExpectedRackGroup(ctx context.Context, in *ExpectedRackGroupRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Replace the full record, including both lists and metadata.
+	// With expected NVLink domains, racks must remain unchanged.
+	// Topology, protocol, and metadata changes are accepted.
 	UpdateExpectedRackGroup(ctx context.Context, in *ExpectedRackGroup, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	GetExpectedRackGroup(ctx context.Context, in *ExpectedRackGroupRequest, opts ...grpc.CallOption) (*ExpectedRackGroup, error)
 	// Return all declarations ordered by rack group ID; an empty site returns an empty list.
@@ -1064,7 +1129,9 @@ type ForgeClient interface {
 	FindExpectedRackGroupIds(ctx context.Context, in *ExpectedRackGroupSearchFilter, opts ...grpc.CallOption) (*ExpectedRackGroupIdList, error)
 	FindExpectedRackGroupsByIds(ctx context.Context, in *ExpectedRackGroupsByIdsRequest, opts ...grpc.CallOption) (*ExpectedRackGroupList, error)
 	// Atomically clear existing groups and insert the supplied list; an empty list clears all groups.
+	// Fails with FAILED_PRECONDITION while any expected NVLink domain references a group.
 	ReplaceAllExpectedRackGroups(ctx context.Context, in *ExpectedRackGroupList, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Fails with FAILED_PRECONDITION while any expected NVLink domain references a group.
 	DeleteAllExpectedRackGroups(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Perform Attestation Procedure for Measured Boot
 	AttestQuote(ctx context.Context, in *AttestQuoteRequest, opts ...grpc.CallOption) (*AttestQuoteResponse, error)
@@ -1257,6 +1324,29 @@ type ForgeClient interface {
 	GetDesiredFirmwareVersions(ctx context.Context, in *GetDesiredFirmwareVersionsRequest, opts ...grpc.CallOption) (*GetDesiredFirmwareVersionsResponse, error)
 	UpsertHostFirmwareConfig(ctx context.Context, in *UpsertHostFirmwareConfigRequest, opts ...grpc.CallOption) (*HostFirmwareConfigResponse, error)
 	DeleteHostFirmwareConfig(ctx context.Context, in *DeleteHostFirmwareConfigRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Operator-only NIC firmware profiles, scoped selections and desired firmware.
+	// These methods do not update devices or change machine readiness.
+	// NIC firmware selections require matching v2.4 Core and client schemas,
+	// including clients that read MachineConfig or GetDesiredNicFirmware responses.
+	CreateNicFirmwareProfile(ctx context.Context, in *CreateNicFirmwareProfileRequest, opts ...grpc.CallOption) (*NicFirmwareProfileResponse, error)
+	FindNicFirmwareProfileIds(ctx context.Context, in *FindNicFirmwareProfileIdsRequest, opts ...grpc.CallOption) (*FindNicFirmwareProfileIdsResponse, error)
+	FindNicFirmwareProfilesByIds(ctx context.Context, in *FindNicFirmwareProfilesByIdsRequest, opts ...grpc.CallOption) (*FindNicFirmwareProfilesByIdsResponse, error)
+	UpdateNicFirmwareProfile(ctx context.Context, in *UpdateNicFirmwareProfileRequest, opts ...grpc.CallOption) (*NicFirmwareProfileResponse, error)
+	DeleteNicFirmwareProfile(ctx context.Context, in *DeleteNicFirmwareProfileRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Select or clear the site profile for an exact hardware pair.
+	SetNicFirmwareSiteSelection(ctx context.Context, in *SetNicFirmwareSiteSelectionRequest, opts ...grpc.CallOption) (*NicFirmwareSiteSelectionResponse, error)
+	// List hardware keys for all site selections or those selecting one profile.
+	FindNicFirmwareSiteSelectionIds(ctx context.Context, in *NicFirmwareSiteSelectionSearchFilter, opts ...grpc.CallOption) (*FindNicFirmwareSiteSelectionIdsResponse, error)
+	// Retrieve existing assignments for a bounded batch of hardware keys.
+	FindNicFirmwareSiteSelectionsByIds(ctx context.Context, in *FindNicFirmwareSiteSelectionsByIdsRequest, opts ...grpc.CallOption) (*FindNicFirmwareSiteSelectionsByIdsResponse, error)
+	// Set or clear the operator's machine and card selections using Machine.version.
+	SetMachineNicFirmwareConfig(ctx context.Context, in *SetMachineNicFirmwareConfigRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Only operators may read the tenant selection; the response includes the shared Tenant.version.
+	GetTenantNicFirmwareConfig(ctx context.Context, in *GetTenantNicFirmwareConfigRequest, opts ...grpc.CallOption) (*GetTenantNicFirmwareConfigResponse, error)
+	// Set or clear the operator's tenant selection using the shared Tenant.version.
+	SetTenantNicFirmwareConfig(ctx context.Context, in *SetTenantNicFirmwareConfigRequest, opts ...grpc.CallOption) (*SetTenantNicFirmwareConfigResponse, error)
+	// Get desired firmware for each device using stored host observations.
+	GetDesiredNicFirmware(ctx context.Context, in *GetDesiredNicFirmwareRequest, opts ...grpc.CallOption) (*GetDesiredNicFirmwareResponse, error)
 	// Create A SKU to be assigned to a machine so the machine hardware can be validated.
 	CreateSku(ctx context.Context, in *SkuList, opts ...grpc.CallOption) (*SkuIdList, error)
 	// Generate a SKU from the hardware inventory of a machine.
@@ -1366,6 +1456,11 @@ type ForgeClient interface {
 	SignMachineIdentity(ctx context.Context, in *MachineIdentityRequest, opts ...grpc.CallOption) (*MachineIdentityResponse, error)
 	// Get, set, or delete per-org tenant identity configuration (issuer, audiences, TTL, signing key)
 	GetTenantIdentityConfiguration(ctx context.Context, in *GetTenantIdentityConfigRequest, opts ...grpc.CallOption) (*TenantIdentityConfigResponse, error)
+	// Creates or updates the per-org tenant identity configuration.
+	// Concurrent creation can return ALREADY_EXISTS, leaving the stored configuration
+	// and tenant version unchanged. Read it before retrying, since a retry can update it.
+	// An explicit rotate_key request can instead rotate a concurrently created
+	// configuration found during the write.
 	SetTenantIdentityConfiguration(ctx context.Context, in *SetTenantIdentityConfigRequest, opts ...grpc.CallOption) (*TenantIdentityConfigResponse, error)
 	DeleteTenantIdentityConfiguration(ctx context.Context, in *GetTenantIdentityConfigRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Token delegation: get, set, or delete per-org token exchange config
@@ -1426,6 +1521,9 @@ type ForgeClient interface {
 	MlxAdminShowDevice(ctx context.Context, in *MlxAdminDeviceInfoRequest, opts ...grpc.CallOption) (*MlxAdminDeviceInfoResponse, error)
 	// MlxAdminShowMachine will show an MlxDeviceReport for a given machine.
 	MlxAdminShowMachine(ctx context.Context, in *MlxAdminDeviceReportRequest, opts ...grpc.CallOption) (*MlxAdminDeviceReportResponse, error)
+	// Read stored NIC identity evidence and current managed-DPU associations.
+	// Scout need not be connected. This does not establish update/reset eligibility.
+	MlxAdminShowDeviceIdentities(ctx context.Context, in *MlxAdminDeviceIdentitiesRequest, opts ...grpc.CallOption) (*MlxAdminDeviceIdentitiesResponse, error)
 	// Mellanox administrative endpoints for registry querying, which are called by
 	// the CLI (nico-admin-cli) and potentially the UI. These endpoints ultimately
 	// interconnect with a scout agent listening via an open ScoutStream connection.
@@ -1503,6 +1601,16 @@ type ForgeClient interface {
 	ReleaseDPUServiceSyncHold(ctx context.Context, in *ReleaseDPUServiceSyncHoldRequest, opts ...grpc.CallOption) (*ReleaseDPUServiceSyncHoldResponse, error)
 	// --- Component management (unified switch + power shelf operations) ---
 	ComponentPowerControl(ctx context.Context, in *ComponentPowerControlRequest, opts ...grpc.CallOption) (*ComponentPowerControlResponse, error)
+	// Reads fresh hardware power state and independently stored desired policy.
+	// Flow and ForgeAdminCLI may call this method. A consistent database snapshot
+	// has five seconds, including pool acquisition; failure aborts with INTERNAL.
+	// After releasing that snapshot, queued targets, credentials, and live reads
+	// share fifteen seconds with at most eight targets active. Completed results
+	// survive expiry; unfinished reads report DeadlineExceeded. Earlier caller
+	// cancellation drops pending work. Core and RMS also enforce ten-second local
+	// read budgets, whose expiry reports ReadFailed. This method never registers
+	// devices, writes policy, or submits power operations.
+	GetComponentPowerDetails(ctx context.Context, in *GetComponentPowerDetailsRequest, opts ...grpc.CallOption) (*GetComponentPowerDetailsResponse, error)
 	ComponentConfigureSwitchCertificate(ctx context.Context, in *ComponentConfigureSwitchCertificateRequest, opts ...grpc.CallOption) (*ComponentConfigureSwitchCertificateResponse, error)
 	GetComponentInventory(ctx context.Context, in *GetComponentInventoryRequest, opts ...grpc.CallOption) (*GetComponentInventoryResponse, error)
 	UpdateComponentFirmware(ctx context.Context, in *UpdateComponentFirmwareRequest, opts ...grpc.CallOption) (*UpdateComponentFirmwareResponse, error)
@@ -1536,6 +1644,16 @@ func (c *forgeClient) Version(ctx context.Context, in *VersionRequest, opts ...g
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(BuildInfo)
 	err := c.cc.Invoke(ctx, Forge_Version_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) GetRmsVersion(ctx context.Context, in *GetRmsVersionRequest, opts ...grpc.CallOption) (*GetRmsVersionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetRmsVersionResponse)
+	err := c.cc.Invoke(ctx, Forge_GetRmsVersion_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3288,6 +3406,16 @@ func (c *forgeClient) AdminListResourcePools(ctx context.Context, in *ListResour
 	return out, nil
 }
 
+func (c *forgeClient) AdminInspectResourcePools(ctx context.Context, in *InspectResourcePoolsRequest, opts ...grpc.CallOption) (*InspectResourcePoolsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(InspectResourcePoolsResponse)
+	err := c.cc.Invoke(ctx, Forge_AdminInspectResourcePools_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *forgeClient) AdminGrowResourcePool(ctx context.Context, in *GrowResourcePoolRequest, opts ...grpc.CallOption) (*GrowResourcePoolResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GrowResourcePoolResponse)
@@ -4082,6 +4210,56 @@ func (c *forgeClient) DeleteAllExpectedRacks(ctx context.Context, in *emptypb.Em
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, Forge_DeleteAllExpectedRacks_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) CreateExpectedNvLinkDomain(ctx context.Context, in *CreateExpectedNvLinkDomainRequest, opts ...grpc.CallOption) (*ExpectedNvLinkDomain, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ExpectedNvLinkDomain)
+	err := c.cc.Invoke(ctx, Forge_CreateExpectedNvLinkDomain_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) DeleteExpectedNvLinkDomain(ctx context.Context, in *ExpectedNvLinkDomainRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, Forge_DeleteExpectedNvLinkDomain_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) GetExpectedNvLinkDomain(ctx context.Context, in *ExpectedNvLinkDomainRequest, opts ...grpc.CallOption) (*ExpectedNvLinkDomain, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ExpectedNvLinkDomain)
+	err := c.cc.Invoke(ctx, Forge_GetExpectedNvLinkDomain_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) FindExpectedNvLinkDomainIds(ctx context.Context, in *ExpectedNvLinkDomainSearchFilter, opts ...grpc.CallOption) (*ExpectedNvLinkDomainIdList, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ExpectedNvLinkDomainIdList)
+	err := c.cc.Invoke(ctx, Forge_FindExpectedNvLinkDomainIds_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) FindExpectedNvLinkDomainsByIds(ctx context.Context, in *ExpectedNvLinkDomainsByIdsRequest, opts ...grpc.CallOption) (*ExpectedNvLinkDomainList, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ExpectedNvLinkDomainList)
+	err := c.cc.Invoke(ctx, Forge_FindExpectedNvLinkDomainsByIds_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -5388,6 +5566,126 @@ func (c *forgeClient) DeleteHostFirmwareConfig(ctx context.Context, in *DeleteHo
 	return out, nil
 }
 
+func (c *forgeClient) CreateNicFirmwareProfile(ctx context.Context, in *CreateNicFirmwareProfileRequest, opts ...grpc.CallOption) (*NicFirmwareProfileResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NicFirmwareProfileResponse)
+	err := c.cc.Invoke(ctx, Forge_CreateNicFirmwareProfile_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) FindNicFirmwareProfileIds(ctx context.Context, in *FindNicFirmwareProfileIdsRequest, opts ...grpc.CallOption) (*FindNicFirmwareProfileIdsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FindNicFirmwareProfileIdsResponse)
+	err := c.cc.Invoke(ctx, Forge_FindNicFirmwareProfileIds_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) FindNicFirmwareProfilesByIds(ctx context.Context, in *FindNicFirmwareProfilesByIdsRequest, opts ...grpc.CallOption) (*FindNicFirmwareProfilesByIdsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FindNicFirmwareProfilesByIdsResponse)
+	err := c.cc.Invoke(ctx, Forge_FindNicFirmwareProfilesByIds_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) UpdateNicFirmwareProfile(ctx context.Context, in *UpdateNicFirmwareProfileRequest, opts ...grpc.CallOption) (*NicFirmwareProfileResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NicFirmwareProfileResponse)
+	err := c.cc.Invoke(ctx, Forge_UpdateNicFirmwareProfile_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) DeleteNicFirmwareProfile(ctx context.Context, in *DeleteNicFirmwareProfileRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, Forge_DeleteNicFirmwareProfile_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) SetNicFirmwareSiteSelection(ctx context.Context, in *SetNicFirmwareSiteSelectionRequest, opts ...grpc.CallOption) (*NicFirmwareSiteSelectionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NicFirmwareSiteSelectionResponse)
+	err := c.cc.Invoke(ctx, Forge_SetNicFirmwareSiteSelection_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) FindNicFirmwareSiteSelectionIds(ctx context.Context, in *NicFirmwareSiteSelectionSearchFilter, opts ...grpc.CallOption) (*FindNicFirmwareSiteSelectionIdsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FindNicFirmwareSiteSelectionIdsResponse)
+	err := c.cc.Invoke(ctx, Forge_FindNicFirmwareSiteSelectionIds_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) FindNicFirmwareSiteSelectionsByIds(ctx context.Context, in *FindNicFirmwareSiteSelectionsByIdsRequest, opts ...grpc.CallOption) (*FindNicFirmwareSiteSelectionsByIdsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FindNicFirmwareSiteSelectionsByIdsResponse)
+	err := c.cc.Invoke(ctx, Forge_FindNicFirmwareSiteSelectionsByIds_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) SetMachineNicFirmwareConfig(ctx context.Context, in *SetMachineNicFirmwareConfigRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, Forge_SetMachineNicFirmwareConfig_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) GetTenantNicFirmwareConfig(ctx context.Context, in *GetTenantNicFirmwareConfigRequest, opts ...grpc.CallOption) (*GetTenantNicFirmwareConfigResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetTenantNicFirmwareConfigResponse)
+	err := c.cc.Invoke(ctx, Forge_GetTenantNicFirmwareConfig_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) SetTenantNicFirmwareConfig(ctx context.Context, in *SetTenantNicFirmwareConfigRequest, opts ...grpc.CallOption) (*SetTenantNicFirmwareConfigResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetTenantNicFirmwareConfigResponse)
+	err := c.cc.Invoke(ctx, Forge_SetTenantNicFirmwareConfig_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) GetDesiredNicFirmware(ctx context.Context, in *GetDesiredNicFirmwareRequest, opts ...grpc.CallOption) (*GetDesiredNicFirmwareResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetDesiredNicFirmwareResponse)
+	err := c.cc.Invoke(ctx, Forge_GetDesiredNicFirmware_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *forgeClient) CreateSku(ctx context.Context, in *SkuList, opts ...grpc.CallOption) (*SkuIdList, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SkuIdList)
@@ -6371,6 +6669,16 @@ func (c *forgeClient) MlxAdminShowMachine(ctx context.Context, in *MlxAdminDevic
 	return out, nil
 }
 
+func (c *forgeClient) MlxAdminShowDeviceIdentities(ctx context.Context, in *MlxAdminDeviceIdentitiesRequest, opts ...grpc.CallOption) (*MlxAdminDeviceIdentitiesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MlxAdminDeviceIdentitiesResponse)
+	err := c.cc.Invoke(ctx, Forge_MlxAdminShowDeviceIdentities_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *forgeClient) MlxAdminRegistryList(ctx context.Context, in *MlxAdminRegistryListRequest, opts ...grpc.CallOption) (*MlxAdminRegistryListResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(MlxAdminRegistryListResponse)
@@ -6631,6 +6939,16 @@ func (c *forgeClient) ComponentPowerControl(ctx context.Context, in *ComponentPo
 	return out, nil
 }
 
+func (c *forgeClient) GetComponentPowerDetails(ctx context.Context, in *GetComponentPowerDetailsRequest, opts ...grpc.CallOption) (*GetComponentPowerDetailsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetComponentPowerDetailsResponse)
+	err := c.cc.Invoke(ctx, Forge_GetComponentPowerDetails_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *forgeClient) ComponentConfigureSwitchCertificate(ctx context.Context, in *ComponentConfigureSwitchCertificateRequest, opts ...grpc.CallOption) (*ComponentConfigureSwitchCertificateResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ComponentConfigureSwitchCertificateResponse)
@@ -6777,6 +7095,12 @@ func (c *forgeClient) ReWrapSecrets(ctx context.Context, in *ReWrapSecretsReques
 type ForgeServer interface {
 	// What version of NICo is this service running? Matches `--version` command line.
 	Version(context.Context, *VersionRequest) (*BuildInfo, error)
+	// What version is the RMS backend running?
+	// Returns Unavailable if RMS is not configured on this nico-api instance.
+	// Returns PermissionDenied on older nico-api servers that predate this RPC:
+	// the RBAC middleware rejects unknown RPC names with HTTP 403 before gRPC
+	// dispatch, so Unimplemented is never reached on those servers.
+	GetRmsVersion(context.Context, *GetRmsVersionRequest) (*GetRmsVersionResponse, error)
 	// Stream recent and live machine console output.
 	StreamConsoleLogs(*StreamConsoleLogsRequest, grpc.ServerStreamingServer[ConsoleLogLine]) error
 	// Domain
@@ -6806,13 +7130,19 @@ type ForgeServer interface {
 	UpdateVpcVirtualization(context.Context, *VpcUpdateVirtualizationRequest) (*VpcUpdateVirtualizationResult, error)
 	// Deletion does not release a retained VNI implicitly. Call
 	// ReleaseVpcInactiveVni after verifying convergence before deleting the VPC.
-	// Retained or inconsistent owned allocations cause FailedPrecondition.
+	// Retained or inconsistent owned allocations cause FailedPrecondition, as do
+	// live DNS domains owned by this VPC. Deleted domains do not block deletion.
 	DeleteVpc(context.Context, *VpcDeletionRequest) (*VpcDeletionResult, error)
 	FindVpcIds(context.Context, *VpcSearchFilter) (*VpcIdList, error)
 	FindVpcsByIds(context.Context, *VpcsByIdsRequest) (*VpcList, error)
 	// Reads persisted VPC routing and allocation state without changing it.
 	GetVpcRoutingState(context.Context, *VpcRoutingStateRequest) (*VpcRoutingState, error)
 	CreateSpxPartition(context.Context, *SpxPartitionCreationRequest) (*SpxPartition, error)
+	// Marks the partition deleted and releases its VNI if the partition still owns
+	// that reservation, committing both changes together. Repeating the request
+	// for a deleted, unreferenced partition succeeds. Returns FailedPrecondition
+	// while any instance, including a terminating one, still references it.
+	// An omitted id returns InvalidArgument; an unknown partition returns Internal.
 	DeleteSpxPartition(context.Context, *SpxPartitionDeletionRequest) (*SpxPartitionDeletionResult, error)
 	FindSpxPartitionIds(context.Context, *SpxPartitionSearchFilter) (*SpxPartitionIdList, error)
 	FindSpxPartitionsByIds(context.Context, *SpxPartitionsByIdsRequest) (*SpxPartitionList, error)
@@ -7045,6 +7375,9 @@ type ForgeServer interface {
 	// picks up the freshly persisted report for downstream processing (pairing,
 	// remediation, audit). Returns AlreadyExists
 	// if a concurrent refresh or periodic probe is already in progress.
+	// During DPF provisioning, queues exploration and returns the cached report
+	// with exploration_requested=true. The queued refresh runs after all Site
+	// Explorer suppressions are cleared. Non-DPF suppressions alone return FailedPrecondition.
 	RefreshEndpointReport(context.Context, *RefreshEndpointReportRequest) (*ExploredEndpoint, error)
 	// Delete an explored endpoint from the database
 	DeleteExploredEndpoint(context.Context, *DeleteExploredEndpointRequest) (*DeleteExploredEndpointResponse, error)
@@ -7065,9 +7398,17 @@ type ForgeServer interface {
 	UpdateMachineHardwareInfo(context.Context, *UpdateMachineHardwareInfoRequest) (*emptypb.Empty, error)
 	// Force deletes a Machine and the associated DPU from NICo databases,
 	// with the intention of rediscovering the host later on.
-	// The command will not stop a running tenant instance. Only a reboot that forces
-	// the NICo PXE boot process again would stop the image and run the discovery
-	// process again.
+	// By default, cleanup does not wait for DPU network acknowledgement. Set
+	// wait_for_instance_dpu to request Admin networking when an Instance exists
+	// and retain the records until every attached DPU acknowledges it. While
+	// waiting, return all_done=false; poll to finish deletion. An unreachable DPU
+	// can block an opted-in deletion indefinitely, and omitting the option on a
+	// retry does not cancel an already-recorded wait.
+	// Only servers supporting this option enforce the recorded wait. An older
+	// server can complete cleanup without acknowledgement, including on a retry.
+	// The request remains in ForceDeletion across API restarts and cannot be canceled.
+	// Returning to Admin stops tenant networking through the DPUs, but does not shut
+	// down or wipe the tenant's operating system. A later PXE boot runs discovery again.
 	//
 	// Due to the not well defined state that hosts are in after calling this command,
 	// it should not be used by Tenants or Site Providers to release instances. Those
@@ -7089,8 +7430,12 @@ type ForgeServer interface {
 	AdminReleaseReservedAddresses(context.Context, *AdminReleaseReservedAddressesRequest) (*AdminReleaseReservedAddressesResponse, error)
 	// Starts the managed host decommissioning workflow. The host must be Ready.
 	DecommissionManagedHost(context.Context, *DecommissionManagedHostRequest) (*DecommissionManagedHostResponse, error)
-	// List existing resource pools and their stats
+	// Lists local inventory counts and bounds, including IPv6 prefixes with their lengths.
+	// Any saved gRPC binding makes the whole call fail with FailedPrecondition;
+	// use AdminInspectResourcePools to inspect every backend.
 	AdminListResourcePools(context.Context, *ListResourcePoolsRequest) (*ResourcePools, error)
+	// Inspects local and remote pools without treating unknown capacity as zero.
+	AdminInspectResourcePools(context.Context, *InspectResourcePoolsRequest) (*InspectResourcePoolsResponse, error)
 	// Add capacity to a resource pool
 	AdminGrowResourcePool(context.Context, *GrowResourcePoolRequest) (*GrowResourcePoolResponse, error)
 	// Update the Metadata of a Machine
@@ -7115,8 +7460,11 @@ type ForgeServer interface {
 	TriggerHostReprovisioning(context.Context, *HostReprovisioningRequest) (*emptypb.Empty, error)
 	// List hosts waiting for reprovisioning
 	ListHostsWaitingForReprovisioning(context.Context, *HostReprovisioningListRequest) (*HostReprovisioningListResponse, error)
-	// Trigger a reset of a managed host: tear down its instance and DPF
+	// Trigger a reset of a managed host: tear down its Instance and DPF
 	// resources, then re-ingest it from DPU discovery.
+	// With an Instance present, retain it and its network resources until every
+	// DPU attached to the host acknowledges Admin networking. An unreachable DPU
+	// keeps the reset waiting; hosts without an Instance skip this network wait.
 	TriggerManagedHostReset(context.Context, *ManagedHostResetRequest) (*emptypb.Empty, error)
 	// List managed hosts waiting for reset
 	ListManagedHostsWaitingForReset(context.Context, *ManagedHostResetListRequest) (*ManagedHostResetListResponse, error)
@@ -7182,7 +7530,8 @@ type ForgeServer interface {
 	ReplaceRouteServers(context.Context, *RouteServers) (*emptypb.Empty, error)
 	// MachineInventory
 	UpdateAgentReportedInventory(context.Context, *DpuAgentInventoryReport) (*emptypb.Empty, error)
-	// Periodic LLDP neighbor report from a running agent (DPU agent or scout).
+	// Periodic LLDP neighbor report from scout. The DPU agent reports through
+	// RecordDpuNetworkStatus instead.
 	ReportLldpNeighbors(context.Context, *LldpNeighborReport) (*emptypb.Empty, error)
 	// Phone Home
 	UpdateInstancePhoneHomeLastContact(context.Context, *InstancePhoneHomeLastContactRequest) (*InstancePhoneHomeLastContactResponse, error)
@@ -7277,10 +7626,23 @@ type ForgeServer interface {
 	ReplaceAllExpectedRacks(context.Context, *ExpectedRackList) (*emptypb.Empty, error)
 	// Delete all expected racks in site
 	DeleteAllExpectedRacks(context.Context, *emptypb.Empty) (*emptypb.Empty, error)
+	// Administrator-managed expected NVLink domain inventory
+	// Declare immutable expected membership. This does not configure hardware or validate
+	// physical NVLink connectivity. Unknown/ambiguous members and wrong-group racks are rejected.
+	CreateExpectedNvLinkDomain(context.Context, *CreateExpectedNvLinkDomainRequest) (*ExpectedNvLinkDomain, error)
+	// Delete only the declaration and release its MAC claims; no hardware operations occur.
+	// Missing declarations return NOT_FOUND. Observed domains and health reports are untouched.
+	DeleteExpectedNvLinkDomain(context.Context, *ExpectedNvLinkDomainRequest) (*emptypb.Empty, error)
+	GetExpectedNvLinkDomain(context.Context, *ExpectedNvLinkDomainRequest) (*ExpectedNvLinkDomain, error)
+	FindExpectedNvLinkDomainIds(context.Context, *ExpectedNvLinkDomainSearchFilter) (*ExpectedNvLinkDomainIdList, error)
+	FindExpectedNvLinkDomainsByIds(context.Context, *ExpectedNvLinkDomainsByIdsRequest) (*ExpectedNvLinkDomainList, error)
 	// Expected Rack Group Management
 	AddExpectedRackGroup(context.Context, *ExpectedRackGroup) (*emptypb.Empty, error)
+	// Fails with FAILED_PRECONDITION if expected NVLink domains reference this group.
 	DeleteExpectedRackGroup(context.Context, *ExpectedRackGroupRequest) (*emptypb.Empty, error)
 	// Replace the full record, including both lists and metadata.
+	// With expected NVLink domains, racks must remain unchanged.
+	// Topology, protocol, and metadata changes are accepted.
 	UpdateExpectedRackGroup(context.Context, *ExpectedRackGroup) (*emptypb.Empty, error)
 	GetExpectedRackGroup(context.Context, *ExpectedRackGroupRequest) (*ExpectedRackGroup, error)
 	// Return all declarations ordered by rack group ID; an empty site returns an empty list.
@@ -7288,7 +7650,9 @@ type ForgeServer interface {
 	FindExpectedRackGroupIds(context.Context, *ExpectedRackGroupSearchFilter) (*ExpectedRackGroupIdList, error)
 	FindExpectedRackGroupsByIds(context.Context, *ExpectedRackGroupsByIdsRequest) (*ExpectedRackGroupList, error)
 	// Atomically clear existing groups and insert the supplied list; an empty list clears all groups.
+	// Fails with FAILED_PRECONDITION while any expected NVLink domain references a group.
 	ReplaceAllExpectedRackGroups(context.Context, *ExpectedRackGroupList) (*emptypb.Empty, error)
+	// Fails with FAILED_PRECONDITION while any expected NVLink domain references a group.
 	DeleteAllExpectedRackGroups(context.Context, *emptypb.Empty) (*emptypb.Empty, error)
 	// Perform Attestation Procedure for Measured Boot
 	AttestQuote(context.Context, *AttestQuoteRequest) (*AttestQuoteResponse, error)
@@ -7481,6 +7845,29 @@ type ForgeServer interface {
 	GetDesiredFirmwareVersions(context.Context, *GetDesiredFirmwareVersionsRequest) (*GetDesiredFirmwareVersionsResponse, error)
 	UpsertHostFirmwareConfig(context.Context, *UpsertHostFirmwareConfigRequest) (*HostFirmwareConfigResponse, error)
 	DeleteHostFirmwareConfig(context.Context, *DeleteHostFirmwareConfigRequest) (*emptypb.Empty, error)
+	// Operator-only NIC firmware profiles, scoped selections and desired firmware.
+	// These methods do not update devices or change machine readiness.
+	// NIC firmware selections require matching v2.4 Core and client schemas,
+	// including clients that read MachineConfig or GetDesiredNicFirmware responses.
+	CreateNicFirmwareProfile(context.Context, *CreateNicFirmwareProfileRequest) (*NicFirmwareProfileResponse, error)
+	FindNicFirmwareProfileIds(context.Context, *FindNicFirmwareProfileIdsRequest) (*FindNicFirmwareProfileIdsResponse, error)
+	FindNicFirmwareProfilesByIds(context.Context, *FindNicFirmwareProfilesByIdsRequest) (*FindNicFirmwareProfilesByIdsResponse, error)
+	UpdateNicFirmwareProfile(context.Context, *UpdateNicFirmwareProfileRequest) (*NicFirmwareProfileResponse, error)
+	DeleteNicFirmwareProfile(context.Context, *DeleteNicFirmwareProfileRequest) (*emptypb.Empty, error)
+	// Select or clear the site profile for an exact hardware pair.
+	SetNicFirmwareSiteSelection(context.Context, *SetNicFirmwareSiteSelectionRequest) (*NicFirmwareSiteSelectionResponse, error)
+	// List hardware keys for all site selections or those selecting one profile.
+	FindNicFirmwareSiteSelectionIds(context.Context, *NicFirmwareSiteSelectionSearchFilter) (*FindNicFirmwareSiteSelectionIdsResponse, error)
+	// Retrieve existing assignments for a bounded batch of hardware keys.
+	FindNicFirmwareSiteSelectionsByIds(context.Context, *FindNicFirmwareSiteSelectionsByIdsRequest) (*FindNicFirmwareSiteSelectionsByIdsResponse, error)
+	// Set or clear the operator's machine and card selections using Machine.version.
+	SetMachineNicFirmwareConfig(context.Context, *SetMachineNicFirmwareConfigRequest) (*emptypb.Empty, error)
+	// Only operators may read the tenant selection; the response includes the shared Tenant.version.
+	GetTenantNicFirmwareConfig(context.Context, *GetTenantNicFirmwareConfigRequest) (*GetTenantNicFirmwareConfigResponse, error)
+	// Set or clear the operator's tenant selection using the shared Tenant.version.
+	SetTenantNicFirmwareConfig(context.Context, *SetTenantNicFirmwareConfigRequest) (*SetTenantNicFirmwareConfigResponse, error)
+	// Get desired firmware for each device using stored host observations.
+	GetDesiredNicFirmware(context.Context, *GetDesiredNicFirmwareRequest) (*GetDesiredNicFirmwareResponse, error)
 	// Create A SKU to be assigned to a machine so the machine hardware can be validated.
 	CreateSku(context.Context, *SkuList) (*SkuIdList, error)
 	// Generate a SKU from the hardware inventory of a machine.
@@ -7590,6 +7977,11 @@ type ForgeServer interface {
 	SignMachineIdentity(context.Context, *MachineIdentityRequest) (*MachineIdentityResponse, error)
 	// Get, set, or delete per-org tenant identity configuration (issuer, audiences, TTL, signing key)
 	GetTenantIdentityConfiguration(context.Context, *GetTenantIdentityConfigRequest) (*TenantIdentityConfigResponse, error)
+	// Creates or updates the per-org tenant identity configuration.
+	// Concurrent creation can return ALREADY_EXISTS, leaving the stored configuration
+	// and tenant version unchanged. Read it before retrying, since a retry can update it.
+	// An explicit rotate_key request can instead rotate a concurrently created
+	// configuration found during the write.
 	SetTenantIdentityConfiguration(context.Context, *SetTenantIdentityConfigRequest) (*TenantIdentityConfigResponse, error)
 	DeleteTenantIdentityConfiguration(context.Context, *GetTenantIdentityConfigRequest) (*emptypb.Empty, error)
 	// Token delegation: get, set, or delete per-org token exchange config
@@ -7650,6 +8042,9 @@ type ForgeServer interface {
 	MlxAdminShowDevice(context.Context, *MlxAdminDeviceInfoRequest) (*MlxAdminDeviceInfoResponse, error)
 	// MlxAdminShowMachine will show an MlxDeviceReport for a given machine.
 	MlxAdminShowMachine(context.Context, *MlxAdminDeviceReportRequest) (*MlxAdminDeviceReportResponse, error)
+	// Read stored NIC identity evidence and current managed-DPU associations.
+	// Scout need not be connected. This does not establish update/reset eligibility.
+	MlxAdminShowDeviceIdentities(context.Context, *MlxAdminDeviceIdentitiesRequest) (*MlxAdminDeviceIdentitiesResponse, error)
 	// Mellanox administrative endpoints for registry querying, which are called by
 	// the CLI (nico-admin-cli) and potentially the UI. These endpoints ultimately
 	// interconnect with a scout agent listening via an open ScoutStream connection.
@@ -7727,6 +8122,16 @@ type ForgeServer interface {
 	ReleaseDPUServiceSyncHold(context.Context, *ReleaseDPUServiceSyncHoldRequest) (*ReleaseDPUServiceSyncHoldResponse, error)
 	// --- Component management (unified switch + power shelf operations) ---
 	ComponentPowerControl(context.Context, *ComponentPowerControlRequest) (*ComponentPowerControlResponse, error)
+	// Reads fresh hardware power state and independently stored desired policy.
+	// Flow and ForgeAdminCLI may call this method. A consistent database snapshot
+	// has five seconds, including pool acquisition; failure aborts with INTERNAL.
+	// After releasing that snapshot, queued targets, credentials, and live reads
+	// share fifteen seconds with at most eight targets active. Completed results
+	// survive expiry; unfinished reads report DeadlineExceeded. Earlier caller
+	// cancellation drops pending work. Core and RMS also enforce ten-second local
+	// read budgets, whose expiry reports ReadFailed. This method never registers
+	// devices, writes policy, or submits power operations.
+	GetComponentPowerDetails(context.Context, *GetComponentPowerDetailsRequest) (*GetComponentPowerDetailsResponse, error)
 	ComponentConfigureSwitchCertificate(context.Context, *ComponentConfigureSwitchCertificateRequest) (*ComponentConfigureSwitchCertificateResponse, error)
 	GetComponentInventory(context.Context, *GetComponentInventoryRequest) (*GetComponentInventoryResponse, error)
 	UpdateComponentFirmware(context.Context, *UpdateComponentFirmwareRequest) (*UpdateComponentFirmwareResponse, error)
@@ -7757,6 +8162,9 @@ type UnimplementedForgeServer struct{}
 
 func (UnimplementedForgeServer) Version(context.Context, *VersionRequest) (*BuildInfo, error) {
 	return nil, status.Error(codes.Unimplemented, "method Version not implemented")
+}
+func (UnimplementedForgeServer) GetRmsVersion(context.Context, *GetRmsVersionRequest) (*GetRmsVersionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetRmsVersion not implemented")
 }
 func (UnimplementedForgeServer) StreamConsoleLogs(*StreamConsoleLogsRequest, grpc.ServerStreamingServer[ConsoleLogLine]) error {
 	return status.Error(codes.Unimplemented, "method StreamConsoleLogs not implemented")
@@ -8277,6 +8685,9 @@ func (UnimplementedForgeServer) DecommissionManagedHost(context.Context, *Decomm
 func (UnimplementedForgeServer) AdminListResourcePools(context.Context, *ListResourcePoolsRequest) (*ResourcePools, error) {
 	return nil, status.Error(codes.Unimplemented, "method AdminListResourcePools not implemented")
 }
+func (UnimplementedForgeServer) AdminInspectResourcePools(context.Context, *InspectResourcePoolsRequest) (*InspectResourcePoolsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AdminInspectResourcePools not implemented")
+}
 func (UnimplementedForgeServer) AdminGrowResourcePool(context.Context, *GrowResourcePoolRequest) (*GrowResourcePoolResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AdminGrowResourcePool not implemented")
 }
@@ -8516,6 +8927,21 @@ func (UnimplementedForgeServer) ReplaceAllExpectedRacks(context.Context, *Expect
 }
 func (UnimplementedForgeServer) DeleteAllExpectedRacks(context.Context, *emptypb.Empty) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method DeleteAllExpectedRacks not implemented")
+}
+func (UnimplementedForgeServer) CreateExpectedNvLinkDomain(context.Context, *CreateExpectedNvLinkDomainRequest) (*ExpectedNvLinkDomain, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateExpectedNvLinkDomain not implemented")
+}
+func (UnimplementedForgeServer) DeleteExpectedNvLinkDomain(context.Context, *ExpectedNvLinkDomainRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteExpectedNvLinkDomain not implemented")
+}
+func (UnimplementedForgeServer) GetExpectedNvLinkDomain(context.Context, *ExpectedNvLinkDomainRequest) (*ExpectedNvLinkDomain, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetExpectedNvLinkDomain not implemented")
+}
+func (UnimplementedForgeServer) FindExpectedNvLinkDomainIds(context.Context, *ExpectedNvLinkDomainSearchFilter) (*ExpectedNvLinkDomainIdList, error) {
+	return nil, status.Error(codes.Unimplemented, "method FindExpectedNvLinkDomainIds not implemented")
+}
+func (UnimplementedForgeServer) FindExpectedNvLinkDomainsByIds(context.Context, *ExpectedNvLinkDomainsByIdsRequest) (*ExpectedNvLinkDomainList, error) {
+	return nil, status.Error(codes.Unimplemented, "method FindExpectedNvLinkDomainsByIds not implemented")
 }
 func (UnimplementedForgeServer) AddExpectedRackGroup(context.Context, *ExpectedRackGroup) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method AddExpectedRackGroup not implemented")
@@ -8907,6 +9333,42 @@ func (UnimplementedForgeServer) UpsertHostFirmwareConfig(context.Context, *Upser
 func (UnimplementedForgeServer) DeleteHostFirmwareConfig(context.Context, *DeleteHostFirmwareConfigRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method DeleteHostFirmwareConfig not implemented")
 }
+func (UnimplementedForgeServer) CreateNicFirmwareProfile(context.Context, *CreateNicFirmwareProfileRequest) (*NicFirmwareProfileResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateNicFirmwareProfile not implemented")
+}
+func (UnimplementedForgeServer) FindNicFirmwareProfileIds(context.Context, *FindNicFirmwareProfileIdsRequest) (*FindNicFirmwareProfileIdsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method FindNicFirmwareProfileIds not implemented")
+}
+func (UnimplementedForgeServer) FindNicFirmwareProfilesByIds(context.Context, *FindNicFirmwareProfilesByIdsRequest) (*FindNicFirmwareProfilesByIdsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method FindNicFirmwareProfilesByIds not implemented")
+}
+func (UnimplementedForgeServer) UpdateNicFirmwareProfile(context.Context, *UpdateNicFirmwareProfileRequest) (*NicFirmwareProfileResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateNicFirmwareProfile not implemented")
+}
+func (UnimplementedForgeServer) DeleteNicFirmwareProfile(context.Context, *DeleteNicFirmwareProfileRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteNicFirmwareProfile not implemented")
+}
+func (UnimplementedForgeServer) SetNicFirmwareSiteSelection(context.Context, *SetNicFirmwareSiteSelectionRequest) (*NicFirmwareSiteSelectionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetNicFirmwareSiteSelection not implemented")
+}
+func (UnimplementedForgeServer) FindNicFirmwareSiteSelectionIds(context.Context, *NicFirmwareSiteSelectionSearchFilter) (*FindNicFirmwareSiteSelectionIdsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method FindNicFirmwareSiteSelectionIds not implemented")
+}
+func (UnimplementedForgeServer) FindNicFirmwareSiteSelectionsByIds(context.Context, *FindNicFirmwareSiteSelectionsByIdsRequest) (*FindNicFirmwareSiteSelectionsByIdsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method FindNicFirmwareSiteSelectionsByIds not implemented")
+}
+func (UnimplementedForgeServer) SetMachineNicFirmwareConfig(context.Context, *SetMachineNicFirmwareConfigRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetMachineNicFirmwareConfig not implemented")
+}
+func (UnimplementedForgeServer) GetTenantNicFirmwareConfig(context.Context, *GetTenantNicFirmwareConfigRequest) (*GetTenantNicFirmwareConfigResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetTenantNicFirmwareConfig not implemented")
+}
+func (UnimplementedForgeServer) SetTenantNicFirmwareConfig(context.Context, *SetTenantNicFirmwareConfigRequest) (*SetTenantNicFirmwareConfigResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetTenantNicFirmwareConfig not implemented")
+}
+func (UnimplementedForgeServer) GetDesiredNicFirmware(context.Context, *GetDesiredNicFirmwareRequest) (*GetDesiredNicFirmwareResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetDesiredNicFirmware not implemented")
+}
 func (UnimplementedForgeServer) CreateSku(context.Context, *SkuList) (*SkuIdList, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateSku not implemented")
 }
@@ -9201,6 +9663,9 @@ func (UnimplementedForgeServer) MlxAdminShowDevice(context.Context, *MlxAdminDev
 func (UnimplementedForgeServer) MlxAdminShowMachine(context.Context, *MlxAdminDeviceReportRequest) (*MlxAdminDeviceReportResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method MlxAdminShowMachine not implemented")
 }
+func (UnimplementedForgeServer) MlxAdminShowDeviceIdentities(context.Context, *MlxAdminDeviceIdentitiesRequest) (*MlxAdminDeviceIdentitiesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method MlxAdminShowDeviceIdentities not implemented")
+}
 func (UnimplementedForgeServer) MlxAdminRegistryList(context.Context, *MlxAdminRegistryListRequest) (*MlxAdminRegistryListResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method MlxAdminRegistryList not implemented")
 }
@@ -9279,6 +9744,9 @@ func (UnimplementedForgeServer) ReleaseDPUServiceSyncHold(context.Context, *Rele
 func (UnimplementedForgeServer) ComponentPowerControl(context.Context, *ComponentPowerControlRequest) (*ComponentPowerControlResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ComponentPowerControl not implemented")
 }
+func (UnimplementedForgeServer) GetComponentPowerDetails(context.Context, *GetComponentPowerDetailsRequest) (*GetComponentPowerDetailsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetComponentPowerDetails not implemented")
+}
 func (UnimplementedForgeServer) ComponentConfigureSwitchCertificate(context.Context, *ComponentConfigureSwitchCertificateRequest) (*ComponentConfigureSwitchCertificateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ComponentConfigureSwitchCertificate not implemented")
 }
@@ -9355,6 +9823,24 @@ func _Forge_Version_Handler(srv interface{}, ctx context.Context, dec func(inter
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ForgeServer).Version(ctx, req.(*VersionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_GetRmsVersion_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRmsVersionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).GetRmsVersion(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_GetRmsVersion_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).GetRmsVersion(ctx, req.(*GetRmsVersionRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -12466,6 +12952,24 @@ func _Forge_AdminListResourcePools_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Forge_AdminInspectResourcePools_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(InspectResourcePoolsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).AdminInspectResourcePools(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_AdminInspectResourcePools_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).AdminInspectResourcePools(ctx, req.(*InspectResourcePoolsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Forge_AdminGrowResourcePool_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GrowResourcePoolRequest)
 	if err := dec(in); err != nil {
@@ -13902,6 +14406,96 @@ func _Forge_DeleteAllExpectedRacks_Handler(srv interface{}, ctx context.Context,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ForgeServer).DeleteAllExpectedRacks(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_CreateExpectedNvLinkDomain_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateExpectedNvLinkDomainRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).CreateExpectedNvLinkDomain(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_CreateExpectedNvLinkDomain_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).CreateExpectedNvLinkDomain(ctx, req.(*CreateExpectedNvLinkDomainRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_DeleteExpectedNvLinkDomain_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExpectedNvLinkDomainRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).DeleteExpectedNvLinkDomain(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_DeleteExpectedNvLinkDomain_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).DeleteExpectedNvLinkDomain(ctx, req.(*ExpectedNvLinkDomainRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_GetExpectedNvLinkDomain_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExpectedNvLinkDomainRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).GetExpectedNvLinkDomain(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_GetExpectedNvLinkDomain_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).GetExpectedNvLinkDomain(ctx, req.(*ExpectedNvLinkDomainRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_FindExpectedNvLinkDomainIds_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExpectedNvLinkDomainSearchFilter)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).FindExpectedNvLinkDomainIds(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_FindExpectedNvLinkDomainIds_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).FindExpectedNvLinkDomainIds(ctx, req.(*ExpectedNvLinkDomainSearchFilter))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_FindExpectedNvLinkDomainsByIds_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExpectedNvLinkDomainsByIdsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).FindExpectedNvLinkDomainsByIds(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_FindExpectedNvLinkDomainsByIds_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).FindExpectedNvLinkDomainsByIds(ctx, req.(*ExpectedNvLinkDomainsByIdsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -16246,6 +16840,222 @@ func _Forge_DeleteHostFirmwareConfig_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Forge_CreateNicFirmwareProfile_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateNicFirmwareProfileRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).CreateNicFirmwareProfile(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_CreateNicFirmwareProfile_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).CreateNicFirmwareProfile(ctx, req.(*CreateNicFirmwareProfileRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_FindNicFirmwareProfileIds_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FindNicFirmwareProfileIdsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).FindNicFirmwareProfileIds(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_FindNicFirmwareProfileIds_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).FindNicFirmwareProfileIds(ctx, req.(*FindNicFirmwareProfileIdsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_FindNicFirmwareProfilesByIds_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FindNicFirmwareProfilesByIdsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).FindNicFirmwareProfilesByIds(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_FindNicFirmwareProfilesByIds_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).FindNicFirmwareProfilesByIds(ctx, req.(*FindNicFirmwareProfilesByIdsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_UpdateNicFirmwareProfile_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateNicFirmwareProfileRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).UpdateNicFirmwareProfile(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_UpdateNicFirmwareProfile_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).UpdateNicFirmwareProfile(ctx, req.(*UpdateNicFirmwareProfileRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_DeleteNicFirmwareProfile_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteNicFirmwareProfileRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).DeleteNicFirmwareProfile(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_DeleteNicFirmwareProfile_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).DeleteNicFirmwareProfile(ctx, req.(*DeleteNicFirmwareProfileRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_SetNicFirmwareSiteSelection_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetNicFirmwareSiteSelectionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).SetNicFirmwareSiteSelection(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_SetNicFirmwareSiteSelection_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).SetNicFirmwareSiteSelection(ctx, req.(*SetNicFirmwareSiteSelectionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_FindNicFirmwareSiteSelectionIds_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NicFirmwareSiteSelectionSearchFilter)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).FindNicFirmwareSiteSelectionIds(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_FindNicFirmwareSiteSelectionIds_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).FindNicFirmwareSiteSelectionIds(ctx, req.(*NicFirmwareSiteSelectionSearchFilter))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_FindNicFirmwareSiteSelectionsByIds_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FindNicFirmwareSiteSelectionsByIdsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).FindNicFirmwareSiteSelectionsByIds(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_FindNicFirmwareSiteSelectionsByIds_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).FindNicFirmwareSiteSelectionsByIds(ctx, req.(*FindNicFirmwareSiteSelectionsByIdsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_SetMachineNicFirmwareConfig_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetMachineNicFirmwareConfigRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).SetMachineNicFirmwareConfig(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_SetMachineNicFirmwareConfig_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).SetMachineNicFirmwareConfig(ctx, req.(*SetMachineNicFirmwareConfigRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_GetTenantNicFirmwareConfig_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetTenantNicFirmwareConfigRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).GetTenantNicFirmwareConfig(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_GetTenantNicFirmwareConfig_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).GetTenantNicFirmwareConfig(ctx, req.(*GetTenantNicFirmwareConfigRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_SetTenantNicFirmwareConfig_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetTenantNicFirmwareConfigRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).SetTenantNicFirmwareConfig(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_SetTenantNicFirmwareConfig_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).SetTenantNicFirmwareConfig(ctx, req.(*SetTenantNicFirmwareConfigRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_GetDesiredNicFirmware_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetDesiredNicFirmwareRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).GetDesiredNicFirmware(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_GetDesiredNicFirmware_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).GetDesiredNicFirmware(ctx, req.(*GetDesiredNicFirmwareRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Forge_CreateSku_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(SkuList)
 	if err := dec(in); err != nil {
@@ -17999,6 +18809,24 @@ func _Forge_MlxAdminShowMachine_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Forge_MlxAdminShowDeviceIdentities_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MlxAdminDeviceIdentitiesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).MlxAdminShowDeviceIdentities(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_MlxAdminShowDeviceIdentities_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).MlxAdminShowDeviceIdentities(ctx, req.(*MlxAdminDeviceIdentitiesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Forge_MlxAdminRegistryList_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(MlxAdminRegistryListRequest)
 	if err := dec(in); err != nil {
@@ -18467,6 +19295,24 @@ func _Forge_ComponentPowerControl_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Forge_GetComponentPowerDetails_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetComponentPowerDetailsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).GetComponentPowerDetails(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_GetComponentPowerDetails_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).GetComponentPowerDetails(ctx, req.(*GetComponentPowerDetailsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Forge_ComponentConfigureSwitchCertificate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ComponentConfigureSwitchCertificateRequest)
 	if err := dec(in); err != nil {
@@ -18729,6 +19575,10 @@ var Forge_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Version",
 			Handler:    _Forge_Version_Handler,
+		},
+		{
+			MethodName: "GetRmsVersion",
+			Handler:    _Forge_GetRmsVersion_Handler,
 		},
 		{
 			MethodName: "CreateDomain",
@@ -19419,6 +20269,10 @@ var Forge_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Forge_AdminListResourcePools_Handler,
 		},
 		{
+			MethodName: "AdminInspectResourcePools",
+			Handler:    _Forge_AdminInspectResourcePools_Handler,
+		},
+		{
 			MethodName: "AdminGrowResourcePool",
 			Handler:    _Forge_AdminGrowResourcePool_Handler,
 		},
@@ -19737,6 +20591,26 @@ var Forge_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DeleteAllExpectedRacks",
 			Handler:    _Forge_DeleteAllExpectedRacks_Handler,
+		},
+		{
+			MethodName: "CreateExpectedNvLinkDomain",
+			Handler:    _Forge_CreateExpectedNvLinkDomain_Handler,
+		},
+		{
+			MethodName: "DeleteExpectedNvLinkDomain",
+			Handler:    _Forge_DeleteExpectedNvLinkDomain_Handler,
+		},
+		{
+			MethodName: "GetExpectedNvLinkDomain",
+			Handler:    _Forge_GetExpectedNvLinkDomain_Handler,
+		},
+		{
+			MethodName: "FindExpectedNvLinkDomainIds",
+			Handler:    _Forge_FindExpectedNvLinkDomainIds_Handler,
+		},
+		{
+			MethodName: "FindExpectedNvLinkDomainsByIds",
+			Handler:    _Forge_FindExpectedNvLinkDomainsByIds_Handler,
 		},
 		{
 			MethodName: "AddExpectedRackGroup",
@@ -20259,6 +21133,54 @@ var Forge_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Forge_DeleteHostFirmwareConfig_Handler,
 		},
 		{
+			MethodName: "CreateNicFirmwareProfile",
+			Handler:    _Forge_CreateNicFirmwareProfile_Handler,
+		},
+		{
+			MethodName: "FindNicFirmwareProfileIds",
+			Handler:    _Forge_FindNicFirmwareProfileIds_Handler,
+		},
+		{
+			MethodName: "FindNicFirmwareProfilesByIds",
+			Handler:    _Forge_FindNicFirmwareProfilesByIds_Handler,
+		},
+		{
+			MethodName: "UpdateNicFirmwareProfile",
+			Handler:    _Forge_UpdateNicFirmwareProfile_Handler,
+		},
+		{
+			MethodName: "DeleteNicFirmwareProfile",
+			Handler:    _Forge_DeleteNicFirmwareProfile_Handler,
+		},
+		{
+			MethodName: "SetNicFirmwareSiteSelection",
+			Handler:    _Forge_SetNicFirmwareSiteSelection_Handler,
+		},
+		{
+			MethodName: "FindNicFirmwareSiteSelectionIds",
+			Handler:    _Forge_FindNicFirmwareSiteSelectionIds_Handler,
+		},
+		{
+			MethodName: "FindNicFirmwareSiteSelectionsByIds",
+			Handler:    _Forge_FindNicFirmwareSiteSelectionsByIds_Handler,
+		},
+		{
+			MethodName: "SetMachineNicFirmwareConfig",
+			Handler:    _Forge_SetMachineNicFirmwareConfig_Handler,
+		},
+		{
+			MethodName: "GetTenantNicFirmwareConfig",
+			Handler:    _Forge_GetTenantNicFirmwareConfig_Handler,
+		},
+		{
+			MethodName: "SetTenantNicFirmwareConfig",
+			Handler:    _Forge_SetTenantNicFirmwareConfig_Handler,
+		},
+		{
+			MethodName: "GetDesiredNicFirmware",
+			Handler:    _Forge_GetDesiredNicFirmware_Handler,
+		},
+		{
 			MethodName: "CreateSku",
 			Handler:    _Forge_CreateSku_Handler,
 		},
@@ -20647,6 +21569,10 @@ var Forge_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Forge_MlxAdminShowMachine_Handler,
 		},
 		{
+			MethodName: "MlxAdminShowDeviceIdentities",
+			Handler:    _Forge_MlxAdminShowDeviceIdentities_Handler,
+		},
+		{
 			MethodName: "MlxAdminRegistryList",
 			Handler:    _Forge_MlxAdminRegistryList_Handler,
 		},
@@ -20749,6 +21675,10 @@ var Forge_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ComponentPowerControl",
 			Handler:    _Forge_ComponentPowerControl_Handler,
+		},
+		{
+			MethodName: "GetComponentPowerDetails",
+			Handler:    _Forge_GetComponentPowerDetails_Handler,
 		},
 		{
 			MethodName: "ComponentConfigureSwitchCertificate",

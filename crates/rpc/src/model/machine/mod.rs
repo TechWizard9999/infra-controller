@@ -351,6 +351,17 @@ impl<ID: MachineIdSubtypeTrait> From<model::machine::Machine<ID>> for rpc::forge
                 .map(|i| i.to_string()),
             dpf,
             hw_sku: machine.config.hw_sku.clone(),
+            nic_firmware_profile_id: machine
+                .config
+                .nic_firmware_profile_id
+                .as_ref()
+                .map(ToString::to_string),
+            nic_firmware_card_selections: machine
+                .config
+                .nic_firmware_card_selections
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         };
 
         // -- Build the new structured status sub-message --
@@ -360,6 +371,7 @@ impl<ID: MachineIdSubtypeTrait> From<model::machine::Machine<ID>> for rpc::forge
             last_reboot_time: machine.status.last_reboot_time.map(|t| t.into()),
             last_observation_time,
             associated_host_machine_id: None, // Gets filled in the `ManagedHostStateSnapshot` conversion
+            lldp_neighbors: Vec::new(), // Filled by FindMachinesByIds, the only read that loads LLDP neighbors
             associated_dpu_machine_ids: associated_dpu_machine_ids.to_vec(),
             last_reboot_requested_time: machine
                 .status

@@ -64,6 +64,7 @@ use crate::state_history::StateHistoryRecord;
 
 pub mod slas;
 
+pub mod astra;
 pub mod capabilities;
 pub mod config;
 pub mod health_override;
@@ -888,8 +889,8 @@ pub struct Machine<ID: MachineIdSubtypeTrait> {
     /// Machine metadata
     pub metadata: Metadata,
 
-    /// Version field that tracks changes to
-    /// - Metadata
+    /// Shared edit version, including metadata and NIC firmware machine and card
+    /// selection changes.
     pub version: ConfigVersion,
     // Columns for these exist, but are unused in rust code
     // /// When this machine record was created
@@ -1598,7 +1599,9 @@ pub enum DecommissioningState {
     /// Powers the host back on after the cycle so OOB rediscovery can proceed.
     PoweringOnHost,
     /// Waiting for the pre-cycle OOB DHCP suppression to be acknowledged.
-    /// Endpoints with an expected static IP and no recorded DHCP contact skip this wait.
+    /// An endpoint skips this wait if its MAC has at least one recorded interface,
+    /// every interface has a current `AllocationType::Static` address, and no
+    /// current address lies within any configured network prefix.
     WaitingForOobDhcpAcknowledgement,
     /// BMC DHCP is suppressed before the BMC factory reset.
     SuppressingBmcDhcp,
@@ -1607,7 +1610,9 @@ pub enum DecommissioningState {
         completed: HashSet<MachineId>,
     },
     /// Waiting for the pre-reset BMC DHCP suppression to be acknowledged.
-    /// Endpoints with an expected static IP and no recorded DHCP contact skip this wait.
+    /// An endpoint skips this wait if its MAC has at least one recorded interface,
+    /// every interface has a current `AllocationType::Static` address, and no
+    /// current address lies within any configured network prefix.
     WaitingForBmcDhcpAcknowledgement,
     /// Managed per-device BMC and DPU credentials are being removed after factory reset.
     DeletingManagedCredentials,
@@ -1638,12 +1643,15 @@ pub enum DeconfiguringDpuState {
     Complete,
 }
 
-/// Sub-states of [`ManagedHostState::Reset`]: delete the tenant instance, then delete
-/// the DPF CRs and wait for them to drain before re-ingesting from DPU discovery.
+/// Sub-states of [`ManagedHostState::Reset`]: wait for Admin networking before
+/// deleting the tenant Instance, then remove the DPF CRs before re-ingestion.
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 #[allow(clippy::enum_variant_names)] // Both steps delete; the object deleted is the distinction
 pub enum ResetState {
+    /// Retains the Instance and its network resources until every topology DPU
+    /// acknowledges Admin networking, then deletes them before host cleanup.
+    /// A host without an Instance proceeds directly to `DeletingCrs`.
     DeletingInstance,
     /// Deletes the CRs and polls until they are gone. Registration refuses a CR that
     /// still carries a deletionTimestamp, so re-ingestion has to wait for the drain
@@ -1879,6 +1887,28 @@ impl std::fmt::Display for ValidationState {
 pub const MAX_FIRMWARE_UPGRADE_RETRIES: u32 = 5;
 
 impl ManagedHostState {
+    /// Whether any DPU is waiting for DPF provisioning or handling its requested reboot.
+    /// Site Explorer must stay paused until every DPU leaves these states.
+    pub fn suppresses_exploration_for_dpf(&self) -> bool {
+        let active = |state: &DpfState| {
+            matches!(
+                state,
+                DpfState::WaitingForReady { .. } | DpfState::HandleReboot { .. }
+            )
+        };
+        match self {
+            Self::DPUInit { dpu_states } => dpu_states
+                .states
+                .values()
+                .any(|state| matches!(state, DpuInitState::DpfStates { state } if active(state))),
+            _ => self.dpu_reprovision_states().is_some_and(|states| {
+                states.states.values().any(|state| {
+                    matches!(state, ReprovisionState::DpfStates { substate } if active(substate))
+                })
+            }),
+        }
+    }
+
     /// Starts `Maintenance` with the requested operation and saves the full
     /// request so completion can check whether it is still pending.
     pub fn maintenance_for_request(request: MachineMaintenanceRequest) -> Self {
@@ -2804,7 +2834,10 @@ pub enum MachineMaintenanceOperation {
     /// Power on the host.
     PowerOn,
     /// Power off the host.
-    PowerOff,
+    PowerOff {
+        #[serde(default)]
+        graceful: bool,
+    },
     /// Reset the host (restart / AC power cycle).
     Reset,
     /// Reset the identified Redfish chassis through the host BMC.
@@ -2846,6 +2879,19 @@ pub struct UpgradeDecision {
     pub should_upgrade: bool,
     pub to_version: String,
     pub last_updated: DateTime<Utc>,
+}
+
+/// `DpuAgentUpgradeStatus` contains the persisted inputs to an agent upgrade decision.
+#[derive(Debug, sqlx::FromRow)]
+pub struct DpuAgentUpgradeStatus {
+    /// The DPU whose observation and upgrade decision were read.
+    pub id: DpuMachineId,
+    /// The version in the latest network observation, or `None` if unreported.
+    pub agent_version: Option<String>,
+    /// Whether an agent upgrade is requested; an absent decision means `false`.
+    pub upgrade_requested: bool,
+    /// Whether the attached host was ingested with DPF, which manages its upgrades.
+    pub host_dpf_used_for_ingestion: bool,
 }
 
 impl Display for DpuDiscoveringState {
@@ -4048,6 +4094,7 @@ mod tests {
                 spxconfig: Default::default(),
                 power_profile: None,
             },
+            nic_firmware_snapshot: None,
             config_version: ConfigVersion::initial(),
             network_config_version: ConfigVersion::initial(),
             ib_config_version: ConfigVersion::initial(),
@@ -5386,7 +5433,7 @@ mod tests {
                         reprovision_state: HostReprovisionState::CheckingFirmware,
                         retry_count: 0,
                     }),
-                    expect: (seconds(2_400), true),
+                    expect: (seconds(5_400), true),
                 },
                 Check {
                     scenario: "pre-assignment measurement collection uses the measurement SLA",

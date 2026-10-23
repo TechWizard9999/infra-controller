@@ -170,7 +170,7 @@ Open `helm-prereqs/values/nico-core.yaml` and update the following values:
   | `[pools.lo-ip]` ranges | Loopback IP range allocated to bare-metal hosts |
   | `[pools.vlan-id]` ranges | VLAN ID allocation range |
   | `[pools.vni]` ranges | VXLAN Network Identifier range |
-  | `[networks.admin]` | `type = "admin"`, an IPv4 `prefix` and `gateway` for DPU provisioning, `mtu`, and `reserve_first` |
+  | `[networks.admin]` | `type = "admin"`, `prefix`, `mtu`, and `reserve_first`; add `gateway` whenever an IPv4 prefix is present, including dual-stack definitions |
   | `[networks.<underlay>]` | Underlay data-plane network(s) — one block per L3 segment |
 
 All fields are documented with inline comments in the file.
@@ -178,9 +178,13 @@ All fields are documented with inline comments in the file.
 Define the site networks to create at startup using the
 [Initial Network Configuration](../provisioning/ip-and-network-configuration.md#initial-network-configuration)
 requirements. An IPv4 prefix requires a gateway; an IPv6-only definition can
-omit it. DPU provisioning requires an admin segment with an IPv4 prefix and
-gateway. Do not use empty strings for address fields. The `[pools.lo-ip]`,
-`[pools.vlan-id]`, and `[pools.vni]` ranges must be non-empty.
+omit it. IPv6-only admin networking requires a configured FNN site and compatible
+Core and DPU-agent builds as described in the linked guide. Retain IPv4 DPU
+loopback addresses and IPv4 VXLAN tunnel endpoints. These IPv4 requirements do
+not restrict the address families of physical underlay segments. Non-FNN admin
+networking requires an IPv4 prefix and gateway. Do not use empty strings for
+address fields. The `[pools.lo-ip]`, `[pools.vlan-id]`, and `[pools.vni]` ranges
+must be non-empty.
 
 <Tip>
 The following fields are safe to leave as empty arrays: `dhcp_servers` and `ntp_servers`. Keep required fields in the TOML block; optional network fields follow the initial network configuration requirements above.
@@ -442,6 +446,7 @@ You can combine common options as needed:
 |--------|--------|
 | `--core-values <file>` | Use site-specific NICo Core values for Phase 6. |
 | `--debug` | Enable shell tracing. This may print secrets, so protect the logs. |
+| `--flow-values <file>` | Use site-specific NICo Flow values for Phase 7h. Flow overrides made outside `setup.sh` are reset on every run unless they are in this file. |
 | `--install-contour` | Install the optional Contour/Envoy ingress controller in Phase 1d, for clusters that do not already provide one. Envoy's Service is `LoadBalancer` and takes its external IP from MetalLB. Same as `NICO_INSTALL_CONTOUR=true`; defaults to `false`. |
 | `--metallb-config <path>` | Use a site-specific MetalLB manifest file or kustomize directory. |
 | `--site-overlay <dir>` | Apply a site kustomize overlay after Phase 6. |
@@ -454,7 +459,7 @@ You can combine common options as needed:
 The `setup.sh` script installs all prerequisites and NICo components in sequential phases:
 
 When upgrading a deployment that previously bundled PSM and NSM, complete the
-[preserve-or-overwrite steps](../../helm-prereqs/README.md#upgrading-deployments-that-bundled-psm-and-nsm)
+[preserve-or-overwrite steps](https://github.com/dsx-ai-factory/infra-controller/blob/main/helm-prereqs/README.md#upgrading-deployments-that-bundled-psm-and-nsm)
 before continuing.
 
 <Anchor id="setup-script-phases"/>
@@ -473,7 +478,7 @@ before continuing.
 | 5b | DPF stack for DPU provisioning (default; `--skip-dpf` to opt out) |
 | 5c | RMS (Rack Management Service) (default; `--skip-rms` to opt out) |
 | 6 | **NICo Core** (nico helm release) |
-| 7a-7g | **NICo REST** base stack (source and CA setup, PostgreSQL, Keycloak, Temporal, REST services) |
+| 7a-7g | **NICo REST** base stack (source and CA setup, Keycloak, Temporal, REST services) |
 | 7h | **NICo Flow** |
 | 7i | **NICo REST site-agent** |
 
@@ -499,9 +504,9 @@ nico-prereqs               (this Helm chart - nico-system namespace)
 NICo Core                  (../helm - nico-core.yaml values)
 NICo REST                  (../helm/rest/nico-rest)
   ├── nico-rest-ca-issuer   (ClusterIssuer - cert-manager.io)
-  ├── postgres StatefulSet  (temporal + keycloak databases)
-  ├── keycloak              (dev OIDC IdP, nico-dev realm)
-  ├── temporal              (temporal-helm/temporal, mTLS)
+  ├── postgres StatefulSet  (deprecated standalone DB, only while Temporal or Keycloak uses it)
+  ├── keycloak              (dev OIDC IdP, nico realm, DB on nico-pg-cluster unless useHaPostgres resolves to false)
+  ├── temporal              (temporal-helm/temporal, mTLS, DB on nico-pg-cluster unless useHaPostgres resolves to false)
   └── nico-rest             (API, cert-manager, workflow, site-manager)
 NICo Flow                  (../helm/nico-flow)
 NICo REST site-agent       (../helm/rest/nico-rest-site-agent - StatefulSet, bootstrap via site-manager)
