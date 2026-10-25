@@ -22,7 +22,7 @@ pub mod remote;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use carbide_instrument::{Event, LabelValue, MetricFamily, emit};
 use config_version::ConfigVersion;
@@ -38,7 +38,6 @@ use model::resource_pool::{
     ResourcePoolSnapshot, ResourcePoolStats, ValueType,
 };
 use sqlx::{PgConnection, Postgres};
-use tokio::sync::oneshot;
 
 use super::BIND_LIMIT;
 use crate::config_drift::{ConfigDefinitionDrifted, ConfigDriftKind, ConfigResourceKind};
@@ -722,6 +721,9 @@ pub async fn all_stored_defs(
         .collect())
 }
 
+/// `all` returns local inventory bounds and counts, ordered by pool name.
+/// Pools do not need a saved backend binding to appear here. Address bounds
+/// omit the host prefix length; delegated IPv6 prefixes retain theirs.
 pub async fn all(txn: &mut PgConnection) -> Result<Vec<ResourcePoolSnapshot>, DatabaseError> {
     let mut out = Vec::with_capacity(4);
 
@@ -746,6 +748,8 @@ pub async fn all(txn: &mut PgConnection) -> Result<Vec<ResourcePoolSnapshot>, Da
                 FROM resource_pool WHERE value_type = 'integer' GROUP BY name
             ) snapshot";
 
+    // IPv4 and IPv6 addresses can share a pool, so group by name rather than
+    // value type. Prefix pools keep their length in the displayed bounds.
     let query_ip_address = "
             SELECT
                 name,
@@ -759,12 +763,18 @@ pub async fn all(txn: &mut PgConnection) -> Result<Vec<ResourcePoolSnapshot>, Da
                 (auto_assign_free + non_auto_assign_free) AS free
             FROM
             (
-                SELECT name, host(min(value::inet)) AS min, host(max(value::inet)) AS max,
+                SELECT name,
+                    CASE WHEN bool_and(value_type = 'ipv6prefix')
+                        THEN min(value::inet)::text
+                        ELSE host(min(value::inet)) END AS min,
+                    CASE WHEN bool_and(value_type = 'ipv6prefix')
+                        THEN max(value::inet)::text
+                        ELSE host(max(value::inet)) END AS max,
                     count(*) FILTER (WHERE state = '{\"state\": \"free\"}' AND auto_assign) AS auto_assign_free,
                     count(*) FILTER (WHERE state != '{\"state\": \"free\"}' AND auto_assign) AS auto_assign_used,
                     count(*) FILTER (WHERE state = '{\"state\": \"free\"}' AND NOT auto_assign) AS non_auto_assign_free,
                     count(*) FILTER (WHERE state != '{\"state\": \"free\"}' AND NOT auto_assign) AS non_auto_assign_used
-                FROM resource_pool WHERE value_type IN ('ipv4', 'ipv6') GROUP BY name
+                FROM resource_pool WHERE value_type IN ('ipv4', 'ipv6', 'ipv6prefix') GROUP BY name
             ) snapshot";
 
     for query in [query_int, query_ip_address] {
@@ -1519,15 +1529,12 @@ fn expand_int_range(start_s: &str, end_s: &str) -> Result<Vec<i64>, eyre::Report
     Ok((start..end).collect())
 }
 
-/// How often to update the resource pool metrics
-const METRICS_RESOURCEPOOL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-
+/// Build the shared pool handles after checking that mandatory pools have free values.
 pub async fn create_common_pools(
     db: sqlx::PgPool,
     ib_fabric_ids: HashSet<String>,
 ) -> eyre::Result<Arc<CommonPools>> {
     let mut pool_names = Vec::new();
-    let mut optional_pool_names = Vec::new();
 
     let pool_loopback_ip: Arc<ResourcePool<IpAddr>> =
         Arc::new(ResourcePool::new(LOOPBACK_IP.to_string(), ValueType::Ipv4));
@@ -1536,7 +1543,6 @@ pub async fn create_common_pools(
         LOOPBACK_IP_V6.to_string(),
         ValueType::Ipv6,
     ));
-    optional_pool_names.push(pool_loopback_ip_v6.name().to_string());
     let pool_vlan_id: Arc<ResourcePool<i16>> =
         Arc::new(ResourcePool::new(VLANID.to_string(), ValueType::Integer));
     pool_names.push(pool_vlan_id.name().to_string());
@@ -1548,24 +1554,19 @@ pub async fn create_common_pools(
     pool_names.push(pool_vpc_vni.name().to_string());
     let pool_fnn_asn: Arc<ResourcePool<u32>> =
         Arc::new(ResourcePool::new(FNN_ASN.to_string(), ValueType::Integer));
-    optional_pool_names.push(pool_fnn_asn.name().to_string());
 
     let pool_dpa_vni: Arc<ResourcePool<i32>> =
         Arc::new(ResourcePool::new(DPA_VNI.to_string(), ValueType::Integer));
-    optional_pool_names.push(pool_dpa_vni.name().to_string());
 
     let pool_vpc_dpu_loopback_ip: Arc<ResourcePool<IpAddr>> = Arc::new(ResourcePool::new(
         VPC_DPU_LOOPBACK.to_string(),
         ValueType::Ipv4,
     ));
-    //  TODO: This should be removed from optional once FNN become mandatory.
-    optional_pool_names.push(pool_vpc_dpu_loopback_ip.name().to_string());
 
     let pool_external_vpc_vni: Arc<ResourcePool<i32>> = Arc::new(ResourcePool::new(
         EXTERNAL_VPC_VNI.to_string(),
         ValueType::Integer,
     ));
-    optional_pool_names.push(pool_external_vpc_vni.name().to_string());
 
     // We can't run if any of the mandatory pools are missing
     for name in &pool_names {
@@ -1573,8 +1574,6 @@ pub async fn create_common_pools(
             eyre::bail!("resource pool '{name}' missing or full. edit config file and restart");
         }
     }
-
-    pool_names.extend(optional_pool_names);
 
     // It's ok for IB partition pools to be missing or full - as long as nobody tries to use partitions
     let pkey_pools: Arc<HashMap<String, ResourcePool<u16>>> = Arc::new(
@@ -1591,34 +1590,6 @@ pub async fn create_common_pools(
             })
             .collect(),
     );
-    pool_names.extend(pkey_pools.values().map(|pool| pool.name().to_string()));
-
-    // Gather resource pool stats. A different thread sends them to Prometheus.
-    let (stop_sender, mut stop_receiver) = oneshot::channel();
-    let pool_stats: Arc<Mutex<HashMap<String, ResourcePoolStats>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let pool_stats_bg = pool_stats.clone();
-    tokio::task::Builder::new()
-        .name("resource_pool metrics")
-        .spawn(async move {
-            loop {
-                let mut next_stats = HashMap::with_capacity(pool_names.len());
-                for name in &pool_names {
-                    if let Ok(st) = stats(&db, name).await {
-                        next_stats.insert(name.to_string(), st);
-                    }
-                }
-                *pool_stats_bg.lock().unwrap() = next_stats;
-
-                tokio::select! {
-                    _ = tokio::time::sleep(METRICS_RESOURCEPOOL_INTERVAL) => {},
-                    _ = &mut stop_receiver => {
-                        tracing::info!("CommonPool metrics stop was requested");
-                        return;
-                    }
-                }
-            }
-        })?;
 
     Ok(Arc::new(CommonPools {
         ethernet: EthernetPools {
@@ -1633,8 +1604,6 @@ pub async fn create_common_pools(
             pool_vpc_dpu_loopback_ip,
         },
         infiniband: IbPools { pkey_pools },
-        pool_stats,
-        _stop_sender: stop_sender,
     }))
 }
 
