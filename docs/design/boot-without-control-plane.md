@@ -256,9 +256,13 @@ Scope:
   must only call
   [`reset`](https://github.com/dsx-ai-factory/infra-controller/blob/main/crates/agent/src/ethernet_virtualization.rs#L1503)
   for the first condition.
-- For a designated DPU, never reset on an unreachable API, even after a long
-  outage. Deliver the designation to the DPU in the cloud-init agent
-  configuration written by
+- For a designated DPU, retain the last-known-good configuration across an
+  unreachable API up to a configurable maximum retention window (defaulting to
+  a bounded duration, e.g. 48 hours), resetting immediately if an explicit
+  `NotFound` response is received from `nico-api`. If the retention window
+  expires before the control plane recovers, the agent resets networking to
+  prevent indefinite ghost-node traffic. Deliver the designation and retention
+  policy to the DPU in the cloud-init agent configuration written by
   [`generate_forge_agent_config`](https://github.com/dsx-ai-factory/infra-controller/blob/main/crates/pxe/src/routes/cloud_init/dpu.rs#L77),
   so the agent can apply the rule before it reaches the API.
 - Confirm that the HBN configuration file `var/support/nvue_startup.yaml` and the
@@ -266,9 +270,10 @@ Scope:
   If they are not, the persistence from the first bullet must cover them.
 
 Safety note: the existing behaviour prevents a stale node from rejoining the
-network. The new behaviour must keep that protection for every machine that is
-not designated. Keep the retention bounded, and record the age of the applied
-configuration in the DPU health report.
+network. The new behaviour keeps that protection: non-designated machines reset
+immediately on the second blank fetch as they do today, while designated machines
+keep bounded retention and record the age of the applied configuration in the DPU
+health report.
 
 ### W5 — Make DNS answerable during a control-plane outage
 
@@ -360,7 +365,7 @@ configuration.
 | Q2 | Which W5 approach is selected? | Approach 1 is small and uses site infrastructure. Approaches 2 and 3 keep the answers inside NICo and are much larger. |
 | Q3 | Does the DPU keep `nvue_startup.yaml` across a reboot on every supported platform? | W4 is much smaller if the file is already persistent. |
 | Q4 | Which BMC vendors must support the static Redfish write at first delivery? | Redfish `EthernetInterface` write support is not uniform. The first delivery can be limited to the control-plane hardware. |
-| Q5 | How long may a DPU keep a stale HBN configuration when the API is unreachable? | An unbounded retention weakens the protection against a stale node. A short limit breaks a long cold start. |
+| Q5 | What is the default maximum retention window for a designated DPU? | Defines the boundary between cold-start recovery allowance (e.g. 24–48 hours) and stale ghost-node prevention upon prolonged disconnect. |
 | Q6 | Must a designated machine still accept a DHCP answer when the control plane returns? | This decides whether W6 is needed and how a network move is performed. |
 | Q7 | Does the host OS of a designated machine also need a static address? | The issue names the BMC and the DPU. A site-controller host usually gets its address from the parent datacenter. |
 
