@@ -414,7 +414,9 @@ flowchart TD
         LoadGood --> Fetch2["Fetch from nico-api"]
         Fetch2 -->|"Fetch OK"| PersistApply["Persist New Config + Apply"]
         Fetch2 -->|"NotFound (Deleted)"| Reset2["reset() (Delete config)"]
-        Fetch2 -->|"API Unreachable"| RetainGood["Keep Last-Good Config<br/>Apply It & Report Age in Health"]
+        Fetch2 -->|"API Unreachable"| WindowCheck{"Retention window expired?"}
+        WindowCheck -->|"No (Within window)"| RetainGood["Keep Last-Good Config<br/>Apply It & Report Age in Health"]
+        WindowCheck -->|"Yes (Expired)"| Reset2
         RetainGood --> Online2["Host Network Comes Up"]
     end
 ```
