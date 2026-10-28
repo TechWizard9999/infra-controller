@@ -182,6 +182,7 @@ async fn test_preingestion_set_ntp_servers_ipv6(
     let ip_addr = IpAddr::from_str(addr).unwrap();
     let mut txn = pool.begin().await.unwrap();
     common::insert_endpoint_version(&mut txn, addr, "6.00.30.00", "1.13.2", false).await?;
+    txn.commit().await?;
 
     let timepoint = redfish_sim.timepoint();
     mgr.run_single_iteration().await?;
