@@ -119,7 +119,7 @@ struct PreingestionManagerStatic {
     bfb_rshim_copier: Arc<BfbRshimCopier>,
     bfb_copy_state: Arc<BfbCopyManager>,
     bfb_copy_limiter: Arc<Semaphore>,
-    ntp_servers: Vec<Ipv4Addr>,
+    ntp_servers: Vec<IpAddr>,
     rack_firmware: Option<RackFirmwareDependencies>,
 
     // Bound individual requests; firmware jobs may outlive these deadlines.
@@ -150,7 +150,7 @@ impl PreingestionManager {
         upload_limiter: Option<Arc<Semaphore>>,
         credential_reader: Option<Arc<dyn CredentialReader>>,
         work_lock_manager_handle: WorkLockManagerHandle,
-        ntp_servers: Vec<Ipv4Addr>,
+        ntp_servers: Vec<IpAddr>,
     ) -> PreingestionManager {
         let hold_period = config
             .run_interval

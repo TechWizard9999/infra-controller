@@ -507,7 +507,7 @@ To configure these flows:
    reachable from bare-metal hosts. This list is informational and is passed
    through to agents; it does not change how `nico-dhcp` itself serves leases.
    May be left as `[]`.
-6. **Set `ntp_servers`** in `siteConfig` to your IPv4 NTP server IPs. NICo uses this list to configure BMC NTP through Redfish during pre-ingestion, includes it in `DiscoverDhcp` responses, and passes it to DPU agents for DHCPv4 option 42.
+6. **Set `ntp_servers`** in `siteConfig` to your NTP server IP addresses (IPv4 or IPv6). NICo uses this list to configure BMC NTP through Redfish during pre-ingestion, includes IPv4 entries in `DiscoverDhcp` responses, and passes both families to DPU agents for DHCP NTP options.
 
 The values that `nico-dhcp` returns in DHCP options (nameservers, NTP servers, next-server, boot file, etc.) are sourced from:
 
@@ -515,10 +515,10 @@ The values that `nico-dhcp` returns in DHCP options (nameservers, NTP servers, n
 - The Kea hook parameters in the `nico-dhcp` Helm chart (`nico-nameserver`, `nico-ntpserver`, etc.) — set these to the `unbound.nico` (or `unbound.nico`, see [section 3](#3-dns-configuration)) recursive resolver VIP. `nico-ntpserver` is used only as a fallback when `siteConfig.ntp_servers` is empty.
 - The per-segment definitions in `siteConfig` `[networks.<name>]` blocks — gateway, MTU, additional routes.
 
-The DPU-local DHCP server evaluates NTP precedence independently for each address family. Valid site-configured addresses replace service-discovered addresses only for the same family. When a family has no valid site-configured address, its service-discovered fallback is retained. Because `siteConfig.ntp_servers` accepts IPv4 addresses, it overrides DHCPv4 option 42 without suppressing service-discovered IPv6 servers advertised through DHCPv6 option 56.
+The DPU-local DHCP server evaluates NTP precedence independently for each address family. Valid site-configured addresses replace service-discovered addresses only for the same family. When a family has no valid site-configured address, its service-discovered fallback is retained. Site-configured IPv4 addresses override DHCPv4 option 42, and site-configured IPv6 addresses override DHCPv6 option 56 on the DPU-local DHCP server without suppressing unconfigured fallbacks.
 
 <Note>
-NICo does not run a standalone NTP service. Point `siteConfig.ntp_servers` to your enterprise IPv4 NTP servers. NICo also attempts to set those servers on host BMCs during pre-ingestion. If the Redfish operation fails repeatedly, pre-ingestion continues and the failure is logged.
+NICo does not run a standalone NTP service. Point `siteConfig.ntp_servers` to your enterprise NTP servers (IPv4 or IPv6). NICo also attempts to set those servers on host BMCs during pre-ingestion. If the Redfish operation fails repeatedly, pre-ingestion continues and the failure is logged.
 </Note>
 
 ### 2.3 How to Verify DHCP Is Working
