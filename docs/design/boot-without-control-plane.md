@@ -282,7 +282,11 @@ This item needs a design decision first. Three candidate approaches:
 1. **Static resolver configuration for designated machines.** Write the resolver
    addresses into the BMC with `StaticNameServers` (part of W2) and into the DPU
    OS (part of W3). Point them at an off-cluster resolver. This is the smallest
-   change, but it moves the dependency to site infrastructure.
+   change, but it moves the dependency to site infrastructure. It only works if
+   the off-cluster resolver answers the private `.forge` names itself, from zone
+   data that the site operator owns and keeps current. A recursive resolver that
+   forwards `.forge` queries to the in-cluster `nico-dns` still fails when the
+   cluster is down.
 2. **A positive cache in `nico-dns`.** Extend
    [`crates/dns/src/negative_cache.rs`](https://github.com/dsx-ai-factory/infra-controller/blob/main/crates/dns/src/negative_cache.rs)
    to a persistent snapshot of the zone, and serve it when `nico-api` is
@@ -292,8 +296,14 @@ This item needs a design decision first. Three candidate approaches:
    transfer support today. This is the largest change.
 
 Approach 1 is the recommended first step, because it removes the start
-dependency described in section 2.5 and needs no new DNS data path. Approaches 2
-and 3 should be tracked separately.
+dependency described in section 2.5 without changing how NICo serves DNS.
+Approach 1 does add a prerequisite. The `.forge` records are stored in NICo's
+resource-record table and served by `nico-api`, so the off-cluster resolver needs
+its own copy of those records. The site DNS operator owns that copy and updates
+it when `carbide-pxe.forge` or `carbide-ntp.forge` change. Before Approach 1 is
+relied on, the operator must confirm that the resolver answers those names
+without forwarding them to the cluster. Approaches 2 and 3 should be tracked
+separately.
 
 Independently of the choice, make the DPU agent start without DNS. Today
 [`ServiceAddresses::build`](https://github.com/dsx-ai-factory/infra-controller/blob/main/crates/agent/src/util.rs#L172)
@@ -362,7 +372,7 @@ configuration.
 | # | Question | Why it matters |
 |---|---|---|
 | Q1 | Is the designation a machine-level flag, or a fourth `ExpectedInterfaceIpAllocation` value? | A machine-level flag matches the words of the issue. A policy value reuses the existing per-interface validation. |
-| Q2 | Which W5 approach is selected? | Approach 1 is small and uses site infrastructure. Approaches 2 and 3 keep the answers inside NICo and are much larger. |
+| Q2 | Which W5 approach is selected? | Approach 1 is small, but it needs site-owned `.forge` records on an off-cluster resolver (section W5). Approaches 2 and 3 keep the answers inside NICo and are much larger. |
 | Q3 | Does the DPU keep `nvue_startup.yaml` across a reboot on every supported platform? | W4 is much smaller if the file is already persistent. |
 | Q4 | Which BMC vendors must support the static Redfish write at first delivery? | Redfish `EthernetInterface` write support is not uniform. The first delivery can be limited to the control-plane hardware. |
 | Q5 | What is the default maximum retention window for a designated DPU? | Defines the boundary between cold-start recovery allowance (e.g. 24–48 hours) and stale ghost-node prevention upon prolonged disconnect. |
