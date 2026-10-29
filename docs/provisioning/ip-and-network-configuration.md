@@ -507,12 +507,12 @@ To configure these flows:
    reachable from bare-metal hosts. This list is informational and is passed
    through to agents; it does not change how `nico-dhcp` itself serves leases.
    May be left as `[]`.
-6. **Set `ntp_servers`** in `siteConfig` to your NTP server IP addresses (IPv4 or IPv6). NICo uses this list to configure BMC NTP through Redfish during pre-ingestion, includes IPv4 entries in `DiscoverDhcp` responses, and passes both families to DPU agents for DHCP NTP options.
+6. **Set `ntp_servers`** in `siteConfig` to your NTP server IP addresses (IPv4 or IPv6). NICo uses this list to configure BMC NTP through Redfish during pre-ingestion, includes IPv4 entries in `DiscoverDhcp` responses, and passes both families to DPU agents for DHCP NTP options. NICo sends the list to BMCs in configured order, and some BMCs keep only the first entries (two on HPE iLO and AMI, three on Dell), so list the preferred servers first. Whether a BMC accepts an IPv6 NTP server depends on its firmware.
 
 The values that `nico-dhcp` returns in DHCP options (nameservers, NTP servers, next-server, boot file, etc.) are sourced from:
 
 - The `ntp_servers` list in `siteConfig` — its IPv4 entries are preferred for DHCP option 42.
-- The Kea hook parameters in the `nico-dhcp` Helm chart (`nico-nameserver`, `nico-ntpserver`, etc.) — set these to the `unbound.nico` (or `unbound.nico`, see [section 3](#3-dns-configuration)) recursive resolver VIP. `nico-ntpserver` is used only as a fallback when `siteConfig.ntp_servers` contains no IPv4 address.
+- The Kea hook parameters in the `nico-dhcp` Helm chart (`nico-nameservers`, `nico-ntpserver`, etc.). Set `nico-nameservers` (the chart's `nameservers` value) to the `unbound.nico` recursive resolver VIP (see [section 3](#3-dns-configuration)). Set `nico-ntpserver` (the chart's `ntpServer` value) to one or more reachable IPv4 NTP service addresses, such as the `nico-ntp` LoadBalancer VIPs or a site NTP server. `nico-ntpserver` is used only as a fallback when `siteConfig.ntp_servers` contains no IPv4 address.
 - The per-segment definitions in `siteConfig` `[networks.<name>]` blocks — gateway, MTU, additional routes.
 
 The DPU-local DHCP server evaluates NTP precedence independently for each address family. Valid site-configured addresses replace service-discovered addresses only for the same family. When a family has no valid site-configured address, its service-discovered fallback is retained. Site-configured IPv4 addresses override DHCPv4 option 42, and site-configured IPv6 addresses override DHCPv6 option 56 on the DPU-local DHCP server without suppressing unconfigured fallbacks.
