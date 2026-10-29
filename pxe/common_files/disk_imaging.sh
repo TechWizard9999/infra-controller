@@ -50,7 +50,7 @@ function curl_url() {
 	if [ -z "$file" ]; then
 		file=$(basename "${url%%\?*}")
 	fi
-	curl --retry 5 --retry-all-errors -k -L "$@" \
+	curl --fail --retry 5 --retry-all-errors -k -L "$@" \
 		--output "$file" "$url" 2>&1 | tee "$log_output"
 	return "${PIPESTATUS[0]}"
 }
@@ -220,7 +220,7 @@ function get_distro_image() {
 		echo "Distro $distro_name not supported" | tee $log_output
 		exit 1;
 	fi
-	curl --retry 5 --retry-all-errors -k -L $shaurl --output shafile 2>&1 | tee $log_output
+	curl --fail --retry 5 --retry-all-errors -k -L $shaurl --output shafile 2>&1 | tee $log_output
 	if [ "${PIPESTATUS[0]}" -ne 0 ]; then
 		echo "Failed to download checksum file from $shaurl" | tee "$log_output"
 		return 1
