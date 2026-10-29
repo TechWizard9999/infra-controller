@@ -101,6 +101,9 @@ const INITIAL_BMC_RESET_MAX_ATTEMPTS: u32 = 3;
 const SET_NTP_SERVERS_MAX_ATTEMPTS: u32 = 3;
 /// How long to wait for NTP servers to converge before checking time sync.
 const SET_NTP_SERVERS_CONVERGENCE_WAIT: chrono::TimeDelta = chrono::TimeDelta::minutes(1);
+/// How long after a BMC reset the host may fail to power on before the reset
+/// cycle is treated as failed. The clock starts when the BMC reset is recorded.
+const BMC_RESET_POWER_ON_TIMEOUT: chrono::TimeDelta = chrono::TimeDelta::minutes(30);
 
 pub struct PreingestionManager {
     static_info: Arc<PreingestionManagerStatic>,
@@ -1991,7 +1994,6 @@ impl PreingestionManagerStatic {
         &self,
         redfish_client: &dyn libredfish::Redfish,
         endpoint: &ExploredEndpoint,
-        last_time: Option<&DateTime<Utc>>,
     ) -> bool {
         if let Err(e) = redfish_client.get_tasks().await {
             tracing::info!(
@@ -2000,6 +2002,38 @@ impl PreingestionManagerStatic {
                 "Waiting for BMC reset to complete"
             );
             return false;
+        }
+
+        // A BlueField-3 left Paused by the earlier ForceOff ignores On, so restart it
+        // directly, as the machine controller does.
+        if endpoint.report.identify_dpu() == Some(DpuModel::BlueField3) {
+            match redfish_client.get_power_state().await {
+                Ok(PowerState::Paused) => {
+                    tracing::warn!(
+                        bmc_ip_address = %endpoint.address,
+                        "BlueField-3 is Paused after BMC reset; force-restarting it"
+                    );
+                    // Returning true advances to the boot wait, which decides whether the restart worked.
+                    return instrument_power_op(
+                        PowerOperation::ForceRestart,
+                        redfish_client.power(SystemPowerControl::ForceRestart),
+                        PowerControlLog::RecoverySequence {
+                            bmc_ip_address: endpoint.address,
+                        },
+                    )
+                    .await
+                    .is_ok();
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        bmc_ip_address = %endpoint.address,
+                        error = %e,
+                        "Could not get power state"
+                    );
+                    return false;
+                }
+            }
         }
 
         match instrument_power_op(
@@ -2027,27 +2061,6 @@ impl PreingestionManagerStatic {
                 return false;
             }
         };
-        // A BlueField-3 also reports Paused while booting, so only treat it as
-        // stuck in the UEFI shell once it stays Paused past the grace period.
-        if status == PowerState::Paused
-            && endpoint.report.identify_dpu() == Some(DpuModel::BlueField3)
-        {
-            if Utc::now().signed_duration_since(last_time.unwrap_or(&Utc::now()))
-                < chrono::TimeDelta::minutes(5)
-            {
-                return false;
-            }
-            // Returning true advances to the boot wait, which decides whether the restart worked.
-            return instrument_power_op(
-                PowerOperation::ForceRestart,
-                redfish_client.power(SystemPowerControl::ForceRestart),
-                PowerControlLog::RecoverySequence {
-                    bmc_ip_address: endpoint.address,
-                },
-            )
-            .await
-            .is_ok();
-        }
         if status != PowerState::On {
             tracing::warn!(
                 bmc_ip_address = %endpoint.address,
@@ -2126,13 +2139,16 @@ impl PreingestionManagerStatic {
             }
             InitialResetPhase::BMCWasReset => {
                 if !self
-                    .execute_wait_bmc_and_power_on(redfish_client.as_ref(), endpoint, last_time)
+                    .execute_wait_bmc_and_power_on(redfish_client.as_ref(), endpoint)
                     .await
                 {
-                    // A host that never powers on is terminal here; without this it would retry forever.
                     if Utc::now().signed_duration_since(last_time.unwrap_or(&Utc::now()))
-                        > chrono::TimeDelta::minutes(30)
+                        > BMC_RESET_POWER_ON_TIMEOUT
                     {
+                        tracing::warn!(
+                            bmc_ip_address = %endpoint.address,
+                            "Host did not power on within the BMC reset timeout; failing preingestion"
+                        );
                         db.with_txn(|txn| {
                             db::explored_endpoints::set_preingestion_failed(
                                 endpoint.address,
@@ -2176,6 +2192,14 @@ impl PreingestionManagerStatic {
                         return Ok(());
                     }
                 };
+                if matches!(power_state, PowerState::PoweringOn | PowerState::Reset) {
+                    tracing::trace!(
+                        bmc_ip_address = %endpoint.address,
+                        power_state = %power_state,
+                        "Host still powering on after restart; rechecking next iteration"
+                    );
+                    return Ok(());
+                }
                 if power_state != PowerState::On {
                     let reason =
                         "Host never reached On after restart during firmware pre-update reset";
@@ -2274,14 +2298,20 @@ impl PreingestionManagerStatic {
             }
             TimeSyncResetPhase::BMCWasReset => {
                 if !self
-                    .execute_wait_bmc_and_power_on(redfish_client.as_ref(), endpoint, last_time)
+                    .execute_wait_bmc_and_power_on(redfish_client.as_ref(), endpoint)
                     .await
                 {
                     // Count a host that never turns on as a failed cycle so the attempt budget applies.
                     if Utc::now().signed_duration_since(last_time.unwrap_or(&Utc::now()))
-                        > chrono::TimeDelta::minutes(30)
+                        > BMC_RESET_POWER_ON_TIMEOUT
                     {
                         let attempts_done = attempt + 1;
+                        tracing::warn!(
+                            bmc_ip_address = %endpoint.address,
+                            attempt = attempts_done,
+                            max_attempts = MAX_TIME_SYNC_RESET_ATTEMPTS,
+                            "Host did not power on within the BMC reset timeout"
+                        );
                         if attempts_done < MAX_TIME_SYNC_RESET_ATTEMPTS {
                             db.with_txn(|txn| {
                                 db::explored_endpoints::set_preingestion_time_sync_reset(

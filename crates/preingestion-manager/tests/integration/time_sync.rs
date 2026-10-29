@@ -52,18 +52,7 @@ async fn prepare_time_sync_endpoint(
     common::insert_endpoint_version(&mut txn, &response.address, "6.00.30.00", "1.13.2", false)
         .await?;
     if is_dpu {
-        sqlx::query(
-            "UPDATE explored_endpoints SET exploration_report = \
-             jsonb_set( \
-                 jsonb_set( \
-                     jsonb_set(exploration_report, '{Systems,0,Id}', to_jsonb('Bluefield'::text)), \
-                     '{Chassis,0,Id}', to_jsonb('Card1'::text)), \
-                 '{Chassis,0,Model}', to_jsonb('NVIDIA BlueField 3 DPU'::text)) \
-             WHERE address = $1",
-        )
-        .bind(ip_addr)
-        .execute(&mut *txn)
-        .await?;
+        common::mark_endpoint_bluefield3(&mut txn, ip_addr).await?;
     }
     db::explored_endpoints::set_preingestion_set_ntp_servers(ip_addr, None, 0, &mut txn).await?;
 
@@ -470,8 +459,7 @@ async fn test_preingestion_time_sync_reset_flow(
     Ok(())
 }
 
-/// A BlueField-3 can report Paused after ForceOff.
-/// A DPU in the UEFI shell also reports Paused, and On does not restart boot.
+/// A BlueField-3 can report Paused after ForceOff, and On does not resume it.
 /// The no-NTP recovery waits for the BMC reset, force-restarts the paused DPU,
 /// and completes the time-sync recovery.
 #[sqlx_test]
@@ -543,21 +531,6 @@ async fn test_preingestion_time_sync_reset_accepts_paused_power_state_for_dpu(
         "host must not power on while the BMC reset is still in progress"
     );
 
-    // Keep the timestamp past the restart grace period but inside the 30-minute
-    // reset-cycle timeout so a transient restart failure remains retryable.
-    let mut txn = pool.begin().await?;
-    let last_time = (chrono::Utc::now() - chrono::TimeDelta::minutes(10)).to_rfc3339();
-    sqlx::query(
-        "UPDATE explored_endpoints SET preingestion_state = \
-         jsonb_set(preingestion_state, '{last_time}', to_jsonb($2::text)) \
-         WHERE address = $1",
-    )
-    .bind(dpu_ip)
-    .bind(last_time)
-    .execute(&mut *txn)
-    .await?;
-    txn.commit().await?;
-
     // A failed restart must leave recovery retryable, not advance past Paused.
     redfish_sim.fail_next_power_action(
         SystemPowerControl::ForceRestart,
@@ -580,7 +553,7 @@ async fn test_preingestion_time_sync_reset_accepts_paused_power_state_for_dpu(
             ))
     );
 
-    // Retry On, then restart the still-paused DPU to resume boot.
+    // Retry the restart of the still-paused DPU to resume boot.
     mgr.run_single_iteration().await?;
     let state = preingestion_state(&pool, dpu_ip).await?;
     assert!(matches!(
@@ -601,15 +574,15 @@ async fn test_preingestion_time_sync_reset_accepts_paused_power_state_for_dpu(
         .iter()
         .position(|action| *action == RedfishSimAction::BmcReset(None))
         .expect("BMC should be reset");
-    let power_on = actions
-        .iter()
-        .position(|action| *action == RedfishSimAction::Power(SystemPowerControl::On))
-        .expect("DPU should be powered on after the BMC reset is ready");
     let restart = actions
         .iter()
         .position(|action| *action == RedfishSimAction::Power(SystemPowerControl::ForceRestart))
         .expect("paused DPU should be restarted after the BMC reset is ready");
-    assert!(power_off < bmc_reset && bmc_reset < power_on && power_on < restart);
+    assert!(power_off < bmc_reset && bmc_reset < restart);
+    assert!(
+        !actions.contains(&RedfishSimAction::Power(SystemPowerControl::On)),
+        "On is a no-op for a paused BlueField-3, so it must not be sent"
+    );
 
     let mut txn = pool.begin().await?;
     db::explored_endpoints::pregestion_hostboot_time_test(dpu_ip, &mut txn).await?;
@@ -790,9 +763,9 @@ async fn test_preingestion_time_sync_reset_retries_until_host_reaches_on(
     Ok(())
 }
 
-/// A paused BlueField-3 may be booting, so it is not restarted within the grace period.
+/// A paused BlueField-3 is force-restarted, without sending On, on the first ready poll.
 #[sqlx_test]
-async fn test_preingestion_time_sync_reset_waits_grace_before_restarting_paused_dpu(
+async fn test_preingestion_time_sync_reset_force_restarts_paused_dpu_on_first_ready_poll(
     pool: PgPool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let env = TestHarness::builder(pool.clone()).build().await;
@@ -832,23 +805,24 @@ async fn test_preingestion_time_sync_reset_waits_grace_before_restarting_paused_
     assert!(matches!(
         preingestion_state(&pool, dpu_ip).await?,
         PreingestionState::TimeSyncReset {
-            phase: TimeSyncResetPhase::BMCWasReset,
+            phase: TimeSyncResetPhase::WaitHostBoot,
             ..
         }
     ));
     let actions = redfish_sim
         .actions_since(&timepoint)
         .for_host(&dpu_ip.to_string());
-    assert!(actions.contains(&RedfishSimAction::Power(SystemPowerControl::On)));
+    assert!(actions.contains(&RedfishSimAction::Power(SystemPowerControl::ForceRestart)));
     assert!(
-        !actions.contains(&RedfishSimAction::Power(SystemPowerControl::ForceRestart)),
-        "a paused DPU must not be restarted within the grace period"
+        !actions.contains(&RedfishSimAction::Power(SystemPowerControl::On)),
+        "On is a no-op for a paused BlueField-3, so it must not be sent"
     );
 
     Ok(())
 }
 
-/// A host that never powers on is retried as a failed cycle after 30 minutes.
+/// A host that never powers on within 30 minutes of the BMC reset counts as a
+/// failed cycle: it is retried until the attempt budget is spent, then fails.
 #[sqlx_test]
 async fn test_preingestion_time_sync_reset_counts_host_power_on_timeout_as_attempt(
     pool: PgPool,
@@ -874,29 +848,51 @@ async fn test_preingestion_time_sync_reset_counts_host_power_on_timeout_as_attem
         env.api().work_lock_manager_handle(),
         config.ntp_servers,
     );
-    let dpu_ip = prepare_time_sync_endpoint(
+    let host_ip = prepare_time_sync_endpoint(
         &env,
         &pool,
         underlay_segment.relay_address,
         "b8:3f:d2:90:97:a9",
-        true,
+        false,
     )
     .await?;
 
-    mgr.run_single_iteration().await?;
-    let mut txn = pool.begin().await?;
-    db::explored_endpoints::pregestion_hostboot_time_test(dpu_ip, &mut txn).await?;
-    txn.commit().await?;
-    mgr.run_single_iteration().await?;
+    for attempt in 0_u32..3 {
+        mgr.run_single_iteration().await?;
+        assert!(matches!(
+            preingestion_state(&pool, host_ip).await?,
+            PreingestionState::TimeSyncReset {
+                phase: TimeSyncResetPhase::BMCWasReset,
+                attempt: current_attempt,
+                ..
+            } if current_attempt == attempt
+        ));
 
-    assert!(matches!(
-        preingestion_state(&pool, dpu_ip).await?,
-        PreingestionState::TimeSyncReset {
-            phase: TimeSyncResetPhase::Start,
-            attempt: 1,
-            ..
+        let mut txn = pool.begin().await?;
+        db::explored_endpoints::pregestion_hostboot_time_test(host_ip, &mut txn).await?;
+        txn.commit().await?;
+        mgr.run_single_iteration().await?;
+
+        let state = preingestion_state(&pool, host_ip).await?;
+        if attempt < 2 {
+            assert!(matches!(
+                state,
+                PreingestionState::TimeSyncReset {
+                    phase: TimeSyncResetPhase::Start,
+                    attempt: next_attempt,
+                    ..
+                } if next_attempt == attempt + 1
+            ));
+        } else {
+            match state {
+                PreingestionState::Failed { reason } => assert_eq!(
+                    reason,
+                    "Host did not power on after BMC reset in 3 attempts"
+                ),
+                other => panic!("expected Failed after exhausting attempts, got: {other:?}"),
+            }
         }
-    ));
+    }
 
     Ok(())
 }
