@@ -1272,6 +1272,7 @@ func TestRunGeneratedTUICommand(t *testing.T) {
 		{name: "resource selectors", run: testRunGeneratedTUICommand_ResourceSelectors},
 		{name: "registered Sites", run: testRunGeneratedTUICommand_RegisteredSites},
 		{name: "expected machine SKU Site", run: testRunGeneratedTUICommandExpectedMachineSKU},
+		{name: "domain body Site", run: testRunGeneratedTUICommand_DomainBodyScope},
 	} {
 		t.Run(test.name, test.run)
 	}

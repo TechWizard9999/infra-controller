@@ -375,7 +375,11 @@ func persistGeneratedSiteScopeFromArgs(
 		if GeneratedPathResourceDescriptor(info.Name, parameter).ScopeParameter != "siteId" {
 			continue
 		}
-		out, err := materializeGeneratedDataFile(info, args)
+		// Stdin stays usable when no scope is active, because nothing else
+		// then needs to merge into the body.
+		allowStdin := strings.TrimSpace(s.Scope.SiteID) == "" &&
+			strings.TrimSpace(s.Scope.VpcID) == ""
+		out, err := materializeGeneratedDataFile(info, args, allowStdin)
 		if err != nil {
 			return nil, err
 		}
@@ -417,7 +421,7 @@ func generatedCommandRequiresSiteScope(
 ) bool {
 	resource, _, _ := strings.Cut(info.Name, " ")
 	switch resource {
-	case "rack", "rule", "task-run", "tray":
+	case "domain", "rack", "rule", "task-run", "tray":
 		// Guided forms and scalar body flags need a persisted scope so their
 		// resource selectors use the correct Site. Opaque JSON already
 		// carries its own siteId and remains an explicit escape hatch unless
@@ -676,7 +680,7 @@ func addGeneratedScopeFlags(s *Session, info appcli.GeneratedCommandInfo, args [
 		}
 		if hasGeneratedOption(info, out, "data-file") {
 			var err error
-			out, err = materializeGeneratedDataFile(info, out)
+			out, err = materializeGeneratedDataFile(info, out, false)
 			if err != nil {
 				return nil, err
 			}
@@ -714,7 +718,7 @@ func generatedBodyField(info appcli.GeneratedCommandInfo, flagName string) (appc
 	return appcli.GeneratedCommandBodyField{}, false
 }
 
-func materializeGeneratedDataFile(info appcli.GeneratedCommandInfo, args []string) ([]string, error) {
+func materializeGeneratedDataFile(info appcli.GeneratedCommandInfo, args []string, allowStdin bool) ([]string, error) {
 	out := append([]string(nil), args...)
 	for _, option := range generatedArgumentOptions(info, out) {
 		if option.name != "data-file" {
@@ -723,7 +727,7 @@ func materializeGeneratedDataFile(info appcli.GeneratedCommandInfo, args []strin
 		if option.value == "" {
 			return nil, fmt.Errorf("option --data-file requires a path")
 		}
-		if option.value == "-" {
+		if option.value == "-" && !allowStdin {
 			return nil, fmt.Errorf("--data-file - cannot be combined with active site or VPC scope in interactive mode; use the hidden JSON prompt or --data")
 		}
 		body, err := appcli.ReadBodyInput("", option.value)

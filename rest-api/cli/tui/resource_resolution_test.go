@@ -348,7 +348,8 @@ func testRunGeneratedTUICommand_ResourceSelectors(t *testing.T) {
 	}
 }
 
-func TestRunGeneratedTUICommand_DomainBodyScope(t *testing.T) {
+func testRunGeneratedTUICommand_DomainBodyScope(t *testing.T) {
+	t.Helper()
 	const siteID = "550e8400-e29b-41d4-a716-446655440000"
 	const body = `{"siteId":"550e8400-e29b-41d4-a716-446655440000","state":"On"}`
 	for _, test := range []struct {
@@ -356,7 +357,11 @@ func TestRunGeneratedTUICommand_DomainBodyScope(t *testing.T) {
 		args      []string
 		scope     string
 		fileBody  string
+		stdin     string
+		sites     []NamedItem
 		wantError string
+		// wantRequests lists requests made before a wantError stops the run.
+		wantRequests []string
 	}{
 		{
 			name: "JSON supplies site without selected scope",
@@ -380,6 +385,21 @@ func TestRunGeneratedTUICommand_DomainBodyScope(t *testing.T) {
 			name:  "selected scope remains the fallback",
 			args:  []string{"--state", "On", "Domain-A"},
 			scope: siteID,
+		},
+		{
+			name:  "missing scope prompts for site before domain lookup",
+			args:  []string{"--state", "On", "Domain-A"},
+			sites: []NamedItem{{ID: siteID}},
+		},
+		{
+			// Stdin carries the whole body, so the confirmation prompt then
+			// reads EOF and cancels. Reaching it after the Site lookup shows
+			// the body was read and scoped instead of rejected up front.
+			name:         "stdin body is read without active scope",
+			args:         []string{"--data-file", "-", "Domain-A"},
+			stdin:        body,
+			wantError:    "input cancelled",
+			wantRequests: []string{"GET /v2/org/acme/nico/domain/nvlink"},
 		},
 		{
 			name:      "invalid body site prevents lookup",
@@ -412,19 +432,27 @@ func TestRunGeneratedTUICommand_DomainBodyScope(t *testing.T) {
 			defer server.Close()
 			session := NewSession(appcli.NewClient(server.URL, "acme", "token", nil, false), "acme", "")
 			session.Scope.SiteID = test.scope
-			session.Cache.Set("site", []NamedItem{{ID: siteID}, {ID: "old-site"}})
+			sites := test.sites
+			if sites == nil {
+				sites = []NamedItem{{ID: siteID}, {ID: "old-site"}}
+			}
+			session.Cache.Set("site", sites)
 			args := test.args
 			if test.fileBody != "" {
 				path := filepath.Join(t.TempDir(), "request.json")
 				require.NoError(t, os.WriteFile(path, []byte(test.fileBody), 0600))
 				args = []string{"--data-file", path, "Domain-A"}
 			}
-			_, err := runSpecializedCommandWithInput(t, "y\n", func() error {
+			input := "y\n"
+			if test.stdin != "" {
+				input = test.stdin
+			}
+			_, err := runSpecializedCommandWithInput(t, input, func() error {
 				return requireTUICommand(t, "domain power-control power-control-nvlink-domain").Run(session, args)
 			})
 			if test.wantError != "" {
 				require.ErrorContains(t, err, test.wantError)
-				assert.Empty(t, requests)
+				assert.Equal(t, test.wantRequests, requests)
 				return
 			}
 			require.NoError(t, err)

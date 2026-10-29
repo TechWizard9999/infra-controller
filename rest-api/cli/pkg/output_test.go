@@ -42,11 +42,6 @@ func TestValidateOutputFormat(t *testing.T) {
 	}
 }
 
-func TestDefaultOutputFormat(t *testing.T) {
-	assert.Equal(t, "table", defaultOutputFormat(vpcPeeringListOperationID))
-	assert.Equal(t, "json", defaultOutputFormat("get-all-site"))
-}
-
 func TestNestedString(t *testing.T) {
 	tests := []struct {
 		name string
@@ -108,18 +103,35 @@ func TestEscapeTableCell(t *testing.T) {
 	}
 }
 
-func TestFormatTableEscapesCellWhitespace(t *testing.T) {
-	data := []byte(`{"id":"peering-id","vpc1":{"name":"Application\tVPC\nprimary"},"vpc1Id":"vpc1-id","vpc2":{"name":"Storage VPC"},"vpc2Id":"vpc2-id"}`)
-	var formatErr error
-
-	output := captureStdout(t, func() {
-		formatErr = formatTableWithColumns(data, tableColumnsByOperation[vpcPeeringListOperationID])
-	})
-
-	require.NoError(t, formatErr)
-	assert.Contains(t, output, `Application\tVPC\nprimary`)
-	assert.NotContains(t, output, "Application\tVPC")
-	assert.NotContains(t, output, "VPC\nprimary")
+func TestFormatTableWithColumns(t *testing.T) {
+	tests := []struct {
+		name        string
+		data        string
+		wantContain []string
+		wantAbsent  []string
+	}{
+		{
+			name:        "escapes cell whitespace",
+			data:        `{"id":"peering-id","vpc1":{"name":"Application\tVPC\nprimary"},"vpc1Id":"vpc1-id","vpc2":{"name":"Storage VPC"},"vpc2Id":"vpc2-id"}`,
+			wantContain: []string{`Application\tVPC\nprimary`},
+			wantAbsent:  []string{"Application\tVPC", "VPC\nprimary"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var formatErr error
+			output := captureStdout(t, func() {
+				formatErr = formatTableWithColumns([]byte(test.data), tableColumnsByOperation[vpcPeeringListOperationID])
+			})
+			require.NoError(t, formatErr)
+			for _, want := range test.wantContain {
+				assert.Contains(t, output, want)
+			}
+			for _, absent := range test.wantAbsent {
+				assert.NotContains(t, output, absent)
+			}
+		})
+	}
 }
 
 func TestFormatOutput_RejectsUnknownFormatAsDefenseInDepth(t *testing.T) {

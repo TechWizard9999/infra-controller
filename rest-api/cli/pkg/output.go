@@ -46,7 +46,7 @@ func defaultOutputFormat(operationID string) string {
 }
 
 // ValidateOutputFormat returns an error if format is outside the allowed set.
-// The empty string is treated as valid so the StringFlag default ("json") and
+// The empty string is treated as valid so the StringFlag default and
 // callers that pass an unset value continue to work.
 //
 // Without this validator, FormatOutput silently routed any unknown value to
