@@ -221,10 +221,21 @@ NICo also reads the BMC `EthernetInterfaces` collection during exploration. See
 and
 [`get_manager_ethernet_interface`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/crates/redfish/src/libredfish/instrumented.rs#L351).
 
-No NICo code writes `IPv4StaticAddresses`, `DHCPv4.DHCPEnabled` or
-`StaticNameServers`. The read path and the state machine hook both exist, so the
-new write path can reuse them. Because the write methods belong to `libredfish`,
-adding them needs a `libredfish` release and a tag bump in `Cargo.toml`.
+NICo writes `IPv4StaticAddresses` in one place only: the GB200 repair of the
+BMC-to-host interface `hostusb0`
+([`ensure_gb200_host_interface_static_ipv4`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/crates/redfish/src/libredfish/host_interface.rs#L116),
+called from the machine controller in
+[`gb200_host_interface.rs`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/crates/machine-controller/src/handler/gb200_host_interface.rs#L54)).
+It writes the fixed address `10.0.1.1/24` for the host link, not a management
+address. It sends a raw `PATCH` through the `libredfish` HTTP client with an
+`If-Match` ETag, and it reads the resource again to verify the change. No NICo code writes
+`DHCPv4.DHCPEnabled` or `StaticNameServers`, and no code writes a static
+management address into a BMC.
+
+The read path, the state machine hook and the raw `PATCH` pattern all exist, so
+the new write path can reuse them. A new write method can follow the GB200 raw
+`PATCH` pattern inside `crates/redfish`, or it can be a typed method in
+`libredfish`, which needs a `libredfish` release and a tag bump in `Cargo.toml`.
 
 ---
 
@@ -241,23 +252,26 @@ says that new per-host knobs go there and not into new flat columns
 ([`expected_machine.rs`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/crates/api-model/src/expected_machine.rs#L1010-L1014)).
 The designation needs no migration.
 
-That pull request also validates the designation on insert: it rejects a
-`control-plane` machine whose Host BMC, DPU BMC or DPU OS interface resolves to
-`Dynamic`. This describes the diff of that pull request as reviewed. The code was not run.
+That pull request also validates the designation: it rejects a `control-plane`
+machine whose Host BMC, DPU BMC or DPU OS interface resolves to `Dynamic`. The
+check uses `resolved_ip_allocation`, so it also rejects an omitted policy that
+resolves to `Dynamic`. This describes the diff of that pull request at head
+`b45626854f0d61328523939f4403085b7dedb3ab`. The code was not run.
 
 W1 work that remains after that pull request, if the merged code leaves it open:
 
-- Validation must resolve an omitted `ip_allocation`. With the field omitted,
-  a DPU BMC or DPU OS interface resolves to `Dynamic` unless it has a `fixed_ip`
+- Keep the omitted-policy rejection. With the field omitted, a DPU BMC or DPU OS
+  interface resolves to `Dynamic` unless it has a `fixed_ip`
   ([`resolved_ip_allocation`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/crates/api-model/src/expected_machine.rs#L528),
   field documentation at
   [`#L383-L387`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/crates/api-model/src/expected_machine.rs#L383-L387)).
-  An omitted policy on those roles must therefore be rejected for a
+  An omitted policy on those roles must therefore stay rejected for a
   `control-plane` machine.
-- Validation must also require that the declaration exists. A `control-plane`
-  machine needs a declared `HostBmc`, `DpuBmc` and `DpuOs` interface, each with a
-  `Fixed` or `Retained` policy, because W2 and W3 need an address to push for
-  each of them. The reviewed diff checks only the interfaces that are declared.
+- Validation must also require that the DPU declarations exist. A
+  `control-plane` machine needs a declared `DpuBmc` and `DpuOs` interface, each
+  with a `Fixed` or `Retained` policy, because W2 and W3 need an address to push
+  for each of them. The reviewed diff checks the Host BMC through
+  `effective_host_bmc`, but it checks only the DPU interfaces that are declared.
   It does not require a DPU declaration to exist.
 
 ### W2 — Write a static address into the host BMC and the DPU BMC ([#7570](https://github.com/dsx-ai-factory/infra-controller/issues/7570))
@@ -271,9 +285,10 @@ Scope:
   [`set_ntp_servers`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/crates/redfish/src/libredfish/instrumented.rs#L396):
   set `DHCPv4.DHCPEnabled = false`, set `IPv4StaticAddresses`, set
   `StaticNameServers`, and the matching IPv6 properties. Add a read-back method
-  for verification, and a method that restores DHCP. These methods belong to the
-  external `libredfish` crate, so this item includes a `libredfish` release and a
-  version bump.
+  for verification, and a method that restores DHCP. Section 2.6 lists the two
+  places these methods can live: a raw `PATCH` in `crates/redfish`, as the GB200
+  `hostusb0` repair does, or typed methods in `libredfish` with a release and a
+  tag bump.
 - A vendor compatibility layer in
   [`crates/bmc-vendor`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/crates/bmc-vendor).
   Redfish `EthernetInterface` support is not uniform across BMC vendors.
@@ -411,16 +426,21 @@ values, and a site may serve them from its own DNS instead (see
 and [DNS service endpoints](../configuration/dns-service-endpoints.md)).
 For a designated machine, the static resolver must be a server outside the NICo
 cluster. It must answer every `.forge` name that the deployed agent queries
-without forwarding it to the in-cluster `unbound` VIP or to `nico-dns`. That is at
-least:
+without forwarding it to the in-cluster `unbound` VIP or to `nico-dns`. The
+complete list of `.forge` names is the table in
+[DPU compatibility DNS](../../helm-prereqs/README.md#dpu-compatibility-dns-forge-zone--required-for-dpu-bring-up);
+the off-cluster resolver should serve all of them. The agent needs these names to
+start or to serve the host:
 
 - `carbide-pxe.forge`, which the agent needs at start;
 - `carbide-ntp.forge`;
 - `carbide-api.forge`, the agent's default API endpoint
   ([`agent_config.rs#L33`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/crates/host-support/src/agent_config.rs#L33)).
 
-The site DNS operator owns these records and keeps them equal to the service VIPs
-in the NICo Helm values. Approaches 2 and 3 should be tracked separately.
+The other names in that table, for example `socks.forge` for DPU extension
+services, are not on the HBN start path. The site DNS operator owns these records
+and keeps them equal to the service VIPs in the NICo Helm values. Approaches 2
+and 3 should be tracked separately.
 
 Independently of the choice, make the DPU agent start without the PXE lookup.
 [`ServiceAddresses::build`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/crates/agent/src/util.rs#L172)
@@ -468,8 +488,8 @@ configuration.
 | PXE cloud-init | [`crates/pxe/src/routes/cloud_init/dpu.rs`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/crates/pxe/src/routes/cloud_init/dpu.rs#L94) | OOB address and designation in the template context |
 | PXE template | [`pxe/templates/user-data`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/pxe/templates/user-data#L345-L358) | Persistent OOB interface configuration; skip "Fix 6" for designated DPUs, if that option is chosen |
 | BlueField config | [`crates/api/files/bf.cfg`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/crates/api/files/bf.cfg#L504-L516) | The same "Fix 6" change, if that option is chosen |
-| Redfish | [`crates/redfish/src/libredfish/instrumented.rs`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/crates/redfish/src/libredfish/instrumented.rs#L396) | Delegation entries for the new write methods |
-| libredfish | External crate, tag set in [`Cargo.toml`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/Cargo.toml#L30) | New static address, resolver and DHCP-disable write methods need a `libredfish` release and a tag bump |
+| Redfish | [`crates/redfish/src/libredfish/instrumented.rs`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/crates/redfish/src/libredfish/instrumented.rs#L396) | The new write methods, as a raw `PATCH` beside `host_interface.rs` or as delegation entries for typed `libredfish` methods |
+| libredfish (optional) | External crate, tag set in [`Cargo.toml`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/Cargo.toml#L30) | Only if the write methods are typed `libredfish` methods instead of a raw `PATCH` in `crates/redfish` (section 2.6): a `libredfish` release and a tag bump |
 | BMC vendors | [`crates/bmc-vendor`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/crates/bmc-vendor) | Per-vendor property differences |
 | Pre-ingestion | [`crates/preingestion-manager/src/lib.rs`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/crates/preingestion-manager/src/lib.rs#L420) | New state that writes the static BMC configuration |
 | Address lifecycle | [`crates/api-core/src/handlers/machine_interface_address.rs`](https://github.com/dsx-ai-factory/infra-controller/blob/5207e5a672b53c253d0428d12df080200b77bb7e/crates/api-core/src/handlers/machine_interface_address.rs#L305) | Re-push on an address change |
@@ -503,8 +523,9 @@ implemented:
   need, and do not persist `instance` or its `user_data`. If a field of `instance`
   is needed later, list it explicitly.
 - **File permissions.** Write the file atomically, owned by root, with mode
-  `0600`, in a root-only directory on persistent DPU storage. The code does not
-  fix such a location or mode yet, so the implementation must choose and test them.
+  `0600`, in a root-only directory on persistent DPU storage. The code at the
+  pinned commit defines no such location or mode, so the implementation must
+  choose and test them.
 - **Removal.** Delete the persisted configuration when the API answers
   `NotFound`, and when the retention window expires.
 - **Stale tenant configuration.** If the host is reassigned to another tenant
