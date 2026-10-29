@@ -21,6 +21,9 @@ mod errors;
 mod metrics;
 mod rack_firmware;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 use std::collections::HashMap;
 use std::default::Default;
 use std::io;
@@ -30,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use carbide_firmware::{
-    FirmwareConfigSnapshot, FirmwareDownloader, ResolvedFirmwareArtifactSource,
+    ArtifactStatus, FirmwareConfigSnapshot, FirmwareDownloader, ResolvedFirmwareArtifactSource,
     resolve_files_firmware_artifact,
 };
 use carbide_instrument::emit;
@@ -118,6 +121,10 @@ struct PreingestionManagerStatic {
     bfb_copy_limiter: Arc<Semaphore>,
     ntp_servers: Vec<Ipv4Addr>,
     rack_firmware: Option<RackFirmwareDependencies>,
+
+    // Bound individual requests; firmware jobs may outlive these deadlines.
+    rack_firmware_submission_timeout: Duration,
+    rack_firmware_status_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -166,6 +173,8 @@ impl PreingestionManager {
                 bfb_copy_limiter: Arc::new(Semaphore::new(config.max_concurrent_bfb_copies)),
                 ntp_servers,
                 rack_firmware: None,
+                rack_firmware_submission_timeout: Duration::from_secs(60),
+                rack_firmware_status_timeout: Duration::from_secs(30),
                 config,
             }),
             metric_holder,
@@ -3321,15 +3330,32 @@ impl PreingestionManagerStatic {
         if !is_bfb_artifact(&artifact.local_path) {
             match &artifact.source {
                 ResolvedFirmwareArtifactSource::Remote { url, sha256 } => {
-                    if !self.downloader.available(&artifact.local_path, url, sha256) {
-                        tracing::debug!(
-                            bmc_ip_address = %endpoint_clone.address,
-                            path = %artifact.local_path.display(),
-                            %url,
-                            "Firmware artifact is being downloaded; update deferred"
-                        );
-
-                        return Ok(false);
+                    match self
+                        .downloader
+                        .available(&artifact.local_path, url, sha256)
+                        .await
+                    {
+                        ArtifactStatus::Available => {}
+                        ArtifactStatus::Downloading => {
+                            tracing::debug!(
+                                bmc_ip_address = %endpoint_clone.address,
+                                path = %artifact.local_path.display(),
+                                "Waiting for firmware artifact availability; update deferred"
+                            );
+                            return Ok(false);
+                        }
+                        // PreingestionState::Failed needs a force delete to leave, so a
+                        // download failure stays retryable: the next call to `available`
+                        // starts a new attempt.
+                        ArtifactStatus::Failed { error } => {
+                            tracing::warn!(
+                                bmc_ip_address = %endpoint_clone.address,
+                                path = %artifact.local_path.display(),
+                                %error,
+                                "Firmware artifact download failed; update deferred"
+                            );
+                            return Ok(false);
+                        }
                     }
                 }
                 ResolvedFirmwareArtifactSource::Local => {

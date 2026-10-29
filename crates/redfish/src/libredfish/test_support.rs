@@ -69,6 +69,7 @@ struct RedfishSimState {
     next_power_state_error: Option<String>,
     /// Fail the next matching power action before changing the host's power.
     next_power_action_error: Option<(SystemPowerControl, String)>,
+    next_chassis_reset_error: Option<RedfishError>,
     job_state_sequence: VecDeque<JobState>,
     /// Offset (in seconds) applied to the BMC `DateTime` returned by
     /// `get_manager`, relative to the controller's `Utc::now()`. Defaults to 0
@@ -106,9 +107,11 @@ struct RedfishSimState {
     machine_setup_status_targets: HashMap<String, Vec<Option<RedfishSimBootInterfaceRef>>>,
     /// Opt-in authentication enforcement. Off by default so existing tests
     /// (which pass arbitrary or anonymous credentials) are undisturbed. When on,
-    /// `get_accounts` returns `401` unless the client was created with a
-    /// `Direct` credential whose password matches the seeded `users` entry, so
-    /// credential-probe paths (e.g. `bmc_credentials_valid`) can be exercised.
+    /// `get_accounts`, `change_password`, `change_password_by_id`,
+    /// `get_systems`, and `get_power_state` return `401` unless the client was
+    /// created with a `Direct` credential whose password matches the seeded
+    /// `users` entry. This makes credential selection and rejection observable
+    /// in callers such as `bmc_credentials_valid`.
     enforce_auth: bool,
     auth_attempts: Vec<RedfishSimAuthAttempt>,
     /// When set, `get_accounts` fails with a non-authentication transport error
@@ -439,6 +442,11 @@ impl RedfishSim {
         self.state.lock().unwrap().next_power_action_error = Some((action, error.to_string()));
     }
 
+    /// Fail one chassis reset with the supplied error, recording the attempt.
+    pub fn fail_next_chassis_reset(&self, error: RedfishError) {
+        self.state.lock().unwrap().next_chassis_reset_error = Some(error);
+    }
+
     /// Set the offset (in seconds) applied to the BMC `DateTime` returned by
     /// `get_manager`, relative to the controller clock. Use a value larger than
     /// the time-sync threshold to simulate an out-of-sync BMC clock.
@@ -487,8 +495,9 @@ impl RedfishSim {
     }
 
     /// Enable opt-in authentication enforcement (see [`RedfishSimState::enforce_auth`]):
-    /// once on, `get_accounts` authorizes against the seeded `users` map, so
-    /// credential-probe paths can distinguish valid from rejected credentials.
+    /// `get_accounts`, `change_password`, `change_password_by_id`,
+    /// `get_systems`, and `get_power_state` authorize against the seeded `users`
+    /// map, so callers can distinguish valid from rejected credentials.
     pub fn set_enforce_auth(&self, enforce: bool) {
         self.state.lock().unwrap().enforce_auth = enforce;
     }
@@ -664,10 +673,22 @@ pub struct RedfishSimTimepoint {
 /// Platform-configuration calls recorded separately from power actions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RedfishSimPlatformAction {
-    SetHostRshim { host: String },
-    SetHostPrivilegeLevel { host: String },
-    IsBiosSetup { host: String },
-    UefiSetup { dpu: bool },
+    SetHostRshim {
+        host: String,
+    },
+    SetIdracLockdown {
+        host: String,
+        enabled: EnabledDisabled,
+    },
+    SetHostPrivilegeLevel {
+        host: String,
+    },
+    IsBiosSetup {
+        host: String,
+    },
+    UefiSetup {
+        dpu: bool,
+    },
 }
 
 /// Owned form of the boot-interface reference observed by the Redfish
@@ -824,6 +845,7 @@ impl Redfish for RedfishSimClient {
     ) -> libredfish::RedfishFuture<'a, Result<libredfish::PowerState, RedfishError>> {
         Box::pin(async move {
             let mut state = self.state.lock().unwrap();
+            self.authorize(&mut state, "Systems/System.Embedded.1")?;
             if let Some(error) = state.next_power_state_error.take() {
                 return Err(RedfishError::GenericError { error });
             }
@@ -2081,6 +2103,9 @@ impl Redfish for RedfishSimClient {
                 chassis_id: chassis_id.to_string(),
                 reset_type,
             });
+            if let Some(error) = state.next_chassis_reset_error.take() {
+                return Err(error);
+            }
             Ok(())
         })
     }
@@ -2201,9 +2226,17 @@ impl Redfish for RedfishSimClient {
 
     fn set_idrac_lockdown<'a>(
         &'a self,
-        _enabled: EnabledDisabled,
+        enabled: EnabledDisabled,
     ) -> libredfish::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move {
+            let mut state = self.state.lock().unwrap();
+            let host = self._host.clone();
+            state.hosts.get_mut(&host).unwrap().lockdown = enabled;
+            state
+                .platform_actions
+                .push(RedfishSimPlatformAction::SetIdracLockdown { host, enabled });
+            Ok(())
+        })
     }
 
     fn get_boss_controller<'a>(

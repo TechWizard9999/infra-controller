@@ -248,6 +248,27 @@ impl DeviceHandle {
         }
     }
 
+    /// Gives a switch's NVOS user `username` the password a completed RMS
+    /// rotation set. Only a switch has an NVOS.
+    pub(crate) fn set_nvos_password(&self, username: &str, password: &str) -> eyre::Result<()> {
+        match &self.0 {
+            DeviceHandleInner::Switch(handle) => handle.set_nvos_password(username, password),
+            DeviceHandleInner::Machine(_) | DeviceHandleInner::PowerShelf(_) => {
+                eyre::bail!("only a switch has an NVOS password")
+            }
+        }
+    }
+
+    /// Restores a switch's NVOS factory credentials without resetting its BMC.
+    pub(crate) fn reset_nvos(&self) -> eyre::Result<()> {
+        match &self.0 {
+            DeviceHandleInner::Switch(handle) => handle.reset_nvos(),
+            DeviceHandleInner::Machine(_) | DeviceHandleInner::PowerShelf(_) => {
+                eyre::bail!("only a switch has an NVOS to reset")
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn for_control_test(dpus: Vec<DpuMachineHandle>, ipmi_port: Option<u16>) -> Self {
         Self::machine(MachineHandle::for_control_test(dpus, ipmi_port))

@@ -33,7 +33,9 @@ use carbide_uuid::vpc::VpcId;
 use carbide_uuid::vpc_peering::VpcPeeringId;
 use chrono::{DateTime, Utc};
 use config_version::ConfigVersion;
-pub use routing_profile::{PrefixFilterPolicyEntry, RouteTargetConfig, VpcRoutingProfileOverrides};
+pub use routing_profile::{
+    PrefixFilterPolicyEntry, RouteTargetConfig, RouteTargetConfigError, VpcRoutingProfileOverrides,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
 use sqlx::{FromRow, Row};
@@ -219,7 +221,8 @@ impl<'r> sqlx::FromRow<'r, PgRow> for Vpc {
     }
 }
 
-#[derive(Clone, Debug, FromRow)]
+#[derive(Clone, Debug, FromRow, carbide_macros::DbTable)]
+#[db_table(name = "vpc_dpu_loopbacks")]
 pub struct VpcDpuLoopback {
     pub dpu_id: DpuMachineId,
     pub vpc_id: VpcId,

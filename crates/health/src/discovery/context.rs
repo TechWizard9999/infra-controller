@@ -17,13 +17,16 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
+use carbide_uuid::machine::MachineId;
 use carbide_uuid::nvlink::NvLinkDomainId;
 use carbide_uuid::power_shelf::PowerShelfId;
+use carbide_uuid::rack::RackId;
 use prometheus::{Histogram, HistogramOpts};
 use tokio::sync::Notify;
 
@@ -31,7 +34,9 @@ use super::reachability::ReachabilitySpec;
 use crate::HealthError;
 use crate::api_client::ApiClientWrapper;
 use crate::bmc::BmcClient;
-use crate::collectors::{Collector, LogDowngradeRegistry, NmxcSchemaOverride, SharedInventory};
+use crate::collectors::{
+    Collector, GnmiRetainedCache, LogDowngradeRegistry, NmxcSchemaOverride, SharedInventory,
+};
 use crate::config::{
     AttributesConfig, Config, Configurable, DiscoveryConfig,
     FirmwareCollectorConfig as FirmwareCollectorOptions, GpuInventoryConfig,
@@ -43,6 +48,7 @@ use crate::config::{
     SensorCollectorConfig as SensorCollectorOptions,
     TelemetryCollectorConfig as TelemetryCollectorOptions,
 };
+use crate::endpoint::{BmcEndpoint, EndpointMetadata};
 use crate::inventory::InventoryMetrics;
 use crate::limiter::RateLimiter;
 use crate::metrics::{MetricsManager, operation_duration_buckets_seconds};
@@ -84,6 +90,36 @@ impl CollectorKind {
     ];
 }
 
+/// Endpoint details that collectors capture at startup and do not refresh.
+///
+/// The endpoint key can stay the same while these change, for example when an
+/// API-discovered MAC reports a new BMC address or a file inventory reassigns
+/// a BMC IP to another rack. The rack and machine are fixed in the client's
+/// BMC latency labels, so a change needs the collectors to pick up a rebuilt
+/// client. Credentials are not tracked: running clients pick up rotated
+/// credentials through their refresh-on-authentication-failure path.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct EndpointConnection {
+    ip: IpAddr,
+    port: Option<u16>,
+    rack_id: Option<RackId>,
+    machine_id: Option<MachineId>,
+}
+
+impl EndpointConnection {
+    pub(super) fn of(endpoint: &BmcEndpoint) -> Self {
+        Self {
+            ip: endpoint.addr.ip,
+            port: endpoint.addr.port,
+            rack_id: endpoint.rack_id.clone(),
+            machine_id: match &endpoint.metadata {
+                Some(EndpointMetadata::Machine(machine)) => machine.machine_id,
+                _ => None,
+            },
+        }
+    }
+}
+
 pub(super) struct CollectorState {
     discovery: HashMap<Cow<'static, str>, Collector>,
     sensors: HashMap<Cow<'static, str>, Collector>,
@@ -96,22 +132,24 @@ pub(super) struct CollectorState {
     nmxc: HashMap<Cow<'static, str>, Collector>,
     nvue_rest: HashMap<Cow<'static, str>, Collector>,
     nvue_gnmi: HashMap<Cow<'static, str>, Collector>,
+    gnmi_caches: HashMap<Cow<'static, str>, GnmiRetainedCache>,
     gpu_inventory: HashMap<Cow<'static, str>, Collector>,
     manager: HashMap<Cow<'static, str>, Collector>,
     reachability: HashMap<Cow<'static, str>, Collector>,
     inventories: HashMap<Cow<'static, str>, SharedInventory<BmcClient>>,
     machine_domain_uuids: HashMap<Cow<'static, str>, Option<NvLinkDomainId>>,
-    switch_domain_uuids: HashMap<Cow<'static, str>, Option<NvLinkDomainId>>,
+    switch_metadata: HashMap<Cow<'static, str>, (Option<NvLinkDomainId>, Option<String>)>,
     power_shelf_ids: HashMap<Cow<'static, str>, Option<PowerShelfId>>,
+    endpoint_connections: HashMap<Cow<'static, str>, EndpointConnection>,
     pub(super) reachability_specs: HashMap<Cow<'static, str>, ReachabilitySpec>,
 }
 
 impl CollectorState {
     /// Stores the first value as a baseline and reports subsequent changes.
     fn observe_value<T: PartialEq>(
-        values: &mut HashMap<Cow<'static, str>, Option<T>>,
+        values: &mut HashMap<Cow<'static, str>, T>,
         key: &str,
-        value: Option<T>,
+        value: T,
     ) -> bool {
         match values.get_mut(key) {
             Some(previous) if previous != &value => {
@@ -139,13 +177,15 @@ impl CollectorState {
             nmxc: HashMap::new(),
             nvue_rest: HashMap::new(),
             nvue_gnmi: HashMap::new(),
+            gnmi_caches: HashMap::new(),
             gpu_inventory: HashMap::new(),
             manager: HashMap::new(),
             reachability: HashMap::new(),
             inventories: HashMap::new(),
             machine_domain_uuids: HashMap::new(),
-            switch_domain_uuids: HashMap::new(),
+            switch_metadata: HashMap::new(),
             power_shelf_ids: HashMap::new(),
+            endpoint_connections: HashMap::new(),
             reachability_specs: HashMap::new(),
         }
     }
@@ -201,9 +241,17 @@ impl CollectorState {
         shared
     }
 
-    /// Drop the shared inventory handle for a removed endpoint.
-    pub(super) fn remove_inventory(&mut self, key: &str) {
+    /// Retains incremental gNMI readings until the endpoint leaves discovery.
+    pub(super) fn gnmi_cache_for(&mut self, key: &str) -> &mut GnmiRetainedCache {
+        self.gnmi_caches
+            .entry(Cow::Owned(key.to_string()))
+            .or_default()
+    }
+
+    /// Releases inventory and retained gNMI readings for an absent endpoint.
+    pub(super) fn remove_endpoint_caches(&mut self, key: &str) {
         self.inventories.remove(key);
+        self.gnmi_caches.remove(key);
     }
 
     /// Records the latest machine domain and reports whether it changed.
@@ -225,24 +273,25 @@ impl CollectorState {
             .retain(|key, _| active_endpoints.contains(key));
     }
 
-    /// Records the latest switch domain and reports whether it changed.
+    /// Records the latest switch domain and serial and reports whether either changed.
     ///
     /// The first observation establishes a baseline without forcing a restart.
-    /// Later transitions between absent and present values, or between two UUIDs,
+    /// Later transitions between absent and present values, or different values,
     /// require a restart because running collectors retain their startup metadata.
-    pub(super) fn observe_switch_domain(
+    pub(super) fn observe_switch_metadata(
         &mut self,
         key: &str,
         domain_uuid: Option<NvLinkDomainId>,
+        serial: Option<String>,
     ) -> bool {
-        Self::observe_value(&mut self.switch_domain_uuids, key, domain_uuid)
+        Self::observe_value(&mut self.switch_metadata, key, (domain_uuid, serial))
     }
 
-    pub(super) fn retain_switch_domains(
+    pub(super) fn retain_switch_metadata(
         &mut self,
         active_switch_endpoints: &HashSet<Cow<'static, str>>,
     ) {
-        self.switch_domain_uuids
+        self.switch_metadata
             .retain(|key, _| active_switch_endpoints.contains(key));
     }
 
@@ -265,6 +314,28 @@ impl CollectorState {
     ) {
         self.power_shelf_ids
             .retain(|key, _| active_power_shelf_endpoints.contains(key));
+    }
+
+    /// Records the latest connection details and reports whether they changed.
+    ///
+    /// The first observation establishes a baseline without forcing a restart.
+    /// Running collectors keep the client and rack captured at startup, so a
+    /// later change requires a restart before new requests and telemetry use it.
+    pub(super) fn observe_endpoint_connection(
+        &mut self,
+        key: &str,
+        connection: EndpointConnection,
+    ) -> bool {
+        Self::observe_value(&mut self.endpoint_connections, key, connection)
+    }
+
+    /// Removes saved connection details for endpoints absent from the discovery pass.
+    pub(super) fn retain_endpoint_connections(
+        &mut self,
+        active_endpoints: &HashSet<Cow<'static, str>>,
+    ) {
+        self.endpoint_connections
+            .retain(|key, _| active_endpoints.contains(key));
     }
 
     pub(super) fn contains(&self, kind: CollectorKind, key: &str) -> bool {
@@ -300,6 +371,7 @@ impl CollectorState {
             .chain(self.nmxc.keys())
             .chain(self.nvue_rest.keys())
             .chain(self.nvue_gnmi.keys())
+            .chain(self.gnmi_caches.keys())
             .chain(self.gpu_inventory.keys())
             .chain(self.manager.keys())
             .filter(|key| !active_keys.contains(*key))
