@@ -531,7 +531,8 @@ async fn test_preingestion_time_sync_reset_accepts_paused_power_state_for_dpu(
         "host must not power on while the BMC reset is still in progress"
     );
 
-    // A failed restart must leave recovery retryable, not advance past Paused.
+    // The first ready poll force-restarts the paused DPU. A failed restart must
+    // leave recovery retryable, not advance past Paused.
     redfish_sim.fail_next_power_action(
         SystemPowerControl::ForceRestart,
         "transient restart failure",
@@ -759,64 +760,6 @@ async fn test_preingestion_time_sync_reset_retries_until_host_reaches_on(
             "ForceRestart must not be repeated during the WaitHostBoot check"
         );
     }
-
-    Ok(())
-}
-
-/// A paused BlueField-3 is force-restarted, without sending On, on the first ready poll.
-#[sqlx_test]
-async fn test_preingestion_time_sync_reset_force_restarts_paused_dpu_on_first_ready_poll(
-    pool: PgPool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let env = TestHarness::builder(pool.clone()).build().await;
-    let domain = env.test_domain().await;
-    let nc = env.network_controller();
-    let underlay_segment = nc.create_underlay_segment(&domain).await;
-    let mut config = default_config::get();
-    config.ntp_servers.clear();
-
-    let redfish_sim = Arc::new(RedfishSim::default());
-    redfish_sim.set_bmc_time_offset_seconds(600);
-    redfish_sim.set_paused_when_off(true);
-    let mgr = PreingestionManager::new(
-        pool.clone(),
-        config.preingestion_manager(),
-        redfish_sim.clone(),
-        env.test_meter.meter(),
-        None,
-        None,
-        None,
-        env.api().work_lock_manager_handle(),
-        config.ntp_servers,
-    );
-    let dpu_ip = prepare_time_sync_endpoint(
-        &env,
-        &pool,
-        underlay_segment.relay_address,
-        "b8:3f:d2:90:97:a8",
-        true,
-    )
-    .await?;
-    let timepoint = redfish_sim.timepoint();
-
-    mgr.run_single_iteration().await?;
-    mgr.run_single_iteration().await?;
-
-    assert!(matches!(
-        preingestion_state(&pool, dpu_ip).await?,
-        PreingestionState::TimeSyncReset {
-            phase: TimeSyncResetPhase::WaitHostBoot,
-            ..
-        }
-    ));
-    let actions = redfish_sim
-        .actions_since(&timepoint)
-        .for_host(&dpu_ip.to_string());
-    assert!(actions.contains(&RedfishSimAction::Power(SystemPowerControl::ForceRestart)));
-    assert!(
-        !actions.contains(&RedfishSimAction::Power(SystemPowerControl::On)),
-        "On is a no-op for a paused BlueField-3, so it must not be sent"
-    );
 
     Ok(())
 }
