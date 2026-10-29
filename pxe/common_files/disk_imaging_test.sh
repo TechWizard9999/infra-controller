@@ -715,6 +715,23 @@ curl() {
 curl_url "http://example.com/fail.qcow2" >/dev/null 2>&1
 assert_eq "curl_url failure status" 22 "$?"
 
+echo "get_distro_image: fails on checksum download error"
+distro_name="ubuntu"
+distro_version="24.04"
+mock_failing_curl() { return 1; }
+curl() { mock_failing_curl; }
+if get_distro_image >/dev/null 2>&1; then
+	fail "get_distro_image succeeded when shaurl download failed"
+fi
+
+echo "get_distro_image: fails on missing checksum in shafile"
+mock_empty_shafile() { touch shafile; return 0; }
+curl() { mock_empty_shafile; }
+if get_distro_image >/dev/null 2>&1; then
+	fail "get_distro_image succeeded when checksum was missing"
+fi
+rm -f shafile
+
 echo "entrypoint: reboot suppression on failed main"
 entrypoint_test_script="$temp_dir/test_entrypoint.sh"
 cat << 'EOF' > "$entrypoint_test_script"
@@ -733,6 +750,26 @@ if [[ "$entrypoint_output" =~ "Rebooting" ]]; then
 fi
 if [[ ! "$entrypoint_output" =~ "Imaging failed; reboot suppressed" ]]; then
 	fail "entrypoint did not indicate reboot was suppressed: $entrypoint_output"
+fi
+
+echo "entrypoint: reboots on successful main"
+entrypoint_success_script="$temp_dir/test_entrypoint_success.sh"
+cat << 'EOF' > "$entrypoint_success_script"
+#!/bin/bash
+log_output=/dev/null
+main() { return 0; }
+systemctl() { echo "systemctl called: $*"; return 0; }
+EOF
+sed -n '/^if \[\[ "\${BASH_SOURCE\[0\]}" == "\$0" \]\]; then/,$p' "$script_under_test" >> "$entrypoint_success_script"
+chmod +x "$entrypoint_success_script"
+entrypoint_success_output=$("${BASH:-bash}" "$entrypoint_success_script" 2>&1)
+entrypoint_success_status=$?
+assert_eq "entrypoint success status" 0 "$entrypoint_success_status"
+if [[ ! "$entrypoint_success_output" =~ "Rebooting" ]]; then
+	fail "entrypoint did not reboot after main succeeded: $entrypoint_success_output"
+fi
+if [[ ! "$entrypoint_success_output" =~ "systemctl called: reboot" ]]; then
+	fail "entrypoint did not invoke systemctl reboot: $entrypoint_success_output"
 fi
 
 echo "disk imaging identifier tests passed"
