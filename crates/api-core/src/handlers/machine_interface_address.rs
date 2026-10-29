@@ -369,8 +369,8 @@ async fn assign_static_address_inner(
     {
         return Err(CarbideError::FailedPrecondition(format!(
             "cannot assign {ip_address} to interface {interface_id}: retained address {sibling} \
-             is outside target network segment {}",
-            target_segment.id,
+             is outside target network segment {} ({}); replace or remove {sibling} first",
+            target_segment.config.name, target_segment.id,
         )));
     }
 

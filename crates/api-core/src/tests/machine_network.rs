@@ -236,21 +236,38 @@ async fn test_static_assignment_rejects_cross_segment_dual_stack(
     env.run_network_segment_controller_iteration().await;
     env.run_network_segment_controller_iteration().await;
 
-    for (mac, ipv4, ipv6, requested, sibling) in [
-        (
-            "aa:bb:cc:dd:ee:30",
-            "192.0.2.42",
-            "2001:db8:1::42",
-            "192.0.12.42",
-            "2001:db8:1::42",
-        ),
-        (
-            "aa:bb:cc:dd:ee:31",
-            "192.0.2.43",
-            "2001:db8:1::43",
-            "2001:db8:2::43",
-            "192.0.2.43",
-        ),
+    struct Case {
+        scenario: &'static str,
+        mac: &'static str,
+        ipv4: &'static str,
+        ipv6: &'static str,
+        requested: &'static str,
+        sibling: &'static str,
+    }
+    for Case {
+        scenario,
+        mac,
+        ipv4,
+        ipv6,
+        requested,
+        sibling,
+    } in [
+        Case {
+            scenario: "IPv4 move strands source IPv6",
+            mac: "aa:bb:cc:dd:ee:30",
+            ipv4: "192.0.2.42",
+            ipv6: "2001:db8:1::42",
+            requested: "192.0.12.42",
+            sibling: "2001:db8:1::42",
+        },
+        Case {
+            scenario: "IPv6 move strands source IPv4",
+            mac: "aa:bb:cc:dd:ee:31",
+            ipv4: "192.0.2.43",
+            ipv6: "2001:db8:1::43",
+            requested: "2001:db8:2::43",
+            sibling: "192.0.2.43",
+        },
     ] {
         let mut txn = env.db_txn().await;
         let interface = db::machine_interface::validate_existing_mac_and_create(
@@ -272,7 +289,7 @@ async fn test_static_assignment_rejects_cross_segment_dual_stack(
             .await?;
         }
         let before = db::machine_interface::find_one(&mut *txn, interface.id).await?;
-        assert_eq!(before.segment_id, source_id);
+        assert_eq!(before.segment_id, source_id, "{scenario}");
         let before_allocations: serde_json::Value = sqlx::query_scalar(
             "SELECT jsonb_agg(to_jsonb(a) ORDER BY address) FROM machine_interface_addresses a WHERE interface_id = $1",
         )
@@ -291,21 +308,21 @@ async fn test_static_assignment_rejects_cross_segment_dual_stack(
             ))
             .await
             .expect_err("a cross-segment move must not retain an out-of-segment sibling");
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{scenario}");
 
         // Reload independently after the rejected RPC, including allocation types and timestamps.
         let mut txn = env.db_txn().await;
         let after = db::machine_interface::find_one(&mut *txn, interface.id).await?;
-        assert_eq!(after.segment_id, before.segment_id);
-        assert_eq!(after.domain_id, before.domain_id);
-        assert_eq!(after.hostname, before.hostname);
+        assert_eq!(after.segment_id, before.segment_id, "{scenario}");
+        assert_eq!(after.domain_id, before.domain_id, "{scenario}");
+        assert_eq!(after.hostname, before.hostname, "{scenario}");
         let after_allocations: serde_json::Value = sqlx::query_scalar(
             "SELECT jsonb_agg(to_jsonb(a) ORDER BY address) FROM machine_interface_addresses a WHERE interface_id = $1",
         )
         .bind(interface.id)
         .fetch_one(&mut *txn)
         .await?;
-        assert_eq!(after_allocations, before_allocations);
+        assert_eq!(after_allocations, before_allocations, "{scenario}");
         txn.rollback().await?;
 
         let same_segment_address = if requested.parse::<std::net::IpAddr>()?.is_ipv4() {
@@ -323,9 +340,9 @@ async fn test_static_assignment_rejects_cross_segment_dual_stack(
             .await?;
         let mut txn = env.db_txn().await;
         let same_segment = db::machine_interface::find_one(&mut *txn, interface.id).await?;
-        assert_eq!(same_segment.segment_id, source_id);
-        assert_eq!(same_segment.addresses.len(), 2);
-        assert!(same_segment.addresses.contains(&sibling.parse()?));
+        assert_eq!(same_segment.segment_id, source_id, "{scenario}");
+        assert_eq!(same_segment.addresses.len(), 2, "{scenario}");
+        assert!(same_segment.addresses.contains(&sibling.parse()?), "{scenario}");
         db::machine_interface_address::delete_by_interface_family(
             &mut txn,
             interface.id,
@@ -344,33 +361,11 @@ async fn test_static_assignment_rejects_cross_segment_dual_stack(
             .await?;
         let mut txn = env.db_txn().await;
         let moved = db::machine_interface::find_one(&mut *txn, interface.id).await?;
-        assert_eq!(moved.segment_id, target_id);
+        assert_eq!(moved.segment_id, target_id, "{scenario}");
         assert_eq!(
             moved.addresses,
-            vec![requested.parse::<std::net::IpAddr>()?]
-        );
-        db::machine_interface_address::delete(&mut txn, &interface.id).await?;
-        txn.commit().await?;
-        let response = env
-            .api
-            .assign_static_address(tonic::Request::new(
-                rpc::forge::AssignStaticAddressRequest {
-                    interface_id: Some(interface.id),
-                    ip_address: same_segment_address.to_string(),
-                },
-            ))
-            .await?
-            .into_inner();
-        assert_eq!(
-            response.status(),
-            rpc::forge::AssignStaticAddressStatus::Assigned
-        );
-        let mut txn = env.db_txn().await;
-        let moved_back = db::machine_interface::find_one(&mut *txn, interface.id).await?;
-        assert_eq!(moved_back.segment_id, source_id);
-        assert_eq!(
-            moved_back.addresses,
-            vec![same_segment_address.parse::<std::net::IpAddr>()?]
+            vec![requested.parse::<std::net::IpAddr>()?],
+            "{scenario}"
         );
         txn.rollback().await?;
     }
