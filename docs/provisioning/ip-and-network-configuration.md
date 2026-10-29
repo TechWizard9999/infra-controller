@@ -511,8 +511,8 @@ To configure these flows:
 
 The values that `nico-dhcp` returns in DHCP options (nameservers, NTP servers, next-server, boot file, etc.) are sourced from:
 
-- The `ntp_servers` list in `siteConfig` — preferred for DHCP option 42 when non-empty.
-- The Kea hook parameters in the `nico-dhcp` Helm chart (`nico-nameserver`, `nico-ntpserver`, etc.) — set these to the `unbound.nico` (or `unbound.nico`, see [section 3](#3-dns-configuration)) recursive resolver VIP. `nico-ntpserver` is used only as a fallback when `siteConfig.ntp_servers` is empty.
+- The `ntp_servers` list in `siteConfig` — its IPv4 entries are preferred for DHCP option 42.
+- The Kea hook parameters in the `nico-dhcp` Helm chart (`nico-nameserver`, `nico-ntpserver`, etc.) — set these to the `unbound.nico` (or `unbound.nico`, see [section 3](#3-dns-configuration)) recursive resolver VIP. `nico-ntpserver` is used only as a fallback when `siteConfig.ntp_servers` contains no IPv4 address.
 - The per-segment definitions in `siteConfig` `[networks.<name>]` blocks — gateway, MTU, additional routes.
 
 The DPU-local DHCP server evaluates NTP precedence independently for each address family. Valid site-configured addresses replace service-discovered addresses only for the same family. When a family has no valid site-configured address, its service-discovered fallback is retained. Site-configured IPv4 addresses override DHCPv4 option 42, and site-configured IPv6 addresses override DHCPv6 option 56 on the DPU-local DHCP server without suppressing unconfigured fallbacks.

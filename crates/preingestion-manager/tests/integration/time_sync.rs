@@ -40,7 +40,7 @@ async fn test_preingestion_time_sync_ok(pool: PgPool) -> Result<(), Box<dyn std:
 
     config.ntp_servers = vec![
         "198.51.100.10".parse().unwrap(),
-        "198.51.100.11".parse().unwrap(),
+        "2001:db8::123".parse().unwrap(),
     ];
 
     let redfish_sim = Arc::new(RedfishSim::default());
@@ -85,11 +85,12 @@ async fn test_preingestion_time_sync_ok(pool: PgPool) -> Result<(), Box<dyn std:
 
     let actions = redfish_sim.actions_since(&timepoint);
     assert!(
-        actions
-            .all_hosts()
-            .iter()
-            .any(|a| matches!(a, RedfishSimAction::SetNtpServers(_))),
-        "Expected SetNtpServers when site NTP is configured"
+        actions.all_hosts().iter().any(|a| matches!(
+            a,
+            RedfishSimAction::SetNtpServers(servers)
+                if servers == &["198.51.100.10".to_string(), "2001:db8::123".to_string()]
+        )),
+        "Expected SetNtpServers with the site NTP servers, IPv4 first and IPv6 unbracketed"
     );
 
     let mut txn = pool.begin().await.unwrap();
@@ -133,70 +134,6 @@ async fn test_preingestion_time_sync_ok(pool: PgPool) -> Result<(), Box<dyn std:
             == 1
     );
     txn.commit().await?;
-
-    Ok(())
-}
-
-/// Test that IPv6 NTP servers are configured through Redfish on the BMC.
-#[sqlx_test]
-async fn test_preingestion_set_ntp_servers_ipv6(
-    pool: PgPool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let env = TestHarness::builder(pool.clone()).build().await;
-    let domain = env.test_domain().await;
-    let nc = env.network_controller();
-    let underlay_segment = nc.create_underlay_segment(&domain).await;
-    let mut config = default_config::get();
-
-    config.ntp_servers = vec![
-        "2001:db8::123".parse().unwrap(),
-        "2001:db8::124".parse().unwrap(),
-    ];
-
-    let redfish_sim = Arc::new(RedfishSim::default());
-    let mgr = PreingestionManager::new(
-        pool.clone(),
-        config.preingestion_manager(),
-        redfish_sim.clone(),
-        env.test_meter.meter(),
-        None,
-        None,
-        None,
-        env.api().work_lock_manager_handle(),
-        config.ntp_servers.clone(),
-    );
-
-    let response = env
-        .api()
-        .discover_dhcp(
-            DhcpDiscovery::builder(
-                "AA:BB:CC:DD:EE:01",
-                &underlay_segment.config.gateway.unwrap(),
-            )
-            .tonic_request(),
-        )
-        .await?
-        .into_inner();
-
-    let addr = response.address.as_str();
-    let ip_addr = IpAddr::from_str(addr).unwrap();
-    let mut txn = pool.begin().await.unwrap();
-    common::insert_endpoint_version(&mut txn, addr, "6.00.30.00", "1.13.2", false).await?;
-    txn.commit().await?;
-
-    let timepoint = redfish_sim.timepoint();
-    mgr.run_single_iteration().await?;
-    mgr.run_single_iteration().await?;
-
-    let actions = redfish_sim.actions_since(&timepoint);
-    assert!(
-        actions.all_hosts().iter().any(|a| matches!(
-            a,
-            RedfishSimAction::SetNtpServers(servers)
-                if servers == &["2001:db8::123".to_string(), "2001:db8::124".to_string()]
-        )),
-        "Expected SetNtpServers with IPv6 addresses when site NTP is configured with IPv6"
-    );
 
     Ok(())
 }

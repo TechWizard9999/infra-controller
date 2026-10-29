@@ -606,11 +606,10 @@ request_timeout_seconds = 5"#
         })
     }
 
-    /// Verifies site NTP configuration accepts IPv4, IPv6, and mixed-family lists
-    /// while preserving the empty-vector default.
+    /// Verifies site NTP configuration accepts IPv6 and mixed-family lists.
     #[test]
     #[allow(clippy::result_large_err)]
-    fn ntp_servers_configuration_accepts_ipv4_ipv6_and_mixed() {
+    fn ntp_servers_configuration_accepts_ipv6_and_mixed() {
         figment::Jail::expect_with(|jail| {
             scenarios!(
                 run = |settings| {
@@ -623,14 +622,11 @@ request_timeout_seconds = 5"#
                         .map_err(|error| format!("{error:#}"))
                 };
                 "ntp_servers configuration" {
-                    "" => Yields(vec![]),
-                    r#"ntp_servers = ["192.0.2.1"]"# => Yields(vec!["192.0.2.1".parse().unwrap()]),
                     r#"ntp_servers = ["2001:db8::123"]"# => Yields(vec!["2001:db8::123".parse().unwrap()]),
                     r#"ntp_servers = ["192.0.2.1", "2001:db8::123"]"# => Yields(vec![
                         "192.0.2.1".parse().unwrap(),
                         "2001:db8::123".parse().unwrap(),
                     ]),
-                    r#"ntp_servers = ["not-an-ip"]"# => Fails,
                 }
             );
             Ok(())

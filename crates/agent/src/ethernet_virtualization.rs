@@ -166,7 +166,7 @@ fn dhcpv6_server_preference(
         .wrap_err("DHCPv6 server preference must be between 0 and 255")
 }
 
-/// Resolve site-configured DHCPv4 NTP and DNS-discovered DHCPv6 NTP options.
+/// Resolve DHCP NTP options, letting each valid site-configured family replace its service-discovered fallback.
 fn build_dhcp_ntp_servers(
     nc: &rpc::ManagedHostNetworkConfigResponse,
     service_addrs: &ServiceAddresses,
@@ -177,22 +177,22 @@ fn build_dhcp_ntp_servers(
 
     // Site-configured addresses replace service-discovered addresses only for the same family.
     if !nc.ntp_servers.is_empty() {
-        let mut site_v4 = Vec::new();
-        let mut site_v6 = Vec::new();
-
-        for server in &nc.ntp_servers {
-            match server.parse::<IpAddr>() {
-                Ok(IpAddr::V4(v4)) => site_v4.push(v4),
-                Ok(IpAddr::V6(v6)) => site_v6.push(v6),
+        let site_addrs: Vec<IpAddr> = nc
+            .ntp_servers
+            .iter()
+            .filter_map(|server| match server.parse::<IpAddr>() {
+                Ok(address) => Some(address),
                 Err(error) => {
                     tracing::debug!(
                         ntp_server = %server,
                         error = %error,
                         "Invalid NTP server from ManagedHostNetworkConfigResponse, ignoring"
                     );
+                    None
                 }
-            }
-        }
+            })
+            .collect();
+        let (site_v4, site_v6) = split_addresses_by_family(&site_addrs);
 
         if !site_v4.is_empty() {
             ntpservers_v4 = site_v4;

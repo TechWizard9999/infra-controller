@@ -182,7 +182,8 @@ fn ensure_dhcpv6_enabled(segment: &NetworkSegment) -> Result<(), CarbideError> {
 }
 
 /// Extract string representations of IPv4 NTP servers only, preserving the
-/// DHCPv4 option 42 contract (machine.rs:373).
+/// DHCPv4 option 42 contract. Kea renders `DhcpRecord.ntp_servers` as DHCPv4
+/// option 42 (an IPv4 address list), so IPv6 entries are excluded.
 fn filter_ipv4_ntp_strings(servers: &[IpAddr]) -> Vec<String> {
     servers
         .iter()

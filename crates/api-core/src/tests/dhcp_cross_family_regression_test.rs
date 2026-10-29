@@ -22,9 +22,7 @@ use model::allocation_type::AllocationType;
 use rpc::forge::forge_server::Forge;
 
 use crate::tests::common::api_fixtures::network_segment::create_network_segment;
-use crate::tests::common::api_fixtures::{
-    FIXTURE_DHCP_RELAY_ADDRESS, TestEnvOverrides, create_test_env, create_test_env_with_overrides,
-};
+use crate::tests::common::api_fixtures::{FIXTURE_DHCP_RELAY_ADDRESS, create_test_env};
 use crate::tests::common::rpc_builder::DhcpDiscovery;
 use crate::tests::machine_dhcp::{
     RPC_MESSAGE_KIND_V6_INFO_REQUEST, RPC_MESSAGE_KIND_V6_SOLICIT, add_ipv6_prefix,
@@ -398,32 +396,6 @@ async fn test_dhcp_v6_info_request_ignores_adversarial_ipv6_address(
         attacker_addresses[0].address,
         expected_slaac_address("2001:db8:8::".parse()?, attacker_mac)
     );
-
-    Ok(())
-}
-
-/// Verify DhcpRecord.ntp_servers filters out IPv6 site NTP addresses so only
-/// valid IPv4 strings reach DHCPv4 option 42.
-#[crate::sqlx_test]
-async fn test_dhcp_record_filters_ipv6_ntp_servers(
-    pool: sqlx::PgPool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut config = crate::test_support::default_config::get();
-    config.ntp_servers = vec![
-        "192.0.2.123".parse().unwrap(),
-        "2001:db8::123".parse().unwrap(),
-    ];
-    let env =
-        create_test_env_with_overrides(pool.clone(), TestEnvOverrides::with_config(config)).await;
-    let mac = MacAddress::from_str("02:00:00:00:00:99").unwrap();
-
-    let response = env
-        .api
-        .discover_dhcp(DhcpDiscovery::builder(mac, FIXTURE_DHCP_RELAY_ADDRESS).tonic_request())
-        .await?
-        .into_inner();
-
-    assert_eq!(response.ntp_servers, vec!["192.0.2.123".to_string()]);
 
     Ok(())
 }

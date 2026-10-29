@@ -27,7 +27,7 @@ pub mod test_support;
 use std::collections::HashMap;
 use std::default::Default;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1838,11 +1838,11 @@ impl PreingestionManagerStatic {
             }
         };
 
-        let ntp_servers: Vec<String> = self
-            .ntp_servers
-            .iter()
-            .map(|addr| addr.to_string())
-            .collect();
+        // BMC firmware may keep only the first few servers (libredfish truncates
+        // on HPE iLO/AMI/Dell), so list the BMC's own address family first.
+        let mut ordered: Vec<&IpAddr> = self.ntp_servers.iter().collect();
+        ordered.sort_by_key(|addr| addr.is_ipv6() != endpoint.address.is_ipv6());
+        let ntp_servers: Vec<String> = ordered.iter().map(|addr| addr.to_string()).collect();
         if let Err(e) = redfish_client.set_ntp_servers(&ntp_servers).await {
             return self
                 .set_ntp_servers_retry_or_fail(
