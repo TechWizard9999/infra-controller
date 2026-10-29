@@ -242,8 +242,9 @@ static NEXT_AUTH_CIRCUIT_ID: AtomicU64 = AtomicU64::new(1);
 enum AuthCircuitState {
     /// Credentials are not under suspicion; requests flow normally.
     Closed,
-    /// A request was rejected with `generation` and no probe is running. The next
-    /// eligible read at that generation or newer becomes the probe.
+    /// A request was rejected with `generation`, or a probe ended without a
+    /// verdict (no HTTP response, or the probe was cancelled), and no probe is
+    /// running. The next eligible read at that generation or newer becomes the probe.
     /// `refresh_generation` is the generation the probe's refresh is measured
     /// from: a refresh is skipped if the credentials have already moved past it.
     Pending {
@@ -612,7 +613,10 @@ impl AuthProbe {
 impl Drop for AuthProbe {
     fn drop(&mut self) {
         if !self.finished {
-            self.finish_open(self.generation);
+            // A cancelled probe produced no verdict, so the next eligible caller
+            // probes at once. Keeping `refresh_generation` means that probe does
+            // not fetch credentials again if this one already refreshed them.
+            self.finish_pending(self.generation);
         }
     }
 }
@@ -4457,6 +4461,109 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_cancelled_probe_leaves_recovery_to_the_next_caller() {
+        // A probe whose future is dropped (collector shutdown, a caller timeout)
+        // never hears from the BMC, so it must neither wedge the circuit in
+        // `Probing` nor condemn credentials it never tested.
+        let (provider, provider_calls) = CountingProvider::new(
+            BmcCredentials::SessionToken {
+                token: "t".to_string(),
+            },
+            None,
+        );
+        let client = test_bmc(reqwest(), test_addr(), provider, None, 10, None).expect("ok");
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let mut probe = Box::pin(client.read_with_auth_retry(move || {
+            let attempt = counter.fetch_add(1, AtomicOrdering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    Err(auth_error())
+                } else {
+                    std::future::pending::<Result<&str, HealthError>>().await
+                }
+            }
+        }));
+        assert!(
+            futures::FutureExt::now_or_never(probe.as_mut()).is_none(),
+            "the replay hangs in flight"
+        );
+        assert_eq!(
+            attempts.load(AtomicOrdering::SeqCst),
+            2,
+            "401 then the replay"
+        );
+        assert_eq!(
+            provider_calls.load(AtomicOrdering::SeqCst),
+            2,
+            "initial fetch plus the probe's refresh"
+        );
+        assert!(
+            matches!(
+                *client
+                    .auth_circuit
+                    .state
+                    .lock()
+                    .expect("auth circuit mutex"),
+                AuthCircuitState::Probing { generation: 2, .. }
+            ),
+            "the replay is the in-flight probe"
+        );
+
+        let (blocked, blocked_attempts) = scripted_op(vec![Ok("body")]);
+        let error = client
+            .read_with_auth_retry(blocked)
+            .await
+            .expect_err("a second caller is suppressed while the probe runs");
+        assert!(
+            matches!(error, HealthError::BmcAuthCircuitOpen(_)),
+            "{error:?}"
+        );
+        assert_eq!(blocked_attempts.load(AtomicOrdering::SeqCst), 0);
+
+        drop(probe);
+        assert!(
+            matches!(
+                *client
+                    .auth_circuit
+                    .state
+                    .lock()
+                    .expect("auth circuit mutex"),
+                AuthCircuitState::Pending {
+                    generation: 2,
+                    refresh_generation: 1,
+                }
+            ),
+            "a cancelled probe hands recovery to the next caller"
+        );
+
+        let (next, next_attempts) = scripted_op(vec![Ok("body")]);
+        let value = client
+            .read_with_auth_retry(next)
+            .await
+            .expect("the next caller probes at once instead of waiting for a deadline");
+        assert_eq!(value, "body");
+        assert_eq!(next_attempts.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            provider_calls.load(AtomicOrdering::SeqCst),
+            2,
+            "the credentials the cancelled probe fetched are reused, not fetched again"
+        );
+        assert!(
+            matches!(
+                *client
+                    .auth_circuit
+                    .state
+                    .lock()
+                    .expect("auth circuit mutex"),
+                AuthCircuitState::Closed
+            ),
+            "the next caller's successful probe closes the circuit"
+        );
+    }
+
     const ENTITY_BODY: &str = r#"{"@odata.id":"/redfish/v1"}"#;
     const SERVICE_ROOT_BODY: &str = r##"{
         "@odata.id": "/redfish/v1",
@@ -5163,8 +5270,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rejected_cooldown_probe_restarts_the_cooldown() {
-        let (base_url, requests, server) = spawn_scripted_http_server(vec![(401, "{}")]);
+    async fn a_cooldown_probe_restarts_the_cooldown_until_credentials_are_repaired() {
+        let (base_url, requests, server) =
+            spawn_scripted_http_server(vec![(401, "{}"), (200, ENTITY_BODY), (200, ENTITY_BODY)]);
         let (client, provider_calls) = client_against(base_url);
         client
             .ensure_credentials()
@@ -5199,6 +5307,35 @@ mod tests {
             provider_calls.load(AtomicOrdering::SeqCst),
             2,
             "and does not spend a credential fetch"
+        );
+        assert_eq!(client.collector_sweep(), CollectorSweep::Skip);
+
+        // The credentials are repaired out of band; the next cooldown probe
+        // proves it and collection resumes without further suppression.
+        client.set_auth_circuit_open_for_test(Some(AuthCircuitOpen {
+            generation: client.credential_generation.load(Ordering::Acquire),
+            opened_at: Instant::now() - AUTH_CIRCUIT_COOLDOWN - Duration::from_secs(1),
+        }));
+        assert_eq!(client.collector_sweep(), CollectorSweep::Probe);
+        client
+            .get::<TestEntity>(&ODataId::service_root())
+            .await
+            .expect("the BMC accepts the repaired credentials");
+        assert_eq!(provider_calls.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(client.collector_sweep(), CollectorSweep::Full);
+        client
+            .get::<TestEntity>(&ODataId::service_root())
+            .await
+            .expect("normal reads flow again");
+        assert_eq!(
+            requests.load(AtomicOrdering::SeqCst),
+            3,
+            "the recovery probe and one normal read reach the BMC"
+        );
+        assert_eq!(
+            provider_calls.load(AtomicOrdering::SeqCst),
+            3,
+            "a normal read after recovery does not refresh credentials"
         );
         server.join().expect("test server thread");
     }
