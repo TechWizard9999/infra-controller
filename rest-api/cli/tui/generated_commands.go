@@ -104,6 +104,17 @@ func runGeneratedTUICommand(s *Session, info appcli.GeneratedCommandInfo, args [
 	if err := validateGeneratedBodyArguments(info, flagArgs); err != nil {
 		return err
 	}
+	confirmed := false
+	if info.Method != http.MethodGet && generatedSiteScopeReadsStdinBody(s, info, flagArgs) {
+		// Reading the body consumes the rest of stdin, so confirm first. This
+		// keeps the confirm-then-body order used when --data-file - is passed
+		// through to the request.
+		ok, confirmErr := confirmGeneratedCommand(info)
+		if confirmErr != nil || !ok {
+			return confirmErr
+		}
+		confirmed = true
+	}
 	flagArgs, err = persistGeneratedSiteScopeFromArgs(s, info, flagArgs)
 	if err != nil {
 		return err
@@ -143,8 +154,8 @@ func runGeneratedTUICommand(s *Session, info appcli.GeneratedCommandInfo, args [
 	}
 	preparedArgs := append(flagArgs, positionalArgs...)
 
-	if info.Method != http.MethodGet {
-		ok, confirmErr := PromptConfirm(fmt.Sprintf("Run %s (%s)?", info.Name, info.Method))
+	if info.Method != http.MethodGet && !confirmed {
+		ok, confirmErr := confirmGeneratedCommand(info)
 		if confirmErr != nil || !ok {
 			return confirmErr
 		}
@@ -158,6 +169,10 @@ func runGeneratedTUICommand(s *Session, info appcli.GeneratedCommandInfo, args [
 		s.Cache.InvalidateAll()
 	}
 	return nil
+}
+
+func confirmGeneratedCommand(info appcli.GeneratedCommandInfo) (bool, error) {
+	return PromptConfirm(fmt.Sprintf("Run %s (%s)?", info.Name, info.Method))
 }
 
 func splitGeneratedArguments(info appcli.GeneratedCommandInfo, args []string) ([]string, []string, error) {
@@ -368,33 +383,50 @@ func persistGeneratedSiteScopeFromArgs(
 	if siteID, ok := generatedOptionValue(info, args, "site-id"); ok {
 		setGeneratedSiteScopeFromID(s, siteID)
 	}
-	if _, accepted := generatedRootBodyProperty(info, "site-id"); !accepted {
+	if !generatedBodySuppliesPathSiteScope(info) {
 		return args, nil
 	}
-	for _, parameter := range info.PathParameters {
-		if GeneratedPathResourceDescriptor(info.Name, parameter).ScopeParameter != "siteId" {
-			continue
-		}
-		// Stdin stays usable when no scope is active, because nothing else
-		// then needs to merge into the body.
-		allowStdin := strings.TrimSpace(s.Scope.SiteID) == "" &&
-			strings.TrimSpace(s.Scope.VpcID) == ""
-		out, err := materializeGeneratedDataFile(info, args, allowStdin)
-		if err != nil {
-			return nil, err
-		}
-		if data, ok := generatedOptionValue(info, out, "data"); ok {
-			var body struct {
-				SiteID string `json:"siteId"`
-			}
-			if err := json.Unmarshal([]byte(data), &body); err != nil {
-				return nil, fmt.Errorf("reading request site: %w", err)
-			}
-			setGeneratedSiteScopeFromID(s, body.SiteID)
-		}
-		return out, nil
+	out, err := materializeGeneratedDataFile(info, args, generatedScopeIsEmpty(s))
+	if err != nil {
+		return nil, err
 	}
-	return args, nil
+	if data, ok := generatedOptionValue(info, out, "data"); ok {
+		var body struct {
+			SiteID string `json:"siteId"`
+		}
+		if err := json.Unmarshal([]byte(data), &body); err != nil {
+			return nil, fmt.Errorf("reading request site: %w", err)
+		}
+		setGeneratedSiteScopeFromID(s, body.SiteID)
+	}
+	return out, nil
+}
+
+// generatedBodySuppliesPathSiteScope reports whether the request body's siteId
+// must be known before a site-scoped path parameter can be resolved.
+func generatedBodySuppliesPathSiteScope(info appcli.GeneratedCommandInfo) bool {
+	if _, accepted := generatedRootBodyProperty(info, "site-id"); !accepted {
+		return false
+	}
+	for _, parameter := range info.PathParameters {
+		if GeneratedPathResourceDescriptor(info.Name, parameter).ScopeParameter == "siteId" {
+			return true
+		}
+	}
+	return false
+}
+
+// generatedScopeIsEmpty reports whether no site or VPC scope must be merged
+// into the body, which is the only case where stdin can supply it.
+func generatedScopeIsEmpty(s *Session) bool {
+	return strings.TrimSpace(s.Scope.SiteID) == "" && strings.TrimSpace(s.Scope.VpcID) == ""
+}
+
+// generatedSiteScopeReadsStdinBody reports whether persistGeneratedSiteScopeFromArgs
+// will read the request body from stdin.
+func generatedSiteScopeReadsStdinBody(s *Session, info appcli.GeneratedCommandInfo, args []string) bool {
+	dataFile, ok := generatedOptionValue(info, args, "data-file")
+	return ok && dataFile == "-" && generatedScopeIsEmpty(s) && generatedBodySuppliesPathSiteScope(info)
 }
 
 func setGeneratedSiteScopeFromID(s *Session, siteID string) {

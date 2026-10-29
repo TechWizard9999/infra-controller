@@ -362,6 +362,7 @@ func testRunGeneratedTUICommand_DomainBodyScope(t *testing.T) {
 		wantError string
 		// wantRequests lists requests made before a wantError stops the run.
 		wantRequests []string
+		declined     bool
 	}{
 		{
 			name: "JSON supplies site without selected scope",
@@ -392,14 +393,17 @@ func testRunGeneratedTUICommand_DomainBodyScope(t *testing.T) {
 			sites: []NamedItem{{ID: siteID}},
 		},
 		{
-			// Stdin carries the whole body, so the confirmation prompt then
-			// reads EOF and cancels. Reaching it after the Site lookup shows
-			// the body was read and scoped instead of rejected up front.
-			name:         "stdin body is read without active scope",
-			args:         []string{"--data-file", "-", "Domain-A"},
-			stdin:        body,
-			wantError:    "input cancelled",
-			wantRequests: []string{"GET /v2/org/acme/nico/domain/nvlink"},
+			// The body consumes the rest of stdin, so confirmation is read
+			// first, as when --data-file - is passed through to the request.
+			name:  "stdin body supplies site after confirmation",
+			args:  []string{"--data-file", "-", "Domain-A"},
+			stdin: "y\n" + body,
+		},
+		{
+			name:     "declining before stdin body skips the request",
+			args:     []string{"--data-file", "-", "Domain-A"},
+			stdin:    "n\n" + body,
+			declined: true,
 		},
 		{
 			name:      "invalid body site prevents lookup",
@@ -456,6 +460,10 @@ func testRunGeneratedTUICommand_DomainBodyScope(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
+			if test.declined {
+				assert.Empty(t, requests)
+				return
+			}
 			assert.Equal(t, []string{
 				"GET /v2/org/acme/nico/domain/nvlink",
 				"PATCH /v2/org/acme/nico/domain/nvlink/domain-1/power",
