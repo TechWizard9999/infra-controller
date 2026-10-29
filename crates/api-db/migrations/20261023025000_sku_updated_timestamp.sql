@@ -1,3 +1,3 @@
--- Track when SKUs are updated after initial creation.
-ALTER TABLE machine_skus ADD COLUMN updated timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL;
-UPDATE machine_skus SET updated = created;
+-- NULL marks SKUs whose last change predates update tracking.
+ALTER TABLE machine_skus ADD COLUMN updated timestamp with time zone;
+ALTER TABLE machine_skus ALTER COLUMN updated SET DEFAULT CURRENT_TIMESTAMP;

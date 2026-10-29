@@ -418,7 +418,7 @@ pub(in crate::tests) mod tests {
             .remove(0);
         // cheat the created/updated timestamps (DB sets both to now())
         actual_sku.created = expected_sku.created;
-        actual_sku.updated = actual_sku.created;
+        actual_sku.updated = expected_sku.updated;
 
         let actual_sku_json = serde_json::ser::to_string_pretty(&actual_sku)?;
 
@@ -591,7 +591,7 @@ pub(in crate::tests) mod tests {
         // cheat the created/updated timestamps (DB sets both to now()) and id
         actual_sku.id = "sku id".to_string();
         actual_sku.created = expected_sku.created;
-        actual_sku.updated = actual_sku.created;
+        actual_sku.updated = expected_sku.updated;
 
         let actual_sku_json: String = serde_json::ser::to_string_pretty(&actual_sku)?;
         tracing::info!(
@@ -2678,10 +2678,9 @@ pub(in crate::tests) mod tests {
             .await?
             .pop()
             .expect("created SKU should exist");
-        assert_eq!(fetched.created, fetched.updated);
+        assert_eq!(fetched.updated, Some(fetched.created));
 
-        // Advance time slightly and update metadata
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // update metadata (uses clock_timestamp(), so no sleep is needed)
         db::sku::update_metadata(
             &mut connection,
             original_sku.id.clone(),
@@ -2695,15 +2694,15 @@ pub(in crate::tests) mod tests {
             .pop()
             .expect("SKU should exist after metadata update");
         assert_eq!(after_metadata.description, "updated description");
-        assert!(after_metadata.updated > after_metadata.created);
+        assert!(after_metadata.updated > Some(after_metadata.created));
 
-        // Advance time and replace SKU
+        // replace SKU
         let prior_updated = after_metadata.updated;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let mut replace_req = original_sku.clone();
         replace_req.description = "replaced description".to_string();
         let replaced_sku = db::sku::replace(&mut connection, &replace_req).await?;
         assert_eq!(replaced_sku.description, "replaced description");
+        assert_eq!(replaced_sku.created, fetched.created);
         assert!(replaced_sku.updated > prior_updated);
 
         // Verify across gRPC boundary
@@ -2716,7 +2715,7 @@ pub(in crate::tests) mod tests {
             .into_inner();
         let rpc_sku = &rpc_res.skus[0];
         assert!(rpc_sku.created.is_some());
-        assert_eq!(rpc_sku.updated, Some(replaced_sku.updated.into()));
+        assert_eq!(rpc_sku.updated, replaced_sku.updated.map(Into::into));
 
         Ok(())
     }

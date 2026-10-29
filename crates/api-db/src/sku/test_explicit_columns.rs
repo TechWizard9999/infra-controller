@@ -48,7 +48,7 @@ async fn exercise_queries(connection: &mut PgConnection) -> Result<(), Box<dyn s
         schema_version: CURRENT_SKU_VERSION,
         description: "accelerator host".to_string(),
         created: Utc::now(),
-        updated: Utc::now(),
+        updated: None,
         device_type: Some("host".to_string()),
         components: SkuComponents {
             chassis: SkuComponentChassis {

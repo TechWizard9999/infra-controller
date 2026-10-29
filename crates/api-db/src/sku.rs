@@ -40,6 +40,8 @@ use crate::{DatabaseError, ObjectFilter, Transaction, machine};
 mod test_decode;
 #[cfg(test)]
 mod test_explicit_columns;
+#[cfg(test)]
+mod test_updated_migration;
 
 /// The current version of the SKU format.  The state machine will create older
 /// versions from hardware using the currently assigned sku's version so that
@@ -560,7 +562,7 @@ pub async fn generate_sku_from_machine_at_version_0_or_1(
         id: format!("{} {}", chassis.model, Utc::now()),
         description,
         created,
-        updated: created,
+        updated: None,
         components: SkuComponents {
             chassis,
             cpus: hardware_info
@@ -661,7 +663,7 @@ pub fn generate_base_sku_from_hardware(
         id: format!("{} {}", chassis.model, Utc::now()),
         description,
         created,
-        updated: created,
+        updated: None,
         components: SkuComponents {
             chassis,
             cpus,
