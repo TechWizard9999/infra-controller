@@ -59,15 +59,22 @@ const CIRCUIT_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
 const CIRCUIT_MAX_BACKOFF: Duration = Duration::from_secs(300);
 /// How long a connection or authentication probe is allowed to run before
 /// another caller may probe.
+///
+/// nv-redfish applies its own two-minute default request timeout, which is
+/// longer than this, so a probe whose request is still in flight can be
+/// superseded by a second probe and the two briefly overlap. That is harmless:
+/// only the probe whose id matches the circuit's current `Probing` state may
+/// change it, so the superseded probe's outcome is discarded.
 const CIRCUIT_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long a credential generation stays marked as known-bad after a
-/// post-refresh retry was refused with it.
+/// How long the authentication circuit stays open after a BMC rejected a
+/// credential generation, before one probe may test that generation again. A
+/// newer generation is probed at once.
 ///
 /// Long enough that a full collection sweep against a misconfigured endpoint
 /// costs one refresh rather than one per resource, short enough that
 /// credentials repaired out of band are picked up within a couple of intervals.
-const KNOWN_BAD_CREDENTIAL_COOLDOWN: Duration = Duration::from_secs(60);
+const AUTH_CIRCUIT_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// How long a credential fetch the provider failed is remembered before another
 /// caller may drive the provider again for this endpoint.
@@ -75,7 +82,7 @@ const KNOWN_BAD_CREDENTIAL_COOLDOWN: Duration = Duration::from_secs(60);
 /// Nothing else damps a provider failure: no request reaches the BMC, so the
 /// connection circuit never trips, and the known-bad record only covers
 /// credentials that were fetched and then refused. The value matches
-/// [`KNOWN_BAD_CREDENTIAL_COOLDOWN`] for the same reason it has: a sweep against
+/// [`AUTH_CIRCUIT_COOLDOWN`] for the same reason it has: a sweep against
 /// an endpoint whose credentials cannot be issued costs one provider call, and a
 /// provider that recovers is noticed within a couple of collection intervals.
 const CREDENTIAL_FETCH_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
@@ -139,16 +146,53 @@ struct ConnectionCircuitClosed {
     bmc_ip: std::net::IpAddr,
 }
 
+/// A BMC's authentication circuit opened because it rejected refreshed credentials.
+#[derive(carbide_instrument::Event)]
+#[event(
+    event_name = "bmc_auth_circuit_opened",
+    metric_name = "carbide_health_bmc_auth_circuit_opened_total",
+    component = "nico-hardware-health",
+    log = warn,
+    metric = counter,
+    message = "BMC rejected refreshed credentials; suppressing requests until the authentication cooldown elapses",
+    describe = "Number of times a BMC authentication circuit opened because refreshed credentials were rejected."
+)]
+struct AuthCircuitOpened {
+    #[context]
+    bmc_ip_address: std::net::IpAddr,
+    #[context]
+    cooldown_seconds: u64,
+    #[context]
+    error: String,
+}
+
+/// A BMC's authentication circuit closed because a protected request succeeded.
+#[derive(carbide_instrument::Event)]
+#[event(
+    event_name = "bmc_auth_circuit_closed",
+    metric_name = "carbide_health_bmc_auth_circuit_closed_total",
+    component = "nico-hardware-health",
+    log = info,
+    metric = counter,
+    message = "BMC accepted credentials again; closing authentication circuit",
+    describe = "Number of times a BMC authentication circuit closed because a protected request succeeded."
+)]
+struct AuthCircuitClosed {
+    #[context]
+    bmc_ip_address: std::net::IpAddr,
+}
+
 /// What a batch-oriented collector should do this iteration, derived from the
-/// endpoint's circuit state via [`BmcClient::collector_sweep`].
+/// endpoint's connection and authentication circuit states via
+/// [`BmcClient::collector_sweep`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollectorSweep {
-    /// Circuit closed — run the full batch as normal.
+    /// Circuits closed — run the full batch as normal.
     Full,
     /// Backoff window elapsed — send a single probe to test reachability instead
     /// of the full fan-out, so a still-dead BMC costs one request, not hundreds.
     Probe,
-    /// Circuit open within the backoff window — skip entirely.
+    /// A circuit is open within its backoff or cooldown window — skip entirely.
     Skip,
 }
 
@@ -169,6 +213,9 @@ struct AuthProbeToken {
 struct BmcRequestTracking {
     credential_generation: AtomicU64,
     transport_started: AtomicBool,
+    /// Set when the transport refused the request because the authentication
+    /// circuit was gating it, so the caller can report a typed error.
+    auth_suppressed: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -185,16 +232,30 @@ tokio::task_local! {
 
 static NEXT_AUTH_CIRCUIT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Per-endpoint authentication circuit state.
+///
+/// A 401 means the BMC refused the credentials themselves, so every request
+/// sharing them would be refused too. The circuit stops that fan-out: after a
+/// rejection only one probe (a refresh and a single replay) reaches the BMC,
+/// and everything else fails locally until the probe settles the question.
 #[derive(Debug, Clone, Copy)]
 enum AuthCircuitState {
+    /// Credentials are not under suspicion; requests flow normally.
     Closed,
+    /// A request was rejected with `generation` and no probe is running. The next
+    /// eligible read at that generation or newer becomes the probe.
+    /// `refresh_generation` is the generation the probe's refresh is measured
+    /// from: a refresh is skipped if the credentials have already moved past it.
     Pending {
         generation: u64,
         refresh_generation: u64,
     },
-    Open {
-        open: AuthCircuitOpen,
-    },
+    /// The BMC rejected `open.generation` after a refresh. Requests fail locally
+    /// until a newer generation exists or [`AUTH_CIRCUIT_COOLDOWN`] elapses, which
+    /// admits one probe.
+    Open { open: AuthCircuitOpen },
+    /// One probe, identified by `probe_id`, is in flight until `deadline`; other
+    /// requests fail locally. After the deadline another caller may probe.
     Probing {
         generation: u64,
         probe_id: u64,
@@ -281,7 +342,7 @@ impl AuthenticationCircuit {
             AuthCircuitState::Open { open }
                 if probe_eligible
                     && generation == open.generation
-                    && open.opened_at.elapsed() >= KNOWN_BAD_CREDENTIAL_COOLDOWN =>
+                    && open.opened_at.elapsed() >= AUTH_CIRCUIT_COOLDOWN =>
             {
                 AuthAdmission::Probe(self.begin_probe(&mut state, generation, open.generation))
             }
@@ -319,7 +380,7 @@ impl AuthenticationCircuit {
             }
             AuthCircuitState::Open { open }
                 if generation == open.generation
-                    && open.opened_at.elapsed() >= KNOWN_BAD_CREDENTIAL_COOLDOWN =>
+                    && open.opened_at.elapsed() >= AUTH_CIRCUIT_COOLDOWN =>
             {
                 AuthAdmission::Probe(self.begin_probe(&mut state, generation, open.generation))
             }
@@ -396,31 +457,65 @@ impl AuthenticationCircuit {
         }
     }
 
+    /// Settle the probe identified by `token` with `state_after`. Returns whether
+    /// `state_after` was applied: `false` if the probe was superseded, or if the
+    /// credentials moved past `request_generation` while it ran, in which case
+    /// the circuit goes `Pending` so the newer credentials are probed instead.
     fn finish_probe_for_generation(
         &self,
         token: AuthProbeToken,
         request_generation: u64,
         state_after: AuthCircuitState,
-    ) {
+    ) -> bool {
         let mut state = self.state.lock().expect("BMC auth circuit mutex poisoned");
         if !matches!(
             *state,
             AuthCircuitState::Probing { probe_id, .. } if probe_id == token.probe_id
         ) {
-            return;
+            return false;
         }
 
         let current_generation = self.credential_generation.load(Ordering::Acquire);
-        *state = if request_generation < current_generation {
-            AuthCircuitState::Pending {
+        if request_generation < current_generation {
+            *state = AuthCircuitState::Pending {
                 generation: current_generation,
                 refresh_generation: request_generation,
-            }
+            };
+            false
         } else {
-            state_after
-        };
+            *state = state_after;
+            true
+        }
     }
 
+    /// What a batch-oriented collector should do this iteration; see
+    /// [`BmcClient::collector_sweep`]. Mirrors the admission rules: a sweep is
+    /// worth running only when a read would be admitted.
+    fn collector_sweep(&self) -> CollectorSweep {
+        let current_generation = self.credential_generation.load(Ordering::Acquire);
+        match *self.state.lock().expect("BMC auth circuit mutex poisoned") {
+            AuthCircuitState::Closed => CollectorSweep::Full,
+            AuthCircuitState::Pending { .. } => CollectorSweep::Probe,
+            AuthCircuitState::Probing { deadline, .. } => {
+                if Instant::now() < deadline {
+                    CollectorSweep::Skip
+                } else {
+                    CollectorSweep::Probe
+                }
+            }
+            AuthCircuitState::Open { open } => {
+                if current_generation > open.generation
+                    || open.opened_at.elapsed() >= AUTH_CIRCUIT_COOLDOWN
+                {
+                    CollectorSweep::Probe
+                } else {
+                    CollectorSweep::Skip
+                }
+            }
+        }
+    }
+
+    /// Open the circuit for `generation` unless a newer verdict is recorded.
     fn note_credentials_refused(&self, generation: u64) {
         if generation < self.credential_generation.load(Ordering::Acquire) {
             return;
@@ -472,13 +567,16 @@ impl AuthProbe {
         );
     }
 
-    fn finish_success(&mut self, request_generation: u64) {
-        self.circuit.finish_probe_for_generation(
+    /// Close the circuit. Returns whether it closed; see
+    /// [`AuthenticationCircuit::finish_probe_for_generation`].
+    fn finish_success(&mut self, request_generation: u64) -> bool {
+        let applied = self.circuit.finish_probe_for_generation(
             self.token,
             request_generation,
             AuthCircuitState::Closed,
         );
         self.finished = true;
+        applied
     }
 
     fn finish_pending(&mut self, request_generation: u64) {
@@ -493,8 +591,10 @@ impl AuthProbe {
         self.finished = true;
     }
 
-    fn finish_open(&mut self, generation: u64) {
-        self.circuit.finish_probe_for_generation(
+    /// Open the circuit. Returns whether it opened; see
+    /// [`AuthenticationCircuit::finish_probe_for_generation`].
+    fn finish_open(&mut self, generation: u64) -> bool {
+        let applied = self.circuit.finish_probe_for_generation(
             self.token,
             generation,
             AuthCircuitState::Open {
@@ -505,6 +605,7 @@ impl AuthProbe {
             },
         );
         self.finished = true;
+        applied
     }
 }
 
@@ -891,6 +992,16 @@ impl BmcClient {
     /// the metric collectors means the series behind that resource vanish for the
     /// interval and reappear on the next one. See NVBug 6506008.
     ///
+    /// Admission is gated by the authentication circuit: while a 401 is being
+    /// recovered from, one caller runs the refresh-and-replay as the probe and
+    /// every other caller fails immediately with
+    /// [`HealthError::BmcAuthCircuitOpen`] without waiting for the probe. A read
+    /// that was already queued behind the endpoint's concurrency limit when the
+    /// rejection happened is refused the same way rather than replayed, so a
+    /// credential rotation can cost those callers one interval of data. Only
+    /// the probe's outcome reopens traffic: a rejection opens the circuit until
+    /// [`AUTH_CIRCUIT_COOLDOWN`] elapses or newer credentials exist.
+    ///
     /// `op` is only ever re-run for reads (`get`/`poll`/`expand`/`filter`/`stream`),
     /// so replaying it is safe. The retry is deliberately single-shot: it runs with
     /// credentials newer than the ones that were rejected, so a second 401 means
@@ -917,12 +1028,7 @@ impl BmcClient {
         let generation = self.credential_generation.load(Ordering::Acquire);
         match self.auth_circuit.admit_read(generation, true) {
             AuthAdmission::Normal => {}
-            AuthAdmission::Blocked => {
-                return Err(HealthError::GenericError(format!(
-                    "BMC {} authentication recovery is active; request was not sent",
-                    self.addr.ip
-                )));
-            }
+            AuthAdmission::Blocked => return Err(self.auth_suppressed_error()),
             AuthAdmission::Probe(probe) => {
                 return self
                     .run_auth_probe(op, probe, None, can_confirm_authentication)
@@ -1032,7 +1138,9 @@ impl BmcClient {
             .refresh_credentials(refresh_context, Some(probe.refresh_generation))
             .await
         {
-            probe.finish_open(self.credential_generation.load(Ordering::Acquire));
+            if probe.finish_open(self.credential_generation.load(Ordering::Acquire)) {
+                self.emit_auth_circuit_opened(&refresh_error);
+            }
             return Err(original_error.unwrap_or(refresh_error));
         }
 
@@ -1041,19 +1149,35 @@ impl BmcClient {
         let (result, request_generation) =
             probe.scope(self.guarded_with_generation(op(), true)).await;
         match &result {
-            Ok(_) if can_confirm_authentication => probe.finish_success(request_generation),
-            Ok(_) => probe.finish_pending(request_generation),
             Err(error) if is_credential_rejection(error) => {
-                probe.finish_open(request_generation);
+                if probe.finish_open(request_generation) {
+                    self.emit_auth_circuit_opened(error);
+                }
             }
-            // A resource-specific 403 shows that the credentials were accepted.
-            Err(error) if is_auth_error(error) && can_confirm_authentication => {
-                probe.finish_success(request_generation);
+            // No HTTP response: the credentials were never presented. Stay pending.
+            Err(error) if is_connection_error(error) => probe.finish_pending(request_generation),
+            // The auth circuit itself refused the probe, so nothing was presented.
+            Err(HealthError::BmcAuthCircuitOpen(_)) => probe.finish_pending(request_generation),
+            // Any other HTTP status (including a resource-specific 403) or an
+            // undecodable body was produced after the BMC accepted the credentials.
+            _ if can_confirm_authentication => {
+                if probe.finish_success(request_generation) {
+                    emit(AuthCircuitClosed {
+                        bmc_ip_address: self.addr.ip,
+                    });
+                }
             }
-            Err(error) if is_auth_error(error) => probe.finish_pending(request_generation),
-            Err(_) => probe.finish_open(request_generation),
+            _ => probe.finish_pending(request_generation),
         }
         result
+    }
+
+    fn emit_auth_circuit_opened(&self, error: &HealthError) {
+        emit(AuthCircuitOpened {
+            bmc_ip_address: self.addr.ip,
+            cooldown_seconds: AUTH_CIRCUIT_COOLDOWN.as_secs(),
+            error: error.to_string(),
+        });
     }
 
     /// [`Self::read_with_auth_retry`] for a repaired read, which fails with a
@@ -1101,16 +1225,20 @@ impl BmcClient {
         })
     }
 
-    /// Record that a replay running at `generation` was refused, so subsequent
-    /// callers observing the same generation skip the refresh-and-replay.
+    /// Record that a request run at `generation` was refused after a refresh, so
+    /// the authentication circuit opens and callers at the same generation fail
+    /// locally instead of refreshing and replaying again.
     fn note_credentials_refused(&self, generation: u64) {
         self.auth_circuit.note_credentials_refused(generation);
     }
 
-    /// Run a BMC operation through the connection circuit breaker.
+    /// Run a BMC operation through the authentication and connection circuits.
     ///
-    /// Fast-fails (without touching the network) while the circuit is open, and
-    /// updates the breaker based on the outcome. A connect-level failure trips
+    /// The authentication circuit admits it, fails it locally with
+    /// [`HealthError::BmcAuthCircuitOpen`], or runs it as the recovery probe; the
+    /// connection circuit then guards the request itself as described below.
+    /// Fast-fails (without touching the network) while the connection circuit is
+    /// open, and updates the breaker based on the outcome. A connect-level failure trips
     /// it. Any other outcome — a success, or a non-connection error such as a
     /// 404/auth/decode — means the BMC actually answered, so it closes the
     /// circuit. Closing on a non-connection error matters for the half-open
@@ -1134,10 +1262,7 @@ impl BmcClient {
         match self.auth_circuit.admit_read(generation, probe_eligible) {
             AuthAdmission::Normal => self.guarded_with_generation(op, track_auth_failure).await.0,
             AuthAdmission::Probe(probe) => self.run_auth_probe(|| op, probe, None, true).await,
-            AuthAdmission::Blocked => Err(HealthError::GenericError(format!(
-                "BMC {} authentication recovery is active; request was not sent",
-                self.addr.ip
-            ))),
+            AuthAdmission::Blocked => Err(self.auth_suppressed_error()),
         }
     }
 
@@ -1150,6 +1275,7 @@ impl BmcClient {
         let tracking = Arc::new(BmcRequestTracking {
             credential_generation: AtomicU64::new(credential_generation),
             transport_started: AtomicBool::new(false),
+            auth_suppressed: AtomicBool::new(false),
         });
         let context = BmcRequestContext {
             circuit_id: self.auth_circuit.id,
@@ -1163,6 +1289,11 @@ impl BmcClient {
                     Ok(value) => {
                         self.note_reachable();
                         Ok(value)
+                    }
+                    Err(_) if tracking.auth_suppressed.load(Ordering::Acquire) => {
+                        // The transport never sent the request, so the BMC was not
+                        // heard from either way: leave the connection circuit alone.
+                        Err(self.auth_suppressed_error())
                     }
                     Err(error) => {
                         if is_connection_error(&error) {
@@ -1285,11 +1416,21 @@ impl BmcClient {
 
     /// What a batch-oriented caller (e.g. the sensor sweep) should do this
     /// iteration, so it can avoid both the request flood and its log spam:
-    /// run the full batch, send a single probe, or skip entirely. Reading this
+    /// run the full batch, send a single probe, or skip entirely. Both the
+    /// connection circuit and the authentication circuit are consulted; the more
+    /// restrictive answer wins. Reading this
     /// once up front — rather than letting each request fast-fail individually —
     /// keeps a dead endpoint from re-emitting a per-request burst every time the
     /// backoff window elapses.
     pub fn collector_sweep(&self) -> CollectorSweep {
+        match (self.connection_sweep(), self.auth_circuit.collector_sweep()) {
+            (CollectorSweep::Skip, _) | (_, CollectorSweep::Skip) => CollectorSweep::Skip,
+            (CollectorSweep::Probe, _) | (_, CollectorSweep::Probe) => CollectorSweep::Probe,
+            (CollectorSweep::Full, CollectorSweep::Full) => CollectorSweep::Full,
+        }
+    }
+
+    fn connection_sweep(&self) -> CollectorSweep {
         // Fast path: a closed circuit runs normally and never takes the lock.
         if !self.circuit_tripped.load(Ordering::Acquire) {
             return CollectorSweep::Full;
@@ -1312,6 +1453,11 @@ impl BmcClient {
                 }
             }
         }
+    }
+
+    /// The error for a request the authentication circuit kept off the wire.
+    fn auth_suppressed_error(&self) -> HealthError {
+        HealthError::BmcAuthCircuitOpen(self.addr.ip)
     }
 
     fn circuit_open_error(&self) -> HealthError {
@@ -1380,6 +1526,17 @@ impl InstrumentedHttpClient {
         if self.auth_circuit.request_allowed() {
             Ok(())
         } else {
+            // Tell the enclosing request, if any, why it failed, so it reports
+            // `HealthError::BmcAuthCircuitOpen` rather than this transport-typed
+            // error, which cannot carry the variant.
+            let _ = BMC_REQUEST_CONTEXT.try_with(|context| {
+                if context.circuit_id == self.auth_circuit.id {
+                    context
+                        .tracking
+                        .auth_suppressed
+                        .store(true, Ordering::Release);
+                }
+            });
             Err(BmcError::InvalidRequest(
                 "BMC authentication recovery is active; request was suppressed before transport"
                     .to_string(),
@@ -2667,6 +2824,7 @@ mod tests {
             tracking: Arc::new(BmcRequestTracking {
                 credential_generation: AtomicU64::new(1),
                 transport_started: AtomicBool::new(false),
+                auth_suppressed: AtomicBool::new(false),
             }),
         };
         let probe_result = probe
@@ -2709,6 +2867,7 @@ mod tests {
             tracking: Arc::new(BmcRequestTracking {
                 credential_generation: AtomicU64::new(1),
                 transport_started: AtomicBool::new(false),
+                auth_suppressed: AtomicBool::new(false),
             }),
         };
         let url = base_url
@@ -2762,6 +2921,7 @@ mod tests {
             tracking: Arc::new(BmcRequestTracking {
                 credential_generation: AtomicU64::new(1),
                 transport_started: AtomicBool::new(false),
+                auth_suppressed: AtomicBool::new(false),
             }),
         };
         let url = base_url
@@ -3616,31 +3776,32 @@ mod tests {
         let client =
             test_bmc(reqwest(), test_addr(), provider.clone(), None, 10, None).expect("ok");
 
-        for read in 0..3 {
+        let (op, attempts) = scripted_op(vec![Err(auth_error())]);
+        let error = client
+            .read_with_auth_retry(op)
+            .await
+            .expect_err("the refresh cannot produce credentials");
+        assert!(
+            is_auth_error(&error),
+            "the initial read surfaces the original 401: {error:?}"
+        );
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
+
+        for read in 1..3 {
             let (op, attempts) = scripted_op(vec![Err(auth_error())]);
             let error = client
                 .read_with_auth_retry(op)
                 .await
                 .expect_err("the refresh cannot produce credentials");
-            if read == 0 {
-                assert!(
-                    is_auth_error(&error),
-                    "the initial read surfaces the original 401: {error:?}"
-                );
-                assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
-            } else {
-                assert!(
-                    error
-                        .to_string()
-                        .contains("authentication recovery is active"),
-                    "read {read} should fail locally during recovery: {error:?}"
-                );
-                assert_eq!(
-                    attempts.load(AtomicOrdering::SeqCst),
-                    0,
-                    "read {read} must be suppressed before the operation"
-                );
-            }
+            assert!(
+                matches!(error, HealthError::BmcAuthCircuitOpen(_)),
+                "read {read} should fail locally during recovery: {error:?}"
+            );
+            assert_eq!(
+                attempts.load(AtomicOrdering::SeqCst),
+                0,
+                "read {read} must be suppressed before the operation"
+            );
         }
         assert_eq!(
             provider.calls.load(AtomicOrdering::SeqCst),
@@ -3651,7 +3812,7 @@ mod tests {
         let generation = client.credential_generation.load(Ordering::Acquire);
         client.set_auth_circuit_open_for_test(Some(AuthCircuitOpen {
             generation,
-            opened_at: Instant::now() - KNOWN_BAD_CREDENTIAL_COOLDOWN - Duration::from_secs(1),
+            opened_at: Instant::now() - AUTH_CIRCUIT_COOLDOWN - Duration::from_secs(1),
         }));
         client.set_credential_fetch_failure_for_test(expired_fetch_failure());
         let (op, _) = scripted_op(vec![Err(auth_error())]);
@@ -3735,12 +3896,16 @@ mod tests {
         );
 
         // Every subsequent read observes the generation just proven bad.
-        for read in 0..300 {
+        for read in 0..2 {
             let (op, attempts) = scripted_op(vec![Err(auth_error())]);
-            client
+            let error = client
                 .read_with_auth_retry(op)
                 .await
                 .expect_err("still refused");
+            assert!(
+                matches!(error, HealthError::BmcAuthCircuitOpen(_)),
+                "read {read} fails with the typed suppression error: {error:?}"
+            );
             assert_eq!(
                 attempts.load(AtomicOrdering::SeqCst),
                 0,
@@ -3770,7 +3935,7 @@ mod tests {
         let generation = client.credential_generation.load(Ordering::Acquire);
         client.set_auth_circuit_open_for_test(Some(AuthCircuitOpen {
             generation,
-            opened_at: Instant::now() - KNOWN_BAD_CREDENTIAL_COOLDOWN - Duration::from_secs(1),
+            opened_at: Instant::now() - AUTH_CIRCUIT_COOLDOWN - Duration::from_secs(1),
         }));
 
         let (op, attempts) = scripted_op(vec![Ok("body")]);
@@ -3954,9 +4119,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_non_auth_probe_failure_keeps_recovery_gated() {
-        // A 500 says nothing about credential validity, but it also does not
-        // prove that protected reads are healthy enough to reopen the circuit.
+    async fn probe_outcome_decides_the_auth_circuit_state() {
+        // Only a 401 on the probe shows the credentials are bad. Any other answer
+        // from the BMC means they were accepted; no answer proves nothing.
+        enum Expected {
+            Open,
+            Closed,
+            Pending,
+        }
+        let rows = [
+            ("401", auth_error(), Expected::Open),
+            (
+                "404",
+                HealthError::BmcError(Box::new(bmc_status_error(http::StatusCode::NOT_FOUND))),
+                Expected::Closed,
+            ),
+            (
+                "undecodable body",
+                HealthError::BmcError("invalid JSON in response".into()),
+                Expected::Closed,
+            ),
+            (
+                "no HTTP response",
+                HealthError::BmcCircuitOpen("10.0.0.1".parse().unwrap()),
+                Expected::Pending,
+            ),
+        ];
+        for (name, probe_error, expected) in rows {
+            let (provider, _) = CountingProvider::new(
+                BmcCredentials::SessionToken {
+                    token: "t".to_string(),
+                },
+                None,
+            );
+            let client = test_bmc(reqwest(), test_addr(), provider, None, 10, None).expect("ok");
+            let (op, _) = scripted_op(vec![Err(auth_error()), Err(probe_error)]);
+
+            client
+                .read_with_auth_retry(op)
+                .await
+                .expect_err("the probe error surfaces");
+
+            let state = *client
+                .auth_circuit
+                .state
+                .lock()
+                .expect("auth circuit mutex");
+            let matches_expected = match expected {
+                Expected::Open => matches!(state, AuthCircuitState::Open { .. }),
+                Expected::Closed => matches!(state, AuthCircuitState::Closed),
+                Expected::Pending => matches!(state, AuthCircuitState::Pending { .. }),
+            };
+            assert!(
+                matches_expected,
+                "{name}: unexpected circuit state {state:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_circuit_events_are_emitted_on_open_and_close() {
         let (provider, _) = CountingProvider::new(
             BmcCredentials::SessionToken {
                 token: "t".to_string(),
@@ -3964,26 +4186,91 @@ mod tests {
             None,
         );
         let client = test_bmc(reqwest(), test_addr(), provider, None, 10, None).expect("ok");
-        let (op, _) = scripted_op(vec![
-            Err(auth_error()),
-            Err(HealthError::HttpError("HTTP 500".to_string())),
-        ]);
+        let (op, _) = scripted_op(vec![Err(auth_error()), Err(auth_error())]);
+        let (_, opened_logs) =
+            carbide_instrument::testing::capture_logs_async(client.read_with_auth_retry(op)).await;
+        let opened: Vec<&str> = opened_logs
+            .iter()
+            .map(|log| log.message.as_str())
+            .filter(|message| {
+                message.contains("authentication circuit")
+                    || message.contains("authentication cooldown")
+            })
+            .collect();
+        assert_eq!(
+            opened,
+            [
+                "BMC rejected refreshed credentials; suppressing requests until the authentication cooldown elapses"
+            ],
+            "a rejected probe opens the circuit exactly once"
+        );
 
-        client
-            .read_with_auth_retry(op)
-            .await
-            .expect_err("the 500 surfaces");
+        client.set_auth_circuit_open_for_test(Some(AuthCircuitOpen {
+            generation: client.credential_generation.load(Ordering::Acquire),
+            opened_at: Instant::now() - AUTH_CIRCUIT_COOLDOWN - Duration::from_secs(1),
+        }));
+        let (op, _) = scripted_op(vec![Ok("accepted")]);
+        let (result, closed_logs) =
+            carbide_instrument::testing::capture_logs_async(client.read_with_auth_retry(op)).await;
+        result.expect("the probe succeeds");
+        let closed: Vec<&str> = closed_logs
+            .iter()
+            .map(|log| log.message.as_str())
+            .filter(|message| {
+                message.contains("authentication circuit")
+                    || message.contains("authentication cooldown")
+            })
+            .collect();
+        assert_eq!(
+            closed,
+            ["BMC accepted credentials again; closing authentication circuit"],
+            "a successful probe closes the circuit exactly once"
+        );
+    }
 
-        assert!(
-            matches!(
-                *client
-                    .auth_circuit
-                    .state
-                    .lock()
-                    .expect("auth circuit mutex"),
-                AuthCircuitState::Open { .. }
+    #[tokio::test]
+    async fn collector_sweep_follows_the_auth_circuit() {
+        let (provider, _) = CountingProvider::new(
+            BmcCredentials::SessionToken {
+                token: "t".to_string(),
+            },
+            None,
+        );
+        let client = test_bmc(reqwest(), test_addr(), provider, None, 10, None).expect("ok");
+        let generation = client.credential_generation.load(Ordering::Acquire);
+        let rows = [
+            ("closed", None, CollectorSweep::Full),
+            (
+                "fresh rejection",
+                Some(AuthCircuitOpen {
+                    generation,
+                    opened_at: Instant::now(),
+                }),
+                CollectorSweep::Skip,
             ),
-            "an unverified recovery result must keep normal traffic gated"
+            (
+                "cooldown elapsed",
+                Some(AuthCircuitOpen {
+                    generation,
+                    opened_at: Instant::now() - AUTH_CIRCUIT_COOLDOWN - Duration::from_secs(1),
+                }),
+                CollectorSweep::Probe,
+            ),
+        ];
+        for (name, record, expected) in rows {
+            client.set_auth_circuit_open_for_test(record);
+            assert_eq!(client.collector_sweep(), expected, "{name}");
+        }
+
+        client.set_auth_circuit_open_for_test(Some(AuthCircuitOpen {
+            generation,
+            opened_at: Instant::now(),
+        }));
+        client.credential_generation.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(
+            client.collector_sweep(),
+            CollectorSweep::Probe,
+            "newer credentials than the rejected ones are worth probing"
         );
     }
 
@@ -4106,7 +4393,7 @@ mod tests {
         let client = test_client();
         client.set_auth_circuit_open_for_test(Some(AuthCircuitOpen {
             generation: 3,
-            opened_at: Instant::now() - KNOWN_BAD_CREDENTIAL_COOLDOWN - Duration::from_secs(1),
+            opened_at: Instant::now() - AUTH_CIRCUIT_COOLDOWN - Duration::from_secs(1),
         }));
 
         let AuthAdmission::Probe(probe) = client.auth_circuit.admit_read(3, true) else {
@@ -4841,6 +5128,77 @@ mod tests {
             provider_calls.load(AtomicOrdering::SeqCst),
             2,
             "initial fetch plus one refresh"
+        );
+        server.join().expect("test server thread");
+    }
+
+    #[tokio::test]
+    async fn reads_queued_for_a_concurrency_slot_never_reach_a_rejecting_bmc() {
+        // The endpoint admits one request at a time, so 49 of the 50 reads are
+        // queued when the first is rejected. Once the circuit is gating, none of
+        // them may be sent: the BMC sees the rejected read and one probe only.
+        // The server has spare responses so an extra request would be counted
+        // instead of hanging the client.
+        let (base_url, requests, _server) = spawn_scripted_http_server(vec![(401, "{}"); 4]);
+        let (client, provider_calls) = client_against(base_url);
+
+        let root = ODataId::service_root();
+        let results =
+            futures::future::join_all((0..50).map(|_| client.get::<TestEntity>(&root))).await;
+
+        assert!(
+            results.iter().all(Result::is_err),
+            "every read fails against a BMC that rejects the credentials"
+        );
+        assert_eq!(
+            requests.load(AtomicOrdering::SeqCst),
+            2,
+            "the rejected read plus one probe"
+        );
+        assert_eq!(
+            provider_calls.load(AtomicOrdering::SeqCst),
+            2,
+            "initial fetch plus the probe's refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_cooldown_probe_restarts_the_cooldown() {
+        let (base_url, requests, server) = spawn_scripted_http_server(vec![(401, "{}")]);
+        let (client, provider_calls) = client_against(base_url);
+        client
+            .ensure_credentials()
+            .await
+            .expect("initial credentials load");
+        client.set_auth_circuit_open_for_test(Some(AuthCircuitOpen {
+            generation: client.credential_generation.load(Ordering::Acquire),
+            opened_at: Instant::now() - AUTH_CIRCUIT_COOLDOWN - Duration::from_secs(1),
+        }));
+
+        client
+            .get::<TestEntity>(&ODataId::service_root())
+            .await
+            .expect_err("the BMC rejects the cooldown probe");
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(provider_calls.load(AtomicOrdering::SeqCst), 2);
+
+        let suppressed = client
+            .get::<TestEntity>(&ODataId::service_root())
+            .await
+            .expect_err("the restarted cooldown suppresses the next read");
+        assert!(
+            matches!(suppressed, HealthError::BmcAuthCircuitOpen(_)),
+            "{suppressed:?}"
+        );
+        assert_eq!(
+            requests.load(AtomicOrdering::SeqCst),
+            1,
+            "the suppressed read never reaches the BMC"
+        );
+        assert_eq!(
+            provider_calls.load(AtomicOrdering::SeqCst),
+            2,
+            "and does not spend a credential fetch"
         );
         server.join().expect("test server thread");
     }
