@@ -687,4 +687,43 @@ assert_eq "override source" "override" "$boot_part_source"
 assert_log_contains "Resolved /boot from bootfs_uuid=boot-override to /dev/targetp2"
 bootfs_uuid=
 
+echo "verify_sha: matching checksum"
+probe_file="$temp_dir/probe.bin"
+printf 'probe data\n' >"$probe_file"
+file="$probe_file"
+probe_sha=$(sha256sum "$probe_file" 2>/dev/null || shasum -a 256 "$probe_file")
+probe_sha=${probe_sha%% *}
+verify_sha "$probe_sha" >/dev/null 2>&1 || fail "valid sha verification failed"
+
+echo "verify_sha: mismatching checksum"
+if verify_sha "$(printf '%064d' 0)" >/dev/null 2>&1; then
+	fail "mismatching sha verification succeeded unexpectedly"
+fi
+
+echo "verify_sha: unknown digest length"
+if verify_sha "short" >/dev/null 2>&1; then
+	fail "invalid sha digest length succeeded unexpectedly"
+fi
+
+echo "curl_url: preserves failure exit code"
+mock_failing_curl() {
+	return 22
+}
+curl() {
+	mock_failing_curl
+}
+curl_url "http://example.com/fail.qcow2" >/dev/null 2>&1
+assert_eq "curl_url failure status" 22 "$?"
+
+echo "entrypoint: reboot suppression on failed main"
+entrypoint_output=$("${BASH:-bash}" "$script_under_test" 2>&1)
+entrypoint_status=$?
+assert_eq "entrypoint failure status" 1 "$entrypoint_status"
+if [[ "$entrypoint_output" =~ "Rebooting" ]]; then
+	fail "entrypoint attempted reboot after main failed: $entrypoint_output"
+fi
+if [[ ! "$entrypoint_output" =~ "Imaging failed; reboot suppressed" ]]; then
+	fail "entrypoint did not indicate reboot was suppressed: $entrypoint_output"
+fi
+
 echo "disk imaging identifier tests passed"

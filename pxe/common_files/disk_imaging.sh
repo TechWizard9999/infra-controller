@@ -52,6 +52,7 @@ function curl_url() {
 	fi
 	curl --retry 5 --retry-all-errors -k -L "$@" \
 		--output "$file" "$url" 2>&1 | tee "$log_output"
+	return "${PIPESTATUS[0]}"
 }
 
 # Announces the download without exposing URL queries, which may contain
@@ -101,7 +102,7 @@ function build_image_auth_args() {
 function verify_sha() {
 	sha=$1
 
-	len=$(expr length $sha)
+	len=${#sha}
 	if [ $len -eq 40 ]; then
 		shasum=shasum
 	elif [ $len -eq 64 ]; then
@@ -112,9 +113,10 @@ function verify_sha() {
 		shasum=sha512sum
 	else
 		echo "Unknown sha digest length" | tee $log_output
-		exit 1;
+		return 1
 	fi
-	echo "$sha $file" | $shasum --check 2>&1 | tee $log_output
+	echo "$sha $file" | $shasum --check - 2>&1 | tee $log_output
+	return "${PIPESTATUS[1]}"
 }
 
 function find_efi_disk() {
@@ -218,8 +220,16 @@ function get_distro_image() {
 		exit 1;
 	fi
 	curl --retry 5 --retry-all-errors -k -L $shaurl --output shafile 2>&1 | tee $log_output
+	if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+		echo "Failed to download checksum file from $shaurl" | tee "$log_output"
+		return 1
+	fi
 	file=$(basename $image_url)
 	image_sha=$(grep -m 1 $file shafile)
+	if [ -z "$image_sha" ]; then
+		echo "Checksum for $file not found in $shaurl" | tee "$log_output"
+		return 1
+	fi
 }
 
 function add_cloud_init() {
@@ -1181,7 +1191,7 @@ function main() {
 	fi
 
 	if [ ! -z "$distro_name" ]; then
-		get_distro_image
+		get_distro_image || return 1
 	fi
 
 	if [ -z "$image_url" ]; then
@@ -1200,7 +1210,10 @@ function main() {
 	fi
 
 	announce_image_download
-	curl_url "$image_url" "${image_auth[@]}"
+	if ! curl_url "$image_url" "${image_auth[@]}"; then
+		echo "Failed to download image from $image_url" | tee "$log_output"
+		return 1
+	fi
 	if [ -n "$image_auth_header_file" ]; then
 		rm -f "$image_auth_header_file"
 		trap - EXIT INT TERM
@@ -1231,7 +1244,7 @@ function main() {
 
 	echo "Imaging $file to $image_disk" | tee $log_output
 	qemu-img convert -p -O raw -S 0 "$file" "$image_disk" 2>&1 | tee $log_output
-	ret=$?
+	ret=${PIPESTATUS[0]}
 	if [ $ret -ne 0 ]; then
 		echo "Imaging failed $ret" | tee $log_output
 		return $ret;
@@ -1272,7 +1285,10 @@ function main() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-	main
+	if ! main; then
+		echo "Imaging failed; reboot suppressed" | tee "$log_output" >&2
+		exit 1
+	fi
 	echo "Rebooting" | tee $log_output
 	systemctl reboot | tee $log_output
 fi
