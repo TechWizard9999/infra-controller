@@ -47,6 +47,8 @@ const (
 	Forge_DeleteSpxPartition_FullMethodName                                 = "/forge.Forge/DeleteSpxPartition"
 	Forge_FindSpxPartitionIds_FullMethodName                                = "/forge.Forge/FindSpxPartitionIds"
 	Forge_FindSpxPartitionsByIds_FullMethodName                             = "/forge.Forge/FindSpxPartitionsByIds"
+	Forge_GetMachineSpxMultiplane_FullMethodName                            = "/forge.Forge/GetMachineSpxMultiplane"
+	Forge_UpdateMachineSpxMultiplaneMaintenance_FullMethodName              = "/forge.Forge/UpdateMachineSpxMultiplaneMaintenance"
 	Forge_CreateVpcPrefix_FullMethodName                                    = "/forge.Forge/CreateVpcPrefix"
 	Forge_SearchVpcPrefixes_FullMethodName                                  = "/forge.Forge/SearchVpcPrefixes"
 	Forge_GetVpcPrefixes_FullMethodName                                     = "/forge.Forge/GetVpcPrefixes"
@@ -436,6 +438,7 @@ const (
 	Forge_FindSkusByIds_FullMethodName                                      = "/forge.Forge/FindSkusByIds"
 	Forge_UpdateSkuMetadata_FullMethodName                                  = "/forge.Forge/UpdateSkuMetadata"
 	Forge_ReplaceSku_FullMethodName                                         = "/forge.Forge/ReplaceSku"
+	Forge_ReplaceSkuComponents_FullMethodName                               = "/forge.Forge/ReplaceSkuComponents"
 	Forge_GetManagedHostQuarantineState_FullMethodName                      = "/forge.Forge/GetManagedHostQuarantineState"
 	Forge_SetManagedHostQuarantineState_FullMethodName                      = "/forge.Forge/SetManagedHostQuarantineState"
 	Forge_ClearManagedHostQuarantineState_FullMethodName                    = "/forge.Forge/ClearManagedHostQuarantineState"
@@ -625,6 +628,10 @@ type ForgeClient interface {
 	DeleteSpxPartition(ctx context.Context, in *SpxPartitionDeletionRequest, opts ...grpc.CallOption) (*SpxPartitionDeletionResult, error)
 	FindSpxPartitionIds(ctx context.Context, in *SpxPartitionSearchFilter, opts ...grpc.CallOption) (*SpxPartitionIdList, error)
 	FindSpxPartitionsByIds(ctx context.Context, in *SpxPartitionsByIdsRequest, opts ...grpc.CallOption) (*SpxPartitionList, error)
+	// Read requested maintenance for the declared CX9 logical interfaces on a host.
+	GetMachineSpxMultiplane(ctx context.Context, in *MachineSpxMultiplaneRequest, opts ...grpc.CallOption) (*MachineSpxMultiplane, error)
+	// Atomically save maintenance mode for the selected rails and planes.
+	UpdateMachineSpxMultiplaneMaintenance(ctx context.Context, in *MachineSpxMultiplaneMaintenanceUpdateRequest, opts ...grpc.CallOption) (*MachineSpxMultiplane, error)
 	// VPC prefixes
 	CreateVpcPrefix(ctx context.Context, in *VpcPrefixCreationRequest, opts ...grpc.CallOption) (*VpcPrefix, error)
 	SearchVpcPrefixes(ctx context.Context, in *VpcPrefixSearchQuery, opts ...grpc.CallOption) (*VpcPrefixIdList, error)
@@ -1135,7 +1142,9 @@ type ForgeClient interface {
 	DeleteAllExpectedRackGroups(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Perform Attestation Procedure for Measured Boot
 	AttestQuote(ctx context.Context, in *AttestQuoteRequest, opts ...grpc.CallOption) (*AttestQuoteResponse, error)
+	//
 	// InstanceType
+	//
 	CreateInstanceType(ctx context.Context, in *CreateInstanceTypeRequest, opts ...grpc.CallOption) (*CreateInstanceTypeResponse, error)
 	FindInstanceTypeIds(ctx context.Context, in *FindInstanceTypeIdsRequest, opts ...grpc.CallOption) (*FindInstanceTypeIdsResponse, error)
 	FindInstanceTypesByIds(ctx context.Context, in *FindInstanceTypesByIdsRequest, opts ...grpc.CallOption) (*FindInstanceTypesByIdsResponse, error)
@@ -1192,7 +1201,9 @@ type ForgeClient interface {
 	ListMeasurementTrustedMachines(ctx context.Context, in *ListMeasurementTrustedMachinesRequest, opts ...grpc.CallOption) (*ListMeasurementTrustedMachinesResponse, error)
 	ListMeasurementTrustedProfiles(ctx context.Context, in *ListMeasurementTrustedProfilesRequest, opts ...grpc.CallOption) (*ListMeasurementTrustedProfilesResponse, error)
 	ListAttestationSummary(ctx context.Context, in *ListAttestationSummaryRequest, opts ...grpc.CallOption) (*ListAttestationSummaryResponse, error)
+	//
 	// NetworkSecurityGroups
+	//
 	CreateNetworkSecurityGroup(ctx context.Context, in *CreateNetworkSecurityGroupRequest, opts ...grpc.CallOption) (*CreateNetworkSecurityGroupResponse, error)
 	FindNetworkSecurityGroupIds(ctx context.Context, in *FindNetworkSecurityGroupIdsRequest, opts ...grpc.CallOption) (*FindNetworkSecurityGroupIdsResponse, error)
 	FindNetworkSecurityGroupsByIds(ctx context.Context, in *FindNetworkSecurityGroupsByIdsRequest, opts ...grpc.CallOption) (*FindNetworkSecurityGroupsByIdsResponse, error)
@@ -1309,7 +1320,7 @@ type ForgeClient interface {
 	// Terminate active rack maintenance and transition the rack to Error.
 	TerminateRackMaintenance(ctx context.Context, in *RackMaintenanceTerminateRequest, opts ...grpc.CallOption) (*RackMaintenanceTerminateResponse, error)
 	// TPM CA certs Management
-	// rpc TpmDeleteCaCert(TpmCaCertDetails) returns (google.protobuf.Empty);
+	//rpc TpmDeleteCaCert(TpmCaCertDetails) returns (google.protobuf.Empty);
 	TpmAddCaCert(ctx context.Context, in *TpmCaCert, opts ...grpc.CallOption) (*TpmCaAddedCaStatus, error)
 	TpmShowCaCerts(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*TpmCaCertDetailCollection, error)
 	TpmShowUnmatchedEkCerts(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*TpmEkCertStatusCollection, error)
@@ -1363,7 +1374,22 @@ type ForgeClient interface {
 	GetAllSkuIds(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*SkuIdList, error)
 	FindSkusByIds(ctx context.Context, in *SkusByIdsRequest, opts ...grpc.CallOption) (*SkuList, error)
 	UpdateSkuMetadata(ctx context.Context, in *SkuUpdateMetadataRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Replace the components and metadata of an existing SKU.
+	// Omitting `components` replaces the stored definition with empty values.
+	// Input `components.ethernet_devices` values are ignored; the response list
+	// is empty.
+	// Omitted description becomes empty; omitted device_type becomes unset.
+	// Preserves creation time and machine assignments, requests SKU verification,
+	// and returns the stored SKU with its associated machine IDs.
+	// The schema_version must equal the current SKU schema version. An empty ID,
+	// unsupported schema version, invalid storage constraints, or components
+	// matching another SKU return INVALID_ARGUMENT before absence is checked.
+	// A valid replacement that does not match another SKU returns NOT_FOUND
+	// when its target ID is absent. Other database failures return INTERNAL.
 	ReplaceSku(ctx context.Context, in *Sku, opts ...grpc.CallOption) (*Sku, error)
+	// Replace the complete component definition, preserving omitted metadata.
+	// Requests SKU verification and returns the replaced SKU with its associated machine IDs.
+	ReplaceSkuComponents(ctx context.Context, in *ReplaceSkuComponentsRequest, opts ...grpc.CallOption) (*Sku, error)
 	// get/set/clear quarantine state on machines
 	GetManagedHostQuarantineState(ctx context.Context, in *GetManagedHostQuarantineStateRequest, opts ...grpc.CallOption) (*GetManagedHostQuarantineStateResponse, error)
 	SetManagedHostQuarantineState(ctx context.Context, in *SetManagedHostQuarantineStateRequest, opts ...grpc.CallOption) (*SetManagedHostQuarantineStateResponse, error)
@@ -1395,7 +1421,9 @@ type ForgeClient interface {
 	// Lists the rack profiles from the effective runtime configuration.
 	// Rack profiles are configuration, not persisted rack resources.
 	ListRackProfiles(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ListRackProfilesResponse, error)
+	//
 	// Compute Allocations
+	//
 	CreateComputeAllocation(ctx context.Context, in *CreateComputeAllocationRequest, opts ...grpc.CallOption) (*CreateComputeAllocationResponse, error)
 	FindComputeAllocationIds(ctx context.Context, in *FindComputeAllocationIdsRequest, opts ...grpc.CallOption) (*FindComputeAllocationIdsResponse, error)
 	FindComputeAllocationsByIds(ctx context.Context, in *FindComputeAllocationsByIdsRequest, opts ...grpc.CallOption) (*FindComputeAllocationsByIdsResponse, error)
@@ -1887,6 +1915,26 @@ func (c *forgeClient) FindSpxPartitionsByIds(ctx context.Context, in *SpxPartiti
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SpxPartitionList)
 	err := c.cc.Invoke(ctx, Forge_FindSpxPartitionsByIds_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) GetMachineSpxMultiplane(ctx context.Context, in *MachineSpxMultiplaneRequest, opts ...grpc.CallOption) (*MachineSpxMultiplane, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineSpxMultiplane)
+	err := c.cc.Invoke(ctx, Forge_GetMachineSpxMultiplane_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) UpdateMachineSpxMultiplaneMaintenance(ctx context.Context, in *MachineSpxMultiplaneMaintenanceUpdateRequest, opts ...grpc.CallOption) (*MachineSpxMultiplane, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineSpxMultiplane)
+	err := c.cc.Invoke(ctx, Forge_UpdateMachineSpxMultiplaneMaintenance_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -5786,6 +5834,16 @@ func (c *forgeClient) ReplaceSku(ctx context.Context, in *Sku, opts ...grpc.Call
 	return out, nil
 }
 
+func (c *forgeClient) ReplaceSkuComponents(ctx context.Context, in *ReplaceSkuComponentsRequest, opts ...grpc.CallOption) (*Sku, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Sku)
+	err := c.cc.Invoke(ctx, Forge_ReplaceSkuComponents_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *forgeClient) GetManagedHostQuarantineState(ctx context.Context, in *GetManagedHostQuarantineStateRequest, opts ...grpc.CallOption) (*GetManagedHostQuarantineStateResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetManagedHostQuarantineStateResponse)
@@ -7146,6 +7204,10 @@ type ForgeServer interface {
 	DeleteSpxPartition(context.Context, *SpxPartitionDeletionRequest) (*SpxPartitionDeletionResult, error)
 	FindSpxPartitionIds(context.Context, *SpxPartitionSearchFilter) (*SpxPartitionIdList, error)
 	FindSpxPartitionsByIds(context.Context, *SpxPartitionsByIdsRequest) (*SpxPartitionList, error)
+	// Read requested maintenance for the declared CX9 logical interfaces on a host.
+	GetMachineSpxMultiplane(context.Context, *MachineSpxMultiplaneRequest) (*MachineSpxMultiplane, error)
+	// Atomically save maintenance mode for the selected rails and planes.
+	UpdateMachineSpxMultiplaneMaintenance(context.Context, *MachineSpxMultiplaneMaintenanceUpdateRequest) (*MachineSpxMultiplane, error)
 	// VPC prefixes
 	CreateVpcPrefix(context.Context, *VpcPrefixCreationRequest) (*VpcPrefix, error)
 	SearchVpcPrefixes(context.Context, *VpcPrefixSearchQuery) (*VpcPrefixIdList, error)
@@ -7656,7 +7718,9 @@ type ForgeServer interface {
 	DeleteAllExpectedRackGroups(context.Context, *emptypb.Empty) (*emptypb.Empty, error)
 	// Perform Attestation Procedure for Measured Boot
 	AttestQuote(context.Context, *AttestQuoteRequest) (*AttestQuoteResponse, error)
+	//
 	// InstanceType
+	//
 	CreateInstanceType(context.Context, *CreateInstanceTypeRequest) (*CreateInstanceTypeResponse, error)
 	FindInstanceTypeIds(context.Context, *FindInstanceTypeIdsRequest) (*FindInstanceTypeIdsResponse, error)
 	FindInstanceTypesByIds(context.Context, *FindInstanceTypesByIdsRequest) (*FindInstanceTypesByIdsResponse, error)
@@ -7713,7 +7777,9 @@ type ForgeServer interface {
 	ListMeasurementTrustedMachines(context.Context, *ListMeasurementTrustedMachinesRequest) (*ListMeasurementTrustedMachinesResponse, error)
 	ListMeasurementTrustedProfiles(context.Context, *ListMeasurementTrustedProfilesRequest) (*ListMeasurementTrustedProfilesResponse, error)
 	ListAttestationSummary(context.Context, *ListAttestationSummaryRequest) (*ListAttestationSummaryResponse, error)
+	//
 	// NetworkSecurityGroups
+	//
 	CreateNetworkSecurityGroup(context.Context, *CreateNetworkSecurityGroupRequest) (*CreateNetworkSecurityGroupResponse, error)
 	FindNetworkSecurityGroupIds(context.Context, *FindNetworkSecurityGroupIdsRequest) (*FindNetworkSecurityGroupIdsResponse, error)
 	FindNetworkSecurityGroupsByIds(context.Context, *FindNetworkSecurityGroupsByIdsRequest) (*FindNetworkSecurityGroupsByIdsResponse, error)
@@ -7830,7 +7896,7 @@ type ForgeServer interface {
 	// Terminate active rack maintenance and transition the rack to Error.
 	TerminateRackMaintenance(context.Context, *RackMaintenanceTerminateRequest) (*RackMaintenanceTerminateResponse, error)
 	// TPM CA certs Management
-	// rpc TpmDeleteCaCert(TpmCaCertDetails) returns (google.protobuf.Empty);
+	//rpc TpmDeleteCaCert(TpmCaCertDetails) returns (google.protobuf.Empty);
 	TpmAddCaCert(context.Context, *TpmCaCert) (*TpmCaAddedCaStatus, error)
 	TpmShowCaCerts(context.Context, *emptypb.Empty) (*TpmCaCertDetailCollection, error)
 	TpmShowUnmatchedEkCerts(context.Context, *emptypb.Empty) (*TpmEkCertStatusCollection, error)
@@ -7884,7 +7950,22 @@ type ForgeServer interface {
 	GetAllSkuIds(context.Context, *emptypb.Empty) (*SkuIdList, error)
 	FindSkusByIds(context.Context, *SkusByIdsRequest) (*SkuList, error)
 	UpdateSkuMetadata(context.Context, *SkuUpdateMetadataRequest) (*emptypb.Empty, error)
+	// Replace the components and metadata of an existing SKU.
+	// Omitting `components` replaces the stored definition with empty values.
+	// Input `components.ethernet_devices` values are ignored; the response list
+	// is empty.
+	// Omitted description becomes empty; omitted device_type becomes unset.
+	// Preserves creation time and machine assignments, requests SKU verification,
+	// and returns the stored SKU with its associated machine IDs.
+	// The schema_version must equal the current SKU schema version. An empty ID,
+	// unsupported schema version, invalid storage constraints, or components
+	// matching another SKU return INVALID_ARGUMENT before absence is checked.
+	// A valid replacement that does not match another SKU returns NOT_FOUND
+	// when its target ID is absent. Other database failures return INTERNAL.
 	ReplaceSku(context.Context, *Sku) (*Sku, error)
+	// Replace the complete component definition, preserving omitted metadata.
+	// Requests SKU verification and returns the replaced SKU with its associated machine IDs.
+	ReplaceSkuComponents(context.Context, *ReplaceSkuComponentsRequest) (*Sku, error)
 	// get/set/clear quarantine state on machines
 	GetManagedHostQuarantineState(context.Context, *GetManagedHostQuarantineStateRequest) (*GetManagedHostQuarantineStateResponse, error)
 	SetManagedHostQuarantineState(context.Context, *SetManagedHostQuarantineStateRequest) (*SetManagedHostQuarantineStateResponse, error)
@@ -7916,7 +7997,9 @@ type ForgeServer interface {
 	// Lists the rack profiles from the effective runtime configuration.
 	// Rack profiles are configuration, not persisted rack resources.
 	ListRackProfiles(context.Context, *emptypb.Empty) (*ListRackProfilesResponse, error)
+	//
 	// Compute Allocations
+	//
 	CreateComputeAllocation(context.Context, *CreateComputeAllocationRequest) (*CreateComputeAllocationResponse, error)
 	FindComputeAllocationIds(context.Context, *FindComputeAllocationIdsRequest) (*FindComputeAllocationIdsResponse, error)
 	FindComputeAllocationsByIds(context.Context, *FindComputeAllocationsByIdsRequest) (*FindComputeAllocationsByIdsResponse, error)
@@ -8231,6 +8314,12 @@ func (UnimplementedForgeServer) FindSpxPartitionIds(context.Context, *SpxPartiti
 }
 func (UnimplementedForgeServer) FindSpxPartitionsByIds(context.Context, *SpxPartitionsByIdsRequest) (*SpxPartitionList, error) {
 	return nil, status.Error(codes.Unimplemented, "method FindSpxPartitionsByIds not implemented")
+}
+func (UnimplementedForgeServer) GetMachineSpxMultiplane(context.Context, *MachineSpxMultiplaneRequest) (*MachineSpxMultiplane, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetMachineSpxMultiplane not implemented")
+}
+func (UnimplementedForgeServer) UpdateMachineSpxMultiplaneMaintenance(context.Context, *MachineSpxMultiplaneMaintenanceUpdateRequest) (*MachineSpxMultiplane, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateMachineSpxMultiplaneMaintenance not implemented")
 }
 func (UnimplementedForgeServer) CreateVpcPrefix(context.Context, *VpcPrefixCreationRequest) (*VpcPrefix, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateVpcPrefix not implemented")
@@ -9399,6 +9488,9 @@ func (UnimplementedForgeServer) UpdateSkuMetadata(context.Context, *SkuUpdateMet
 func (UnimplementedForgeServer) ReplaceSku(context.Context, *Sku) (*Sku, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReplaceSku not implemented")
 }
+func (UnimplementedForgeServer) ReplaceSkuComponents(context.Context, *ReplaceSkuComponentsRequest) (*Sku, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReplaceSkuComponents not implemented")
+}
 func (UnimplementedForgeServer) GetManagedHostQuarantineState(context.Context, *GetManagedHostQuarantineStateRequest) (*GetManagedHostQuarantineStateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetManagedHostQuarantineState not implemented")
 }
@@ -10230,6 +10322,42 @@ func _Forge_FindSpxPartitionsByIds_Handler(srv interface{}, ctx context.Context,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ForgeServer).FindSpxPartitionsByIds(ctx, req.(*SpxPartitionsByIdsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_GetMachineSpxMultiplane_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineSpxMultiplaneRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).GetMachineSpxMultiplane(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_GetMachineSpxMultiplane_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).GetMachineSpxMultiplane(ctx, req.(*MachineSpxMultiplaneRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_UpdateMachineSpxMultiplaneMaintenance_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineSpxMultiplaneMaintenanceUpdateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).UpdateMachineSpxMultiplaneMaintenance(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_UpdateMachineSpxMultiplaneMaintenance_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).UpdateMachineSpxMultiplaneMaintenance(ctx, req.(*MachineSpxMultiplaneMaintenanceUpdateRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -17236,6 +17364,24 @@ func _Forge_ReplaceSku_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Forge_ReplaceSkuComponents_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReplaceSkuComponentsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).ReplaceSkuComponents(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_ReplaceSkuComponents_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).ReplaceSkuComponents(ctx, req.(*ReplaceSkuComponentsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Forge_GetManagedHostQuarantineState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetManagedHostQuarantineStateRequest)
 	if err := dec(in); err != nil {
@@ -19665,6 +19811,14 @@ var Forge_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Forge_FindSpxPartitionsByIds_Handler,
 		},
 		{
+			MethodName: "GetMachineSpxMultiplane",
+			Handler:    _Forge_GetMachineSpxMultiplane_Handler,
+		},
+		{
+			MethodName: "UpdateMachineSpxMultiplaneMaintenance",
+			Handler:    _Forge_UpdateMachineSpxMultiplaneMaintenance_Handler,
+		},
+		{
 			MethodName: "CreateVpcPrefix",
 			Handler:    _Forge_CreateVpcPrefix_Handler,
 		},
@@ -21219,6 +21373,10 @@ var Forge_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReplaceSku",
 			Handler:    _Forge_ReplaceSku_Handler,
+		},
+		{
+			MethodName: "ReplaceSkuComponents",
+			Handler:    _Forge_ReplaceSkuComponents_Handler,
 		},
 		{
 			MethodName: "GetManagedHostQuarantineState",
