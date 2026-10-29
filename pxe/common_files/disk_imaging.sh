@@ -1211,7 +1211,7 @@ function main() {
 
 	announce_image_download
 	if ! curl_url "$image_url" "${image_auth[@]}"; then
-		echo "Failed to download image from $image_url" | tee "$log_output"
+		echo "Failed to download image" | tee "$log_output"
 		return 1
 	fi
 	if [ -n "$image_auth_header_file" ]; then

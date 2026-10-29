@@ -716,7 +716,16 @@ curl_url "http://example.com/fail.qcow2" >/dev/null 2>&1
 assert_eq "curl_url failure status" 22 "$?"
 
 echo "entrypoint: reboot suppression on failed main"
-entrypoint_output=$("${BASH:-bash}" "$script_under_test" 2>&1)
+entrypoint_test_script="$temp_dir/test_entrypoint.sh"
+cat << 'EOF' > "$entrypoint_test_script"
+#!/bin/bash
+log_output=/dev/null
+main() { return 1; }
+systemctl() { echo "unexpected systemctl call: $*" >&2; return 0; }
+EOF
+sed -n '/^if \[\[ "\${BASH_SOURCE\[0\]}" == "\$0" \]\]; then/,$p' "$script_under_test" >> "$entrypoint_test_script"
+chmod +x "$entrypoint_test_script"
+entrypoint_output=$("${BASH:-bash}" "$entrypoint_test_script" 2>&1)
 entrypoint_status=$?
 assert_eq "entrypoint failure status" 1 "$entrypoint_status"
 if [[ "$entrypoint_output" =~ "Rebooting" ]]; then
