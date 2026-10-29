@@ -342,7 +342,10 @@ async fn test_static_assignment_rejects_cross_segment_dual_stack(
         let same_segment = db::machine_interface::find_one(&mut *txn, interface.id).await?;
         assert_eq!(same_segment.segment_id, source_id, "{scenario}");
         assert_eq!(same_segment.addresses.len(), 2, "{scenario}");
-        assert!(same_segment.addresses.contains(&sibling.parse()?), "{scenario}");
+        assert!(
+            same_segment.addresses.contains(&sibling.parse()?),
+            "{scenario}"
+        );
         db::machine_interface_address::delete_by_interface_family(
             &mut txn,
             interface.id,

@@ -132,9 +132,8 @@ already belong to that segment; otherwise the command fails with
 `FailedPrecondition` and changes nothing. Because `remove-address` removes only
 Static addresses, first replace a DHCP or SLAAC address in the other family with
 a Static address in the current segment, remove it, then assign the new address.
-The `remove-address`
-command removes a Static address; it does not cause NICo to reapply the
-Expected Machine allocation policy:
+The `remove-address` command removes a Static address; it does not cause NICo
+to reapply the Expected Machine allocation policy:
 
 ```bash
 # Find the interface ID and its current addresses.
