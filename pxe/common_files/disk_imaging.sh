@@ -104,7 +104,7 @@ function verify_sha() {
 
 	len=${#sha}
 	if [ $len -eq 40 ]; then
-		shasum=shasum
+		shasum=sha1sum
 	elif [ $len -eq 64 ]; then
 		shasum=sha256sum
 	elif [ $len -eq 96 ]; then
@@ -115,7 +115,8 @@ function verify_sha() {
 		echo "Unknown sha digest length" | tee $log_output
 		return 1
 	fi
-	echo "$sha $file" | $shasum --check - 2>&1 | tee $log_output
+	# Two spaces: Perl-based checkers reject a single-space check line.
+	printf '%s  %s\n' "$sha" "$file" | $shasum --check - 2>&1 | tee $log_output
 	return "${PIPESTATUS[1]}"
 }
 
@@ -1167,6 +1168,17 @@ function parse_kernel_cmdline_argument() {
 	return 0
 }
 
+# Writes the downloaded image to image_disk and returns qemu-img's status, not tee's.
+function write_image_to_disk() {
+	echo "Imaging $file to $image_disk" | tee $log_output
+	qemu-img convert -p -O raw -S 0 "$file" "$image_disk" 2>&1 | tee $log_output
+	local ret=${PIPESTATUS[0]}
+	if [ $ret -ne 0 ]; then
+		echo "Imaging failed $ret" | tee $log_output
+	fi
+	return $ret
+}
+
 function main() {
 
 	get_serial_port
@@ -1242,13 +1254,7 @@ function main() {
 	image_disk=$resolved_image_disk
 	precheck_image_identifiers || return 1
 
-	echo "Imaging $file to $image_disk" | tee $log_output
-	qemu-img convert -p -O raw -S 0 "$file" "$image_disk" 2>&1 | tee $log_output
-	ret=${PIPESTATUS[0]}
-	if [ $ret -ne 0 ]; then
-		echo "Imaging failed $ret" | tee $log_output
-		return $ret;
-	fi
+	write_image_to_disk || return $?
 
 	sgdisk -epv $image_disk 2>&1 | tee $log_output
 	partprobe $image_disk 2>&1 | tee $log_output

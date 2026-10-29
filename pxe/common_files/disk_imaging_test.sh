@@ -687,13 +687,15 @@ assert_eq "override source" "override" "$boot_part_source"
 assert_log_contains "Resolved /boot from bootfs_uuid=boot-override to /dev/targetp2"
 bootfs_uuid=
 
-echo "verify_sha: matching checksum"
+echo "verify_sha: accepts a matching digest for every supported length"
 probe_file="$temp_dir/probe.bin"
 printf 'probe data\n' >"$probe_file"
 file="$probe_file"
-probe_sha=$(sha256sum "$probe_file" 2>/dev/null || shasum -a 256 "$probe_file")
-probe_sha=${probe_sha%% *}
-verify_sha "$probe_sha" >/dev/null 2>&1 || fail "valid sha verification failed"
+for digest_tool in sha1sum sha256sum sha384sum sha512sum; do
+	probe_sha=$("$digest_tool" "$probe_file")
+	verify_sha "${probe_sha%% *}" >/dev/null 2>&1 ||
+		fail "verify_sha rejected a matching $digest_tool digest"
+done
 
 echo "verify_sha: mismatching checksum"
 if verify_sha "$(printf '%064d' 0)" >/dev/null 2>&1; then
@@ -715,22 +717,48 @@ curl() {
 curl_url "http://example.com/fail.qcow2" >/dev/null 2>&1
 assert_eq "curl_url failure status" 22 "$?"
 
-echo "get_distro_image: fails on checksum download error"
+unset -f curl
+
+echo "write_image_to_disk: returns qemu-img's failure, not tee's success"
+qemu-img() { echo "qemu-img: Could not open input" >&2; return 1; }
+file="$temp_dir/missing.qcow2"
+image_disk="$temp_dir/disk.raw"
+write_image_to_disk >/dev/null 2>&1
+assert_eq "write_image_to_disk failure status" 1 "$?"
+assert_log_contains "Imaging failed 1"
+unset -f qemu-img
+
+# get_distro_image writes shafile to the working directory, so run it in temp_dir.
+distro_workdir="$temp_dir/distro"
+mkdir -p "$distro_workdir"
+pushd "$distro_workdir" >/dev/null || fail "cannot enter $distro_workdir"
 distro_name="ubuntu"
 distro_version="24.04"
-mock_failing_curl() { return 1; }
-curl() { mock_failing_curl; }
-if get_distro_image >/dev/null 2>&1; then
-	fail "get_distro_image succeeded when shaurl download failed"
-fi
+case "$(uname -m)" in
+	x86_64) distro_arch=amd64 ;;
+	aarch64) distro_arch=arm64 ;;
+	*) distro_arch=$(uname -m) ;;
+esac
 
-echo "get_distro_image: fails on missing checksum in shafile"
-mock_empty_shafile() { touch shafile; return 0; }
-curl() { mock_empty_shafile; }
+echo "get_distro_image: fails when the checksum download fails, even with a stale shafile"
+printf '%064d *ubuntu-24.04-server-cloudimg-%s.img\n' 1 "$distro_arch" >shafile
+curl() { return 1; }
 if get_distro_image >/dev/null 2>&1; then
-	fail "get_distro_image succeeded when checksum was missing"
+	fail "get_distro_image used a stale shafile after the download failed"
 fi
-rm -f shafile
+assert_log_contains "Failed to download checksum file"
+
+echo "get_distro_image: fails when shafile has no entry for the image"
+curl() { : >shafile; return 0; }
+if get_distro_image >/dev/null 2>&1; then
+	fail "get_distro_image succeeded when the checksum was missing"
+fi
+assert_log_contains "not found in"
+
+popd >/dev/null || fail "cannot leave $distro_workdir"
+unset -f curl
+distro_name=
+distro_version=
 
 echo "entrypoint: reboot suppression on failed main"
 entrypoint_test_script="$temp_dir/test_entrypoint.sh"
