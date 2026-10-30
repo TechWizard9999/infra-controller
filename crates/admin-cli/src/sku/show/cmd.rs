@@ -441,7 +441,7 @@ mod tests {
             .expect("mock gRPC response is valid")
     }
 
-    async fn mock_sku_request(
+    fn mock_sku_request(
         request: hyper::Request<Incoming>,
         skus: &[Sku],
     ) -> Result<Response<UnsyncBoxBody<Bytes, Infallible>>, Infallible> {
@@ -499,7 +499,7 @@ mod tests {
                     TokioIo::new(connection),
                     service_fn(move |request| {
                         let skus = server_skus.clone();
-                        async move { mock_sku_request(request, &skus).await }
+                        async move { mock_sku_request(request, &skus) }
                     }),
                 )
                 .await
