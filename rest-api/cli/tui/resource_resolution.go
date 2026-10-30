@@ -166,9 +166,9 @@ func matchingGeneratedResourceItems(items []NamedItem, value string) []NamedItem
 	var idMatches []NamedItem
 	var nameMatches []NamedItem
 	for i := range items {
-		if strings.EqualFold(items[i].ID, value) {
+		if items[i].ID == value {
 			idMatches = append(idMatches, items[i])
-		} else if strings.EqualFold(items[i].Name, value) {
+		} else if items[i].Name == value {
 			nameMatches = append(nameMatches, items[i])
 		}
 	}

@@ -972,6 +972,8 @@ func TestResolveGeneratedResource_RejectsAmbiguousNames(t *testing.T) {
 		return []NamedItem{
 			{Name: "duplicate", ID: "machine-1"},
 			{Name: "duplicate", ID: "machine-2"},
+			{Name: "case-a", ID: "machine-a"},
+			{Name: "case-b", ID: "Machine-A"},
 		}, nil
 	})
 	session := &Session{Resolver: resolver}
@@ -998,6 +1000,28 @@ func TestResolveGeneratedResource_RejectsAmbiguousNames(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, supported)
 	assert.Equal(t, "machine-2", item.ID)
+
+	item, supported, err = session.ResolveGeneratedResource(
+		context.Background(),
+		descriptor,
+		nil,
+		"Machine",
+		"Machine-A",
+	)
+	require.NoError(t, err, "IDs that differ only in case must not be ambiguous")
+	assert.True(t, supported)
+	assert.Equal(t, "Machine-A", item.ID)
+
+	_, supported, err = session.ResolveGeneratedResource(
+		context.Background(),
+		descriptor,
+		nil,
+		"Machine",
+		"MACHINE-A",
+	)
+	assert.True(t, supported)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no machine matching")
 }
 
 func TestFetchAllocationConstraints_UsesIDWhenDisplayPartsAreEmpty(t *testing.T) {
