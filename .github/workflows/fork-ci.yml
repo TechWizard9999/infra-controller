@@ -1,0 +1,154 @@
+# Personal pre-check CI for TechWizard9999's fork. Never part of an upstream PR:
+# it lives only on `ci/**` branches (feature branch + this one commit).
+#
+# Mirrors the upstream ci.yaml jobs that can run on GitHub's free runners:
+#   - format : `cargo make check-format-nightly` equivalent
+#   - lint   : lint-police (clippy-flow, carbide-lints, error messages, licenses, bans)
+#   - test   : test-release-container-services (`cargo make test-release-container-services`)
+# lint and test run inside the project's own build container, built from
+# dev/docker/Dockerfile.build-container-x86_64 (public base image), with the
+# same PostgreSQL setup as upstream CI. Upstream-only jobs (image builds,
+# release artifacts, Kubernetes, helm) are not reproduced.
+name: fork-ci
+
+on:
+  push:
+    branches: ['ci/**']
+  workflow_dispatch:
+
+concurrency:
+  group: fork-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_NIGHTLY: nightly-2026-06-16
+  BUILD_IMAGE: nico-build:local
+
+jobs:
+  format:
+    if: github.repository != 'dsx-ai-factory/infra-controller'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install pinned nightly rustfmt
+        run: rustup toolchain install "$RUST_NIGHTLY" --profile minimal -c rustfmt
+      - name: Check Rust formatting (nightly, as upstream)
+        run: cargo +"$RUST_NIGHTLY" fmt --all -- --check
+
+  lint:
+    if: github.repository != 'dsx-ai-factory/infra-controller'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/.ghcup
+          sudo docker image prune -af >/dev/null
+          df -h /
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the project's build container
+        uses: docker/build-push-action@v6
+        with:
+          context: dev/docker
+          file: dev/docker/Dockerfile.build-container-x86_64
+          build-args: KEA_VERSION=2.2.0-6
+          tags: ${{ env.BUILD_IMAGE }}
+          load: true
+          cache-from: type=gha,scope=build-container-x86_64
+          cache-to: type=gha,mode=max,scope=build-container-x86_64
+      - name: Start build container with PostgreSQL (as upstream CI)
+        run: |
+          docker run -d --name nico \
+            -v "$GITHUB_WORKSPACE:/carbide" -w /carbide \
+            -e CARGO_HOME=/carbide/cargo \
+            -e CARGO_INCREMENTAL=0 \
+            -e CARGO_MAKE_SKIP_CODECOV=true \
+            -e DATABASE_URL='postgresql://root@%2Fvar%2Frun%2Fpostgresql/root' \
+            "$BUILD_IMAGE" sleep infinity
+          docker exec nico bash -c '
+            set -euo pipefail
+            git config --global --add safe.directory /carbide
+            printf "max_connections = 1000\nfsync = off\nsynchronous_commit = off\nfull_page_writes = off\n" | tee -a /etc/postgresql/*/main/postgresql.conf
+            /etc/init.d/postgresql start
+            sudo -u postgres psql -c "ALTER USER root WITH SUPERUSER;"
+            createdb root
+          '
+      - name: Validate Cargo metadata
+        run: docker exec nico cargo metadata --locked --no-deps --format-version 1 >/dev/null
+      - name: Clippy (cargo make clippy-flow)
+        run: docker exec nico cargo make --no-workspace clippy-flow
+      - name: Carbide custom lints
+        if: success() || failure()
+        run: docker exec nico cargo make carbide-lints
+      - name: Error message style
+        if: success() || failure()
+        run: docker exec nico cargo make lint-error-messages
+      - name: Licenses
+        if: success() || failure()
+        run: docker exec nico cargo make --no-workspace check-licenses
+      - name: Bans
+        if: success() || failure()
+        run: docker exec nico cargo make --no-workspace check-bans
+      - name: Disk usage
+        if: always()
+        run: df -h /
+
+  test:
+    if: github.repository != 'dsx-ai-factory/infra-controller'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/.ghcup
+          sudo docker image prune -af >/dev/null
+          df -h /
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the project's build container
+        uses: docker/build-push-action@v6
+        with:
+          context: dev/docker
+          file: dev/docker/Dockerfile.build-container-x86_64
+          build-args: KEA_VERSION=2.2.0-6
+          tags: ${{ env.BUILD_IMAGE }}
+          load: true
+          cache-from: type=gha,scope=build-container-x86_64
+          cache-to: type=gha,mode=max,scope=build-container-x86_64
+      - name: Start build container with PostgreSQL (as upstream CI)
+        run: |
+          docker run -d --name nico \
+            -v "$GITHUB_WORKSPACE:/carbide" -w /carbide \
+            -e CARGO_HOME=/carbide/cargo \
+            -e CARGO_INCREMENTAL=0 \
+            -e CARGO_MAKE_SKIP_CODECOV=true \
+            -e DATABASE_URL='postgresql://root@%2Fvar%2Frun%2Fpostgresql/root' \
+            "$BUILD_IMAGE" sleep infinity
+          docker exec nico bash -c '
+            set -euo pipefail
+            git config --global --add safe.directory /carbide
+            printf "max_connections = 1000\n" | tee -a /etc/postgresql/*/main/postgresql.conf
+            /etc/init.d/postgresql start
+            sudo -u postgres psql -c "ALTER USER root WITH SUPERUSER;"
+            createdb root
+            sudo -u postgres psql -c "CREATE ROLE nico_ipv6_test LOGIN PASSWORD \$\$nico_ipv6_test\$\$;"
+          '
+      - name: Unit and database tests (cargo make test-release-container-services)
+        run: |
+          docker exec \
+            -e NICO_TEST_POSTGRES_URL='postgresql://nico_ipv6_test:nico_ipv6_test@[::1]:5432/postgres?sslmode=disable' \
+            nico cargo make test-release-container-services
+      - name: Disk usage
+        if: always()
+        run: df -h /
