@@ -5,6 +5,8 @@
 #   - format : `cargo make check-format-nightly` equivalent
 #   - lint   : lint-police (clippy-flow, carbide-lints, error messages, licenses, bans)
 #   - test   : test-release-container-services (`cargo make test-release-container-services`)
+#   - docs   : AGENTS.md documentation checks (rumdl on AGENTS.md + changed Markdown,
+#              `fern docs md check`, `fern check`), which cannot run on the Windows laptop
 # lint and test run inside the project's own build container, built from
 # dev/docker/Dockerfile.build-container-x86_64 (public base image), with the
 # same PostgreSQL setup as upstream CI. Upstream-only jobs (image builds,
@@ -40,6 +42,43 @@ jobs:
         run: rustup toolchain install "$RUST_NIGHTLY" --profile minimal -c rustfmt
       - name: Check Rust formatting (nightly, as upstream)
         run: cargo +"$RUST_NIGHTLY" fmt --all -- --check
+
+  # AGENTS.md "Documentation review": rumdl on AGENTS.md and every changed Markdown file
+  # (fail on every finding), then the Fern CLI pinned in fern/fern.config.json, installed the
+  # same way as upstream fern-docs-ci.yml. Rendered review stays manual (Fern preview / GitHub).
+  docs:
+    if: github.repository != 'dsx-ai-factory/infra-controller'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install rumdl and the pinned Fern CLI
+        run: |
+          set -euo pipefail
+          pipx install rumdl || cargo install rumdl --locked
+          rumdl --version
+          npm install -g fern-api@$(node -e "console.log(require('./fern/fern.config.json').version)")
+          fern --version
+      - name: Markdown lint (rumdl) on AGENTS.md and changed Markdown
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags https://github.com/dsx-ai-factory/infra-controller.git main
+          base=$(git merge-base FETCH_HEAD HEAD)
+          mapfile -t changed < <(git diff --name-only --diff-filter=d "$base" HEAD -- '*.md' | grep -vx 'AGENTS.md' || true)
+          echo "rumdl: AGENTS.md ${changed[*]}"
+          rumdl check --config docs/.rumdl.toml AGENTS.md "${changed[@]}"
+      - name: Fern docs Markdown check
+        if: success() || failure()
+        run: fern docs md check
+      - name: Fern check
+        if: success() || failure()
+        run: fern check
 
   lint:
     if: github.repository != 'dsx-ai-factory/infra-controller'
