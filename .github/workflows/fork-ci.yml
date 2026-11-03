@@ -217,8 +217,9 @@ jobs:
           build-args: KEA_VERSION=2.2.0-6
           tags: ${{ env.BUILD_IMAGE }}
           load: true
+          # Read-only here: only the lint job saves the container layers, so the 10 GB
+          # Actions cache holds one copy of them next to the sccache entry.
           cache-from: type=gha,scope=build-container-x86_64
-          cache-to: type=gha,mode=max,scope=build-container-x86_64
       # Compile cache, as upstream: sccache in the build container, stored in the Actions cache.
       # The key follows Cargo.lock, so dependency builds (most of the compile time) are reused
       # until dependencies change; it is saved only when that key is new.
