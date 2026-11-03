@@ -173,6 +173,41 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "CI_COMMIT_SHORT_SHA=$SHORT_SHA" >> "$GITHUB_ENV"
           echo "VERSION=$VERSION CI_COMMIT_SHORT_SHA=$SHORT_SHA"
+      # Test scope. Default (`git ci-test`, branch ci/<name>): FOCUSED — only the Cargo packages
+      # that own a file changed against upstream main. `git ci-test full` (branch ci/full/<name>),
+      # manual runs, and changes to workspace-wide files (Cargo.toml, Cargo.lock,
+      # rust-toolchain.toml, .cargo/, shared test crates) run the FULL suite. No Rust package
+      # changed -> tests are skipped. The lint job still compiles and lints the whole workspace.
+      - name: Select test scope
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" != "push" ] || [[ "$GITHUB_REF" == refs/heads/ci/full/* ]]; then
+            scope=FULL
+          else
+            git fetch --quiet --no-tags https://github.com/dsx-ai-factory/infra-controller.git main
+            # HEAD is the ci commit (tested commit + this workflow); its parent is the tested commit.
+            base=$(git merge-base FETCH_HEAD HEAD^)
+            mapfile -t files < <(git diff --name-only "$base" HEAD^)
+            echo "Changed files against upstream main (${#files[@]}):"; printf '  %s\n' "${files[@]}"
+            scope=""
+            pkgs=()
+            for f in "${files[@]}"; do
+              case "$f" in
+                Cargo.toml|Cargo.lock|rust-toolchain.toml|.cargo/*|crates/test-support/*|crates/sqlx-testing/*)
+                  scope=FULL; break ;;
+              esac
+              dir=$(dirname "$f")
+              while [ "$dir" != "." ] && [ ! -f "$dir/Cargo.toml" ]; do dir=$(dirname "$dir"); done
+              [ "$dir" = "." ] && continue
+              name=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^name[ \t]*=/{gsub(/.*=[ \t]*"|".*/,""); print; exit}' "$dir/Cargo.toml")
+              [ -n "$name" ] && pkgs+=("$name")
+            done
+            if [ -z "$scope" ]; then
+              if [ ${#pkgs[@]} -eq 0 ]; then scope=NONE; else scope=$(printf '%s\n' "${pkgs[@]}" | sort -u | tr '\n' ' '); fi
+            fi
+          fi
+          echo "TEST_SCOPE=$scope" >> "$GITHUB_ENV"
+          echo "::notice::Test scope: $scope"
       - uses: docker/setup-buildx-action@v3
       - name: Build the project's build container
         uses: docker/build-push-action@v6
@@ -184,6 +219,17 @@ jobs:
           load: true
           cache-from: type=gha,scope=build-container-x86_64
           cache-to: type=gha,mode=max,scope=build-container-x86_64
+      # Compile cache, as upstream: sccache in the build container, stored in the Actions cache.
+      # The key follows Cargo.lock, so dependency builds (most of the compile time) are reused
+      # until dependencies change; it is saved only when that key is new.
+      - name: Restore sccache
+        id: sccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .sccache
+          key: sccache-fork-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            sccache-fork-test-
       # Same container settings as upstream's "Run release-container service tests"
       # (ulimit, NICO_TEST_MAX_PG_CONNECTIONS, .github/ci/postgresql.conf, VERSION,
       # CI_COMMIT_SHORT_SHA, CONTAINER_REPO_ROOT), plus the variables `cargo make`
@@ -196,9 +242,14 @@ jobs:
       # not changed.
       - name: Start build container with PostgreSQL (as upstream CI)
         run: |
+          mkdir -p "$GITHUB_WORKSPACE/.sccache"
           docker run -d --name nico \
             --ulimit nofile=65536:65536 \
             -v "$GITHUB_WORKSPACE:/carbide" -w /carbide \
+            -v "$GITHUB_WORKSPACE/.sccache:/sccache" \
+            -e SCCACHE_DIR=/sccache \
+            -e SCCACHE_CACHE_SIZE=3G \
+            -e RUSTC_WRAPPER=sccache \
             -e CARGO_HOME=/carbide/cargo \
             -e CARGO_INCREMENTAL=0 \
             -e CARGO_MAKE_SKIP_CODECOV=true \
@@ -245,14 +296,26 @@ jobs:
             -e NICO_TEST_POSTGRES_URL='postgresql://nico_ipv6_test:nico_ipv6_test@[::1]:5432/postgres?sslmode=disable' \
             -e NICO_TEST_TEMPLATE_DB=sqlx_ci_template_db \
             -e KNOWN_TIMING_TESTS="$KNOWN_TIMING_TESTS" \
+            -e TEST_SCOPE="$TEST_SCOPE" \
             nico bash -c '
               set -uo pipefail
               echo "RUST_TEST_THREADS=${RUST_TEST_THREADS:-unset} NICO_TEST_MAX_PG_CONNECTIONS=${NICO_TEST_MAX_PG_CONNECTIONS:-unset}"
               echo "VERSION=${VERSION:-unset} CI_COMMIT_SHORT_SHA=${CI_COMMIT_SHORT_SHA:-unset} REPO_ROOT=${REPO_ROOT:-unset} CONTAINER_REPO_ROOT=${CONTAINER_REPO_ROOT:-unset}"
               [ -n "${VERSION:-}" ] && [ -n "${REPO_ROOT:-}" ] || { echo "REAL FAILURE: VERSION or REPO_ROOT missing in the test container (fork CI setup error)."; exit 1; }
-              cargo test --profile=ci-tests --no-run || exit 1
+              case "$TEST_SCOPE" in
+                NONE) echo "SCOPE: no Rust package changed; tests skipped."; echo "ALL TESTS PASSED on the first pass (no Rust tests needed)."; exit 0 ;;
+                FULL) echo "SCOPE: FULL workspace"; scope_args="" ;;
+                *) scope_args=$(for p in $TEST_SCOPE; do printf -- "-p %s " "$p"; done)
+                   echo "SCOPE: FOCUSED on changed packages: $TEST_SCOPE (run git ci-test full for the whole suite)" ;;
+              esac
+              # shellcheck disable=SC2086
+              cargo test --profile=ci-tests --no-run $scope_args || exit 1
+              if [ ! -x target/ci-tests/prepare-test-template ]; then
+                cargo build --profile=ci-tests -p carbide-sqlx-testing --bin prepare-test-template || exit 1
+              fi
               target/ci-tests/prepare-test-template || exit 1
-              cargo test --profile=ci-tests --no-fail-fast 2>&1 | tee /tmp/tests.log
+              # shellcheck disable=SC2086
+              cargo test --profile=ci-tests --no-fail-fast $scope_args 2>&1 | tee /tmp/tests.log
               first=${PIPESTATUS[0]}
               grep -aE "^test result:" /tmp/tests.log | awk "{p+=\$4; f+=\$6; i+=\$8} END {print \"FIRST PASS: \" p \" passed, \" f \" failed, \" i \" ignored\"}"
               [ "$first" -eq 0 ] && { echo "ALL TESTS PASSED on the first pass."; exit 0; }
@@ -299,6 +362,18 @@ jobs:
               echo "NOT FULLY GREEN: only known timing tests failed under load and passed alone:"; printf "  %s\n" $names
               echo "::warning::Not fully green: known timing tests failed under parallel load and passed alone: $(echo $names | tr "\n" " ")"
             '
+      # Everything in the container runs as root; hand the cache back to the runner user so
+      # actions/cache can read it, then save it only when the Cargo.lock key is new.
+      - name: Hand sccache back to the runner
+        if: always()
+        run: |
+          docker exec nico bash -c "sccache --show-stats || true; du -sh /sccache || true; chown -R $(id -u):$(id -g) /sccache" || true
+      - name: Save sccache
+        if: always() && steps.sccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .sccache
+          key: sccache-fork-test-${{ hashFiles('Cargo.lock') }}
       - name: Disk usage
         if: always()
         run: df -h /
