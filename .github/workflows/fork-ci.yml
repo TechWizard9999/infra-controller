@@ -115,6 +115,25 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          # Full history: `git describe --first-parent` must reach a release tag.
+          fetch-depth: 0
+      # The fork has no tags, so a plain `git describe` returns a bare commit hash,
+      # which NICo rejects as a build version ("Invalid server version, cannot check
+      # for upgrade" in the dpu_agent_upgrade tests). Fetch upstream's public tags and
+      # compute VERSION / CI_COMMIT_SHORT_SHA the way upstream ci.yaml "Calculate version" does.
+      - name: Calculate version (as upstream)
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags https://github.com/dsx-ai-factory/infra-controller.git '+refs/tags/*:refs/tags/*'
+          VERSION=$(git describe --tags --first-parent --always)
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          case "$VERSION" in
+            v[0-9]*) ;;
+            *) echo "::error::git describe returned '$VERSION' (no release tag reachable); tests would fail on the build version"; exit 1 ;;
+          esac
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "CI_COMMIT_SHORT_SHA=$SHORT_SHA" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION CI_COMMIT_SHORT_SHA=$SHORT_SHA"
       - uses: docker/setup-buildx-action@v3
       - name: Build the project's build container
         uses: docker/build-push-action@v6
@@ -127,7 +146,11 @@ jobs:
           cache-from: type=gha,scope=build-container-x86_64
           cache-to: type=gha,mode=max,scope=build-container-x86_64
       # Same container settings as upstream's "Run release-container service tests"
-      # (ulimit, NICO_TEST_MAX_PG_CONNECTIONS, .github/ci/postgresql.conf), except
+      # (ulimit, NICO_TEST_MAX_PG_CONNECTIONS, .github/ci/postgresql.conf, VERSION,
+      # CI_COMMIT_SHORT_SHA, CONTAINER_REPO_ROOT), plus the variables `cargo make`
+      # exports from Makefile.toml [env] (REPO_ROOT, KEA_VERSION, CARBIDE_ENVIRONMENT,
+      # FORGE_CA, FORGE_CA_PATH), because the tests run with plain `cargo test` here.
+      # Without REPO_ROOT, nvue-client fails and some integration helpers silently skip.
       # RUST_TEST_THREADS: the repo's .cargo/config.toml asks for 60 parallel tests,
       # sized for upstream's 32-core runners; a free runner has 4 cores, so use 8.
       # An environment variable wins over a non-forced [env] entry, so the repo is
@@ -143,6 +166,14 @@ jobs:
             -e DATABASE_URL='postgresql://root@%2Fvar%2Frun%2Fpostgresql/root' \
             -e NICO_TEST_MAX_PG_CONNECTIONS=900 \
             -e RUST_TEST_THREADS=8 \
+            -e VERSION="$VERSION" \
+            -e CI_COMMIT_SHORT_SHA="$CI_COMMIT_SHORT_SHA" \
+            -e CONTAINER_REPO_ROOT=/carbide \
+            -e REPO_ROOT=/carbide \
+            -e KEA_VERSION="$(cat dev/docker/kea.version)" \
+            -e CARBIDE_ENVIRONMENT=local \
+            -e FORGE_CA=nonprod \
+            -e FORGE_CA_PATH=/carbide/dev/forge_nonprodroot.pem \
             "$BUILD_IMAGE" sleep infinity
           docker exec nico bash -c '
             set -euo pipefail
@@ -178,6 +209,8 @@ jobs:
             nico bash -c '
               set -uo pipefail
               echo "RUST_TEST_THREADS=${RUST_TEST_THREADS:-unset} NICO_TEST_MAX_PG_CONNECTIONS=${NICO_TEST_MAX_PG_CONNECTIONS:-unset}"
+              echo "VERSION=${VERSION:-unset} CI_COMMIT_SHORT_SHA=${CI_COMMIT_SHORT_SHA:-unset} REPO_ROOT=${REPO_ROOT:-unset} CONTAINER_REPO_ROOT=${CONTAINER_REPO_ROOT:-unset}"
+              [ -n "${VERSION:-}" ] && [ -n "${REPO_ROOT:-}" ] || { echo "REAL FAILURE: VERSION or REPO_ROOT missing in the test container (fork CI setup error)."; exit 1; }
               cargo test --profile=ci-tests --no-run || exit 1
               target/ci-tests/prepare-test-template || exit 1
               cargo test --profile=ci-tests --no-fail-fast 2>&1 | tee /tmp/tests.log
