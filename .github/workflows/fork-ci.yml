@@ -126,67 +126,106 @@ jobs:
           load: true
           cache-from: type=gha,scope=build-container-x86_64
           cache-to: type=gha,mode=max,scope=build-container-x86_64
+      # Same container settings as upstream's "Run release-container service tests"
+      # (ulimit, NICO_TEST_MAX_PG_CONNECTIONS, .github/ci/postgresql.conf), except
+      # RUST_TEST_THREADS: the repo's .cargo/config.toml asks for 60 parallel tests,
+      # sized for upstream's 32-core runners; a free runner has 4 cores, so use 8.
+      # An environment variable wins over a non-forced [env] entry, so the repo is
+      # not changed.
       - name: Start build container with PostgreSQL (as upstream CI)
         run: |
           docker run -d --name nico \
+            --ulimit nofile=65536:65536 \
             -v "$GITHUB_WORKSPACE:/carbide" -w /carbide \
             -e CARGO_HOME=/carbide/cargo \
             -e CARGO_INCREMENTAL=0 \
             -e CARGO_MAKE_SKIP_CODECOV=true \
             -e DATABASE_URL='postgresql://root@%2Fvar%2Frun%2Fpostgresql/root' \
+            -e NICO_TEST_MAX_PG_CONNECTIONS=900 \
+            -e RUST_TEST_THREADS=8 \
             "$BUILD_IMAGE" sleep infinity
           docker exec nico bash -c '
             set -euo pipefail
+            echo "Open file descriptor limits: soft=$(ulimit -Sn), hard=$(ulimit -Hn)"
             git config --global --add safe.directory /carbide
-            printf "max_connections = 1000\n" | tee -a /etc/postgresql/*/main/postgresql.conf
+            if [ -f .github/ci/postgresql.conf ]; then
+              tee -a /etc/postgresql/*/main/postgresql.conf < .github/ci/postgresql.conf
+            else
+              printf "fsync = off\nsynchronous_commit = off\nfull_page_writes = off\nmax_connections = 1000\n" | tee -a /etc/postgresql/*/main/postgresql.conf
+            fi
             /etc/init.d/postgresql start
             sudo -u postgres psql -c "ALTER USER root WITH SUPERUSER;"
             createdb root
             sudo -u postgres psql -c "CREATE ROLE nico_ipv6_test LOGIN PASSWORD \$\$nico_ipv6_test\$\$;"
           '
       # Same commands as `cargo make test-release-container-services`, plus:
-      #  - --no-fail-fast, so every test binary runs even if one has a failure;
-      #  - a free runner has 4 cores (upstream uses 32), so a few lock/deadline
-      #    timing tests can time out under full parallel load. Every failed test is
-      #    rerun on its own (--test-threads=1). Passing alone = slow-runner timeout
-      #    (reported, not fatal); failing again = real failure (job fails).
+      #  - --no-fail-fast, so every test program runs even if one has a failure;
+      #  - every failed test is rerun alone (--test-threads=1):
+      #      * fails again                          -> real failure, job fails
+      #      * a failing program reran 0 tests      -> it crashed / failed for another reason, job fails
+      #      * passes alone, and is a KNOWN timing test -> warning only (job not fully green)
+      #      * passes alone, but is NOT a known timing test -> job fails (possible race between tests)
       - name: Unit and database tests (test-release-container-services, with rerun of failures)
+        env:
+          KNOWN_TIMING_TESTS: >-
+            tests::component_power_details::blocked_snapshots_release_pool_capacity
+            tests::resource_pool_inspection::polling_retains_samples_after_database_failure_and_cancels_sql
         run: |
           docker exec \
             -e NICO_TEST_POSTGRES_URL='postgresql://nico_ipv6_test:nico_ipv6_test@[::1]:5432/postgres?sslmode=disable' \
             -e NICO_TEST_TEMPLATE_DB=sqlx_ci_template_db \
+            -e KNOWN_TIMING_TESTS="$KNOWN_TIMING_TESTS" \
             nico bash -c '
               set -uo pipefail
+              echo "RUST_TEST_THREADS=${RUST_TEST_THREADS:-unset} NICO_TEST_MAX_PG_CONNECTIONS=${NICO_TEST_MAX_PG_CONNECTIONS:-unset}"
               cargo test --profile=ci-tests --no-run || exit 1
               target/ci-tests/prepare-test-template || exit 1
               cargo test --profile=ci-tests --no-fail-fast 2>&1 | tee /tmp/tests.log
               first=${PIPESTATUS[0]}
-              echo "::group::Summary of first pass"
-              grep -aE "^test result:" /tmp/tests.log | awk "{p+=\$4; f+=\$6; i+=\$8} END {print \"first pass: \" p \" passed, \" f \" failed, \" i \" ignored\"}"
-              echo "::endgroup::"
-              [ "$first" -eq 0 ] && { echo "All tests passed on the first pass."; exit 0; }
+              grep -aE "^test result:" /tmp/tests.log | awk "{p+=\$4; f+=\$6; i+=\$8} END {print \"FIRST PASS: \" p \" passed, \" f \" failed, \" i \" ignored\"}"
+              [ "$first" -eq 0 ] && { echo "ALL TESTS PASSED on the first pass."; exit 0; }
+
               names=$(grep -aE "^test .* \.\.\. FAILED$" /tmp/tests.log | sed -E "s/^test (.*) \.\.\. FAILED$/\1/" | sort -u)
-              targets=$(grep -aoE "to rerun pass \`[^\`]+\`" /tmp/tests.log | sed -E "s/^to rerun pass \`(.*)\`$/\1/" | sort -u)
-              if [ -z "$names" ] || [ -z "$targets" ]; then echo "Test run failed without individual test failures (build or harness error)."; exit 1; fi
+              # Failing test programs: cargo prints "to rerun pass `X`" for one, and a
+              # "N targets failed:" list of `X` lines for several (--no-fail-fast).
+              targets=$( { grep -aoE "to rerun pass \`[^\`]+\`" /tmp/tests.log | sed -E "s/^to rerun pass \`(.*)\`$/\1/"; sed -n "/targets\? failed:/,\$p" /tmp/tests.log | grep -aE "^[[:space:]]+\`-p [^\`]+\`[[:space:]]*$" | sed -E "s/^[[:space:]]+\`(.*)\`[[:space:]]*$/\1/"; } | sort -u)
+              [ -n "$targets" ] || { echo "REAL FAILURE: tests failed but cargo named no failing test program (build or harness error)."; exit 1; }
+              [ -n "$names" ] || { echo "REAL FAILURE: failing test program(s) printed no failed test (crash or harness error):"; printf "  %s\n" "$targets"; exit 1; }
               echo "Failed on the first pass:"; printf "  %s\n" $names
-              still=0
+
+              real=0
               while IFS= read -r t; do
                 [ -n "$t" ] || continue
                 echo "::group::Rerun alone: $t"
                 # shellcheck disable=SC2086
-                cargo test --profile=ci-tests $t -- --exact $names --test-threads=1 2>&1 | tee -a /tmp/rerun.log
-                [ "${PIPESTATUS[0]}" -eq 0 ] || still=1
+                cargo test --profile=ci-tests $t -- --exact $names --test-threads=1 > /tmp/r.log 2>&1; rc=$?
+                cat /tmp/r.log; cat /tmp/r.log >> /tmp/rerun.log
                 echo "::endgroup::"
+                ran=$(grep -aE "^test result:" /tmp/r.log | awk "{n+=\$4+\$6} END {print n+0}")
+                if [ "$rc" -ne 0 ]; then
+                  echo "REAL FAILURE in $t: failed again when run alone."; real=1
+                elif [ "$ran" -eq 0 ]; then
+                  echo "REAL FAILURE in $t: it failed in the first pass, but none of the failed tests belong to it (crash or harness error)."; real=1
+                fi
               done <<EOF
           $targets
           EOF
-              if [ "$still" -ne 0 ]; then
-                echo "REAL FAILURES (failed again when run alone):"
+              if [ "$real" -ne 0 ]; then
                 grep -aE "^test .* \.\.\. FAILED$" /tmp/rerun.log | sort -u
                 exit 1
               fi
-              echo "Only slow-runner timeouts: every first-pass failure passed when rerun alone."
-              echo "::warning::Timing-sensitive tests timed out on the 4-core runner and passed on rerun: $(echo $names | tr "\n" " ")"
+
+              unknown=""
+              for n in $names; do
+                case " $KNOWN_TIMING_TESTS " in *" $n "*) ;; *) unknown="$unknown $n" ;; esac
+              done
+              if [ -n "$unknown" ]; then
+                echo "REAL FAILURE: these failed under parallel load and passed alone, but are NOT known timing tests (possible race between tests):"
+                printf "  %s\n" $unknown
+                exit 1
+              fi
+              echo "NOT FULLY GREEN: only known timing tests failed under load and passed alone:"; printf "  %s\n" $names
+              echo "::warning::Not fully green: known timing tests failed under parallel load and passed alone: $(echo $names | tr "\n" " ")"
             '
       - name: Disk usage
         if: always()
