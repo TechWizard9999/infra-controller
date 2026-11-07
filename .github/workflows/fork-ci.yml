@@ -311,6 +311,9 @@ jobs:
               esac
               # shellcheck disable=SC2086
               cargo test --profile=ci-tests --no-run $scope_args || exit 1
+              # Package-scoped tests do not build workspace-only binary targets.
+              # Core TLS integration tests launch this helper beside the test profile.
+              cargo build --profile=ci-tests -p carbide-libmlx --bin mlx-firmware-supervisor || exit 1
               if [ ! -x target/ci-tests/prepare-test-template ]; then
                 cargo build --profile=ci-tests -p carbide-sqlx-testing --bin prepare-test-template || exit 1
               fi
