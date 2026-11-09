@@ -1,0 +1,48 @@
+name: verify-protobuf-sync
+on:
+  push:
+    branches: ['ci/8072-proto-sync-20261109']
+permissions:
+  contents: read
+jobs:
+  protobuf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: rest-api/go.sum
+      - name: Run the Core protobuf sync
+        run: |
+          set -euo pipefail
+          if output=$(make sync-protobuf 2>&1); then
+            printf '%s\n' "$output"
+          else
+            printf '%s\n' "$output"
+            case "$output" in
+              *"No rule to make target 'sync-protobuf'"*) make -C rest-api core-proto ;;
+              *) exit 1 ;;
+            esac
+          fi
+          git diff --check
+          generated=rest-api/proto/core/gen/v1/nico_nico.pb.go
+          test "$(git diff --name-only)" = "$generated"
+          test -z "$(git ls-files --others --exclude-standard)"
+          git diff --binary -- "$generated" > "$RUNNER_TEMP/proto-sync.patch"
+          sha256sum "$generated"
+          git add -- "$generated"
+      - name: Verify the synced output with the CI command
+        run: |
+          make -C rest-api core-proto
+          bash scripts/check-repo-clean.sh "REST Core protobuf sync"
+      - name: Test REST protobuf packages
+        run: make -C rest-api test-proto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proto-sync-patch
+          path: ${{ runner.temp }}/proto-sync.patch
+          if-no-files-found: error
