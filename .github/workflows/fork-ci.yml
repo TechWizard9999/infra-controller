@@ -185,9 +185,8 @@ jobs:
             scope=FULL
           else
             git fetch --quiet --no-tags https://github.com/dsx-ai-factory/infra-controller.git main
-            # HEAD is the ci commit (tested commit + this workflow); its parent is the tested commit.
-            base=$(git merge-base FETCH_HEAD HEAD^)
-            mapfile -t files < <(git diff --name-only "$base" HEAD^)
+            base=$(git merge-base FETCH_HEAD HEAD)
+            mapfile -t files < <(git diff --name-only "$base" HEAD -- . ':!.github/workflows/fork-ci.yml')
             echo "Changed files against upstream main (${#files[@]}):"; printf '  %s\n' "${files[@]}"
             scope=""
             pkgs=()
