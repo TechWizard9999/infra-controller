@@ -43,6 +43,25 @@ jobs:
       - name: Check Rust formatting (nightly, as upstream)
         run: cargo +"$RUST_NIGHTLY" fmt --all -- --check
 
+  proto:
+    if: github.repository != 'dsx-ai-factory/infra-controller'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: rest-api/go.sum
+      - name: Verify canonical Core protobuf sync
+        run: |
+          make -C rest-api core-proto
+          bash scripts/check-repo-clean.sh "REST Core protobuf sync"
+      - name: Test REST protobuf packages
+        run: make -C rest-api test-proto
+
   # AGENTS.md "Documentation review": rumdl on AGENTS.md and every changed Markdown file
   # (fail on every finding), then the Fern CLI pinned in fern/fern.config.json, installed the
   # same way as upstream fern-docs-ci.yml. Rendered review stays manual (Fern preview / GitHub).
@@ -185,9 +204,8 @@ jobs:
             scope=FULL
           else
             git fetch --quiet --no-tags https://github.com/dsx-ai-factory/infra-controller.git main
-            # HEAD is the ci commit (tested commit + this workflow); its parent is the tested commit.
-            base=$(git merge-base FETCH_HEAD HEAD^)
-            mapfile -t files < <(git diff --name-only "$base" HEAD^)
+            base=$(git merge-base FETCH_HEAD HEAD)
+            mapfile -t files < <(git diff --name-only "$base" HEAD -- . ':!.github/workflows/fork-ci.yml')
             echo "Changed files against upstream main (${#files[@]}):"; printf '  %s\n' "${files[@]}"
             scope=""
             pkgs=()
