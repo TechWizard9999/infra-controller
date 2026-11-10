@@ -1,0 +1,68 @@
+name: fork-ci
+on:
+  push:
+    branches: ['ci/9011-generate-protos']
+permissions:
+  contents: read
+env:
+  GENERATE_PROTO_PATCH: 'true'
+jobs:
+  interfaces:
+    if: github.repository != 'dsx-ai-factory/infra-controller'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: rest-api/go.sum
+      - name: Regenerate Core protobuf bindings
+        run: |
+          set -euo pipefail
+          make -C rest-api core-proto
+          if [[ "${GENERATE_PROTO_PATCH:-false}" == true ]]; then
+            git diff --binary -- rest-api/proto/core > "$RUNNER_TEMP/core-proto.patch"
+            git diff --name-only -- rest-api/proto/core
+          else
+            git diff --exit-code -- rest-api/proto/core
+          fi
+      - uses: actions/upload-artifact@v4
+        if: env.GENERATE_PROTO_PATCH == 'true'
+        with:
+          name: core-proto-generated
+          path: ${{ runner.temp }}/core-proto.patch
+          if-no-files-found: error
+      - name: Check protobuf compatibility and style
+        run: |
+          set -euo pipefail
+          git fetch --no-tags https://github.com/dsx-ai-factory/infra-controller.git main:refs/remotes/upstream/main
+          base=$(git merge-base HEAD upstream/main)
+          base_dir=$(mktemp -d)
+          trap 'rm -rf "$base_dir"' EXIT
+          git archive "$base" crates/rpc/proto | tar -x -C "$base_dir"
+          go -C rest-api tool buf breaking ../crates/rpc/proto --against "$base_dir/crates/rpc/proto"
+          docker run --rm -v "$PWD:/work" -w /work yoheimuta/protolint lint -config_path=.protolint.yaml crates/rpc/proto/
+      - name: Install pinned Helm and unittest plugin
+        run: |
+          set -euo pipefail
+          helm_dir="$RUNNER_TEMP/helm-4.2.0"
+          mkdir -p "$helm_dir"
+          curl -fsSL https://get.helm.sh/helm-v4.2.0-linux-amd64.tar.gz -o "$helm_dir/helm.tar.gz"
+          printf '%s  %s\n' 97dbeb971be4ac4b27e3839976d9564c0fb35c6f3b1da89dd1e292d236af4096 "$helm_dir/helm.tar.gz" | sha256sum --check --strict
+          tar -xzf "$helm_dir/helm.tar.gz" -C "$helm_dir"
+          echo "$helm_dir/linux-amd64" >> "$GITHUB_PATH"
+          "$helm_dir/linux-amd64/helm" plugin install oci://ghcr.io/helm-unittest/helm-unittest/unittest:1.1.2 --verify=false
+      - name: Helm chart tests and configuration rollout
+        run: |
+          set -euo pipefail
+          helm lint helm/charts/nico-api
+          helm unittest helm/charts/nico-api
+          disabled=$(helm template nico-api helm/charts/nico-api --show-only templates/deployment.yaml --set powerShelfStateController.rackFirmwareReprovisioningEnabled=false | awk '$1 == "checksum/config:" { print $2 }')
+          enabled=$(helm template nico-api helm/charts/nico-api --show-only templates/deployment.yaml --set powerShelfStateController.rackFirmwareReprovisioningEnabled=true | awk '$1 == "checksum/config:" { print $2 }')
+          [[ "$disabled" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$enabled" =~ ^[0-9a-f]{64}$ ]]
+          test "$disabled" != "$enabled"
