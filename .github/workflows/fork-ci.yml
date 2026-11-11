@@ -1,0 +1,28 @@
+name: issue9092-lockfile
+on:
+  push:
+    branches: ['ci/9092-lockfile']
+permissions:
+  contents: read
+jobs:
+  metadata:
+    if: github.repository == 'TechWizard9999/infra-controller'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Select the repository Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Resolve Cargo metadata without compilation
+        run: |
+          set -euo pipefail
+          cargo metadata --format-version 1 > /dev/null
+          cargo metadata --format-version 1 --locked > /dev/null
+          git diff -- Cargo.lock
+      - uses: actions/upload-artifact@v4
+        with:
+          name: issue9092-lockfile
+          path: Cargo.lock
+          retention-days: 7
