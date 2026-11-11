@@ -1,0 +1,262 @@
+# Scratch verification only. Add this as .github/workflows/fork-ci.yml and
+# target/8991-kind-smoke.sh as .github/ci/issue8991-kind-smoke.sh in the scratch
+# commit; neither file belongs in the upstream feature branch.
+name: issue8991-focused
+
+on:
+  push:
+    branches: ['ci/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue8991-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HELM_VERSION: v4.2.0
+  HELM_SHA256: 97dbeb971be4ac4b27e3839976d9564c0fb35c6f3b1da89dd1e292d236af4096
+  # setup.sh installs the latest official Helmfile release. Resolve it once for
+  # this scratch run, rather than changing it during verification.
+  HELMFILE_VERSION: 1.8.3
+  HELMFILE_SHA256: 7d79c6d2099a4819213873164eda23bdbd32f1404fec7a7104d934e5d102596f
+  KIND_VERSION: v0.33.0
+  KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+  KIND_NODE_IMAGE: kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  shell-helm:
+    if: github.repository == 'TechWizard9999/infra-controller'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install real Helm, Helmfile, PyYAML and jq
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-yaml jq
+          tool_bin="$RUNNER_TEMP/issue8991-bin"
+          mkdir -p "$tool_bin" target/issue8991-results
+          curl -fsSL --retry 3 "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" -o "$RUNNER_TEMP/helm.tar.gz"
+          printf '%s  %s\n' "$HELM_SHA256" "$RUNNER_TEMP/helm.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/helm.tar.gz" -C "$RUNNER_TEMP" linux-amd64/helm
+          install -m 0755 "$RUNNER_TEMP/linux-amd64/helm" "$tool_bin/helm"
+          curl -fsSL --retry 3 "https://github.com/helmfile/helmfile/releases/download/v${HELMFILE_VERSION}/helmfile_${HELMFILE_VERSION}_linux_amd64.tar.gz" -o "$RUNNER_TEMP/helmfile.tar.gz"
+          printf '%s  %s\n' "$HELMFILE_SHA256" "$RUNNER_TEMP/helmfile.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/helmfile.tar.gz" -C "$RUNNER_TEMP" helmfile
+          install -m 0755 "$RUNNER_TEMP/helmfile" "$tool_bin/helmfile"
+          # apt's PyYAML belongs to /usr/bin/python3, not a hosted-toolcache Python.
+          printf '%s\n' /usr/bin "$tool_bin" >> "$GITHUB_PATH"
+          export PATH="$tool_bin:/usr/bin:$PATH"
+          helm plugin install oci://ghcr.io/helm-unittest/helm-unittest/unittest:1.1.2 --verify=false
+          {
+            helm version --short
+            helmfile --version
+            helm plugin list
+            python3 -c 'import sys, yaml; print(sys.version); print("PyYAML", yaml.__version__)'
+            jq --version
+          } | tee target/issue8991-results/tool-versions.txt
+      - name: Check shell syntax
+        run: |
+          set -euo pipefail
+          bash -n helm-prereqs/setup.sh
+          bash -n .github/ci/issue8991-kind-smoke.sh
+          for test in \
+            helm-prereqs/tests/setup-legacy-alias-namespaces_test.sh \
+            helm-prereqs/tests/setup-dpf-single-core-deploy_test.sh \
+            helm-prereqs/tests/setup-skip-vault_test.sh \
+            helm-prereqs/tests/setup-observability-core-gate_test.sh \
+            helm-prereqs/tests/setup-kmip-client-secret_test.sh; do
+            bash -n "$test"
+          done
+      - name: Run namespace and adjacent setup regressions
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          mkdir -p target/issue8991-results
+          failed=0
+          for test in \
+            helm-prereqs/tests/setup-legacy-alias-namespaces_test.sh \
+            helm-prereqs/tests/setup-dpf-single-core-deploy_test.sh \
+            helm-prereqs/tests/setup-skip-vault_test.sh \
+            helm-prereqs/tests/setup-observability-core-gate_test.sh \
+            helm-prereqs/tests/setup-kmip-client-secret_test.sh; do
+            echo "::group::$test"
+            if bash "$test" 2>&1 | tee "target/issue8991-results/$(basename "$test").log"; then
+              echo "PASS: $test"
+            else
+              failed=1
+              echo "::error::Failed: $test"
+            fi
+            echo '::endgroup::'
+          done
+          exit "$failed"
+      - name: Lint and render prerequisites and full Core charts
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          for chart in helm-prereqs helm; do
+            helm dependency build "$chart"
+            helm lint "$chart"
+            # Rendering validates the chart without printing or archiving Secrets.
+            helm template "$chart" > /dev/null
+          done
+      - name: Test prerequisites and every Core chart with a unit-test suite
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          mkdir -p target/issue8991-results
+          charts=(helm-prereqs)
+          while IFS= read -r chart_file; do
+            chart="${chart_file%/Chart.yaml}"
+            if compgen -G "$chart/tests/*_test.yaml" > /dev/null; then
+              charts+=("$chart")
+            fi
+          done < <(git ls-files 'helm/charts/**/Chart.yaml')
+          printf 'Testing chart: %s\n' "${charts[@]}"
+          helm unittest --output-type JUnit --output-file target/issue8991-results/helm-unit-tests.xml -- "${charts[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: issue8991-shell-helm-results
+          path: target/issue8991-results/
+          retention-days: 7
+
+  namespace-kind:
+    if: github.repository == 'TechWizard9999/infra-controller'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.35.8
+      - name: Install Helm, kind, PyYAML and jq
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-yaml jq
+          tool_bin="$RUNNER_TEMP/issue8991-bin"
+          mkdir -p "$tool_bin"
+          curl -fsSL --retry 3 "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" -o "$RUNNER_TEMP/helm.tar.gz"
+          printf '%s  %s\n' "$HELM_SHA256" "$RUNNER_TEMP/helm.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/helm.tar.gz" -C "$RUNNER_TEMP" linux-amd64/helm
+          install -m 0755 "$RUNNER_TEMP/linux-amd64/helm" "$tool_bin/helm"
+          curl -fsSL --retry 3 "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64" -o "$tool_bin/kind"
+          printf '%s  %s\n' "$KIND_SHA256" "$tool_bin/kind" | sha256sum --check
+          chmod +x "$tool_bin/kind"
+          printf '%s\n' /usr/bin "$tool_bin" >> "$GITHUB_PATH"
+      - name: Create disposable Kubernetes cluster
+        run: |
+          set -euo pipefail
+          kind create cluster --name issue8991 --image "$KIND_NODE_IMAGE" --wait 120s
+          helm version --short
+          kind version
+          kubectl version
+      - name: Exercise alias namespace creation and Helm ownership on Kubernetes
+        env:
+          NAMESPACE_SMOKE_OUTPUT: ${{ runner.temp }}/issue8991-kind-results
+        run: |
+          set -euo pipefail
+          mkdir -p "$NAMESPACE_SMOKE_OUTPUT"
+          bash .github/ci/issue8991-kind-smoke.sh 2>&1 | tee "$NAMESPACE_SMOKE_OUTPUT/smoke.log"
+      - name: Save failed cluster diagnostics
+        if: failure()
+        run: kind export logs "$RUNNER_TEMP/issue8991-kind-results/cluster-logs" --name issue8991
+      - name: Delete disposable cluster
+        if: always()
+        run: |
+          if command -v kind > /dev/null 2>&1; then
+            kind delete cluster --name issue8991
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: issue8991-kubernetes-namespace-smoke
+          path: ${{ runner.temp }}/issue8991-kind-results/
+          retention-days: 7
+
+  docs:
+    if: github.repository == 'TechWizard9999/infra-controller'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.1'
+      - name: Install rumdl and the repository-selected Fern CLI
+        run: |
+          set -euo pipefail
+          mkdir -p target/issue8991-docs-preview
+          pipx install rumdl
+          npm install -g "fern-api@$(node -e "console.log(require('./fern/fern.config.json').version)")"
+          {
+            rumdl --version
+            fern --version
+            node --version
+          } | tee target/issue8991-docs-preview/tool-versions.txt
+      - name: Check Markdown
+        run: |
+          set -euo pipefail
+          rumdl check --config docs/.rumdl.toml AGENTS.md \
+            helm-prereqs/README.md docs/getting-started/quick-start.md helm/README.md \
+            2>&1 | tee target/issue8991-docs-preview/rumdl.log
+      - name: Check Fern Markdown
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          fern docs md check 2>&1 | tee target/issue8991-docs-preview/fern-markdown.log
+      - name: Check Fern configuration and links
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          fern check 2>&1 | tee target/issue8991-docs-preview/fern-check.log
+      - name: Render review HTML with GitHub's Markdown API
+        if: success() || failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # This endpoint renders Markdown only; it publishes no pages or messages.
+          node --input-type=module <<'JS'
+          import { mkdir, readFile, writeFile } from 'node:fs/promises';
+          const out = 'target/issue8991-docs-preview';
+          await mkdir(out, { recursive: true });
+          const files = ['helm-prereqs/README.md', 'docs/getting-started/quick-start.md', 'helm/README.md'];
+          const style = 'body{font:16px/1.6 system-ui,sans-serif;max-width:1100px;margin:40px auto;padding:0 24px;color:#1f2328}table{border-collapse:collapse;display:block;overflow:auto}th,td{border:1px solid #d1d9e0;padding:6px 13px}pre{padding:16px;background:#f6f8fa;overflow:auto}code{font-family:ui-monospace,monospace}img{max-width:100%}a{color:#0969da}blockquote{border-left:4px solid #d1d9e0;margin-left:0;padding-left:16px;color:#59636e}';
+          const links = [];
+          for (const file of files) {
+            const response = await fetch(`${process.env.GITHUB_API_URL}/markdown`, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json', 'X-GitHub-Api-Version': '2022-11-28' },
+              body: JSON.stringify({ text: await readFile(file, 'utf8'), mode: 'gfm', context: process.env.GITHUB_REPOSITORY })
+            });
+            if (!response.ok) throw new Error(`GitHub Markdown rendering failed for ${file}: HTTP ${response.status}`);
+            const name = file.replaceAll('/', '-').replace(/\.md$/, '.html');
+            const source = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/blob/${process.env.GITHUB_SHA}/${file}`;
+            await writeFile(`${out}/${name}`, `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${file}</title><style>${style}</style><p><a href="${source}">${file} at the tested scratch commit</a></p><article>${await response.text()}</article>`);
+            links.push(`<li><a href="${name}">${file}</a></li>`);
+          }
+          await writeFile(`${out}/index.html`, `<!doctype html><meta charset="utf-8"><title>Issue 8991 documentation review</title><style>${style}</style><h1>Issue 8991 documentation review</h1><p>GitHub-rendered Markdown with local review styling. This does not reproduce the NVIDIA Fern theme or custom Fern components.</p><p>Scratch revision: ${process.env.GITHUB_SHA}</p><ul>${links.join('')}</ul>`);
+          JS
+          printf '%s\n' 'Rendered Markdown HTML is attached as issue8991-docs-preview. Fern theme/navigation review remains separate.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: issue8991-docs-preview
+          path: target/issue8991-docs-preview/
+          retention-days: 7
