@@ -244,13 +244,13 @@ printf '{"UsernamePassword":{"username":"test-user","password":"test-only"}}' > 
 chmod 600 "$CRED_FILE"
 ```
 
-The site explorer checks these three credentials at startup
-(`REQUIRED_SITE_DEFAULT_CREDENTIAL_KEYS`) and fails if any are missing:
+With `[site_explorer] dpu_policy = "ignore"` as configured above, Site
+Explorer requires the site-wide BMC root and host UEFI site default before
+exploration:
 
 ```bash
 vault kv put secrets/machines/bmc/site/root @"$CRED_FILE"
 vault kv put secrets/machines/all_hosts/site_default/uefi-metadata-items/auth @"$CRED_FILE"
-vault kv put secrets/machines/all_dpus/site_default/uefi-metadata-items/auth @"$CRED_FILE"
 ```
 
 These are consumed later by BMC metadata workflows (credential rotation,
