@@ -1,0 +1,251 @@
+# Temporary fork-only review validation. Never include this workflow in an upstream PR.
+name: fork-ci
+
+on:
+  push:
+    branches: ['ci/**']
+  workflow_dispatch:
+
+concurrency:
+  group: fork-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_NIGHTLY: nightly-2026-06-16
+  BUILD_IMAGE: nico-build:local
+
+jobs:
+  format:
+    if: github.repository != 'dsx-ai-factory/infra-controller'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install pinned nightly rustfmt
+        run: rustup toolchain install "$RUST_NIGHTLY" --profile minimal -c rustfmt
+      - name: Check Rust formatting (nightly, as upstream)
+        run: cargo +"$RUST_NIGHTLY" fmt --all -- --check
+
+  lint:
+    if: github.repository != 'dsx-ai-factory/infra-controller'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/.ghcup
+          sudo docker image prune -af >/dev/null
+          df -h /
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the project's build container
+        uses: docker/build-push-action@v6
+        with:
+          context: dev/docker
+          file: dev/docker/Dockerfile.build-container-x86_64
+          build-args: KEA_VERSION=2.2.0-6
+          tags: ${{ env.BUILD_IMAGE }}
+          load: true
+          cache-from: type=gha,scope=build-container-x86_64
+          cache-to: type=gha,mode=max,scope=build-container-x86_64
+      - name: Start build container with PostgreSQL (as upstream CI)
+        run: |
+          docker run -d --name nico \
+            -v "$GITHUB_WORKSPACE:/carbide" -w /carbide \
+            -e CARGO_HOME=/carbide/cargo \
+            -e CARGO_INCREMENTAL=0 \
+            -e CARGO_MAKE_SKIP_CODECOV=true \
+            -e DATABASE_URL='postgresql://root@%2Fvar%2Frun%2Fpostgresql/root' \
+            "$BUILD_IMAGE" sleep infinity
+          docker exec nico bash -c '
+            set -euo pipefail
+            git config --global --add safe.directory /carbide
+            printf "max_connections = 1000\nfsync = off\nsynchronous_commit = off\nfull_page_writes = off\n" | tee -a /etc/postgresql/*/main/postgresql.conf
+            /etc/init.d/postgresql start
+            sudo -u postgres psql -c "ALTER USER root WITH SUPERUSER;"
+            createdb root
+          '
+      - name: Validate Cargo metadata
+        run: docker exec nico cargo metadata --locked --no-deps --format-version 1 >/dev/null
+      - name: Clippy (cargo make clippy-flow)
+        run: docker exec nico cargo make --no-workspace clippy-flow
+      - name: Carbide custom lints
+        if: success() || failure()
+        run: docker exec nico cargo make carbide-lints
+      - name: Error message style
+        if: success() || failure()
+        run: docker exec nico cargo make lint-error-messages
+      - name: Licenses
+        if: success() || failure()
+        run: docker exec nico cargo make --no-workspace check-licenses
+      - name: Bans
+        if: success() || failure()
+        run: docker exec nico cargo make --no-workspace check-bans
+      - name: Disk usage
+        if: always()
+        run: df -h /
+
+  test:
+    if: github.repository != 'dsx-ai-factory/infra-controller'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/.ghcup
+          sudo docker image prune -af >/dev/null
+          df -h /
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          # Full history: `git describe --first-parent` must reach a release tag.
+          fetch-depth: 0
+      # The fork has no tags, so a plain `git describe` returns a bare commit hash,
+      # which NICo rejects as a build version ("Invalid server version, cannot check
+      # for upgrade" in the dpu_agent_upgrade tests). Fetch upstream's public tags and
+      # compute VERSION / CI_COMMIT_SHORT_SHA the way upstream ci.yaml "Calculate version" does.
+      - name: Calculate version (as upstream)
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags https://github.com/dsx-ai-factory/infra-controller.git '+refs/tags/*:refs/tags/*'
+          VERSION=$(git describe --tags --first-parent --always)
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          case "$VERSION" in
+            v[0-9]*) ;;
+            *) echo "::error::git describe returned '$VERSION' (no release tag reachable); tests would fail on the build version"; exit 1 ;;
+          esac
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "CI_COMMIT_SHORT_SHA=$SHORT_SHA" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION CI_COMMIT_SHORT_SHA=$SHORT_SHA"
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the project's build container
+        uses: docker/build-push-action@v6
+        with:
+          context: dev/docker
+          file: dev/docker/Dockerfile.build-container-x86_64
+          build-args: KEA_VERSION=2.2.0-6
+          tags: ${{ env.BUILD_IMAGE }}
+          load: true
+          # Read-only here: only the lint job saves the container layers, so the 10 GB
+          # Actions cache holds one copy of them next to the sccache entry.
+          cache-from: type=gha,scope=build-container-x86_64
+      # Compile cache, as upstream: sccache in the build container, stored in the Actions cache.
+      # The key follows Cargo.lock, so dependency builds (most of the compile time) are reused
+      # until dependencies change; it is saved only when that key is new.
+      - name: Restore sccache
+        id: sccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .sccache
+          key: sccache-fork-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            sccache-fork-test-
+      # Same container settings as upstream's "Run release-container service tests"
+      # (ulimit, NICO_TEST_MAX_PG_CONNECTIONS, .github/ci/postgresql.conf, VERSION,
+      # CI_COMMIT_SHORT_SHA, CONTAINER_REPO_ROOT), plus the variables `cargo make`
+      # exports from Makefile.toml [env] (REPO_ROOT, KEA_VERSION, CARBIDE_ENVIRONMENT,
+      # FORGE_CA, FORGE_CA_PATH), because the tests run with plain `cargo test` here.
+      # Without REPO_ROOT, nvue-client fails and some integration helpers silently skip.
+      # RUST_TEST_THREADS: the repo's .cargo/config.toml asks for 60 parallel tests,
+      # sized for upstream's 32-core runners; a free runner has 4 cores, so use 8.
+      # An environment variable wins over a non-forced [env] entry, so the repo is
+      # not changed.
+      - name: Start build container with PostgreSQL (as upstream CI)
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.sccache"
+          docker run -d --name nico \
+            --ulimit nofile=65536:65536 \
+            -v "$GITHUB_WORKSPACE:/carbide" -w /carbide \
+            -v "$GITHUB_WORKSPACE/.sccache:/sccache" \
+            -e SCCACHE_DIR=/sccache \
+            -e SCCACHE_CACHE_SIZE=3G \
+            -e RUSTC_WRAPPER=sccache \
+            -e CARGO_HOME=/carbide/cargo \
+            -e CARGO_INCREMENTAL=0 \
+            -e CARGO_MAKE_SKIP_CODECOV=true \
+            -e DATABASE_URL='postgresql://root@%2Fvar%2Frun%2Fpostgresql/root' \
+            -e NICO_TEST_MAX_PG_CONNECTIONS=900 \
+            -e RUST_TEST_THREADS=8 \
+            -e VERSION="$VERSION" \
+            -e CI_COMMIT_SHORT_SHA="$CI_COMMIT_SHORT_SHA" \
+            -e CONTAINER_REPO_ROOT=/carbide \
+            -e REPO_ROOT=/carbide \
+            -e KEA_VERSION="$(cat dev/docker/kea.version)" \
+            -e CARBIDE_ENVIRONMENT=local \
+            -e FORGE_CA=nonprod \
+            -e FORGE_CA_PATH=/carbide/dev/forge_nonprodroot.pem \
+            "$BUILD_IMAGE" sleep infinity
+          docker exec nico bash -c '
+            set -euo pipefail
+            echo "Open file descriptor limits: soft=$(ulimit -Sn), hard=$(ulimit -Hn)"
+            git config --global --add safe.directory /carbide
+            if [ -f .github/ci/postgresql.conf ]; then
+              tee -a /etc/postgresql/*/main/postgresql.conf < .github/ci/postgresql.conf
+            else
+              printf "fsync = off\nsynchronous_commit = off\nfull_page_writes = off\nmax_connections = 1000\n" | tee -a /etc/postgresql/*/main/postgresql.conf
+            fi
+            /etc/init.d/postgresql start
+            sudo -u postgres psql -c "ALTER USER root WITH SUPERUSER;"
+            createdb root
+            sudo -u postgres psql -c "CREATE ROLE nico_ipv6_test LOGIN PASSWORD \$\$nico_ipv6_test\$\$;"
+          '
+      - name: Compile focused packages and prepare database template
+        run: |
+          docker exec -e NICO_TEST_TEMPLATE_DB=sqlx_ci_template_db nico bash -c '
+            set -euo pipefail
+            cargo test --profile=ci-tests --no-run -p carbide-power-shelf-controller -p carbide-api-db
+            cargo build --profile=ci-tests -p carbide-sqlx-testing --bin prepare-test-template
+            target/ci-tests/prepare-test-template
+          '
+      - name: Prove the regression fails against the previous implementation
+        run: |
+          docker exec -i -e NICO_TEST_TEMPLATE_DB=sqlx_ci_template_db nico bash <<'BASH'
+          set -euo pipefail
+          paths=(crates/power-shelf-controller/src/ready.rs crates/api-db/src/power_shelf.rs)
+          trap 'git restore --source=HEAD --worktree -- "${paths[@]}"' EXIT
+          git restore --source=3d9842cea310ee999ce194e5d1be878eb7bc8f3b --worktree -- "${paths[@]}"
+          set +e
+          cargo test --profile=ci-tests -p carbide-power-shelf-controller --test integration test_stale_enabled_request_preserves_previous_skip -- --nocapture 2>&1 | tee /tmp/shelf-regression-before.log
+          test_status=${PIPESTATUS[0]}
+          set -e
+          if [ "$test_status" -eq 0 ]; then
+            echo '::error::The regression unexpectedly passed against the old implementation'
+            exit 1
+          fi
+          grep -Eq '^test result: FAILED\..* [1-9][0-9]* failed;' /tmp/shelf-regression-before.log
+          grep -F 'stale request must not enter reprovisioning' /tmp/shelf-regression-before.log
+          echo 'Regression confirmed: the old implementation failed the stale-request assertion.'
+          BASH
+      - name: Run all shelf tests and database power-shelf tests with the fix
+        run: |
+          docker exec -i -e NICO_TEST_TEMPLATE_DB=sqlx_ci_template_db nico bash <<'BASH'
+          set -euo pipefail
+          git diff --exit-code -- crates/power-shelf-controller/src/ready.rs crates/api-db/src/power_shelf.rs
+          cargo test --profile=ci-tests --no-fail-fast -p carbide-power-shelf-controller 2>&1 | tee /tmp/shelf-after.log
+          cargo test --profile=ci-tests --no-fail-fast -p carbide-api-db power_shelf 2>&1 | tee /tmp/shelf-db-after.log
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed;' /tmp/shelf-after.log
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed;' /tmp/shelf-db-after.log
+          grep -E '^test result:' /tmp/shelf-after.log /tmp/shelf-db-after.log
+          BASH
+      # Everything in the container runs as root; hand the cache back to the runner user so
+      # actions/cache can read it, then save it only when the Cargo.lock key is new.
+      - name: Hand sccache back to the runner
+        if: always()
+        run: |
+          docker exec nico bash -c "sccache --show-stats || true; du -sh /sccache || true; chown -R $(id -u):$(id -g) /sccache" || true
+      - name: Save sccache
+        if: always() && steps.sccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .sccache
+          key: sccache-fork-test-${{ hashFiles('Cargo.lock') }}
+      - name: Disk usage
+        if: always()
+        run: df -h /
