@@ -224,6 +224,7 @@ nico-admin-cli expected-machine add \
 ```
 
 The site explorer also needs:
+
 - A **network segment** of type `underlay` with a prefix covering the
   `bmc_ip_address` range.
 - **DHCP timestamps** on the preallocated machine interfaces (set
@@ -281,6 +282,7 @@ endpoint_explorations_failures=0
 ```
 
 The exploration report contains:
+
 - `EndpointType: Bmc`
 - `MachineSetupStatus.IsDone: true` (Sushy has no real BIOS to configure)
 - One system and one chassis
