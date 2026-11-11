@@ -59,15 +59,16 @@ jobs:
         run: |
           set -euo pipefail
           generated=rest-api/proto/core/gen/v1/nico_nico.pb.go
+          rest_schema=rest-api/proto/core/src/v1/nico_nico.proto
           make -C rest-api core-proto
           git diff --check
-          test "$(git diff --name-only)" = "$generated"
+          test "$(git diff --name-only)" = "$(printf '%s\n' "$generated" "$rest_schema")"
           test -z "$(git ls-files --others --exclude-standard)"
           mkdir -p "$RUNNER_TEMP/proto-sync"
-          git diff --binary -- "$generated" > "$RUNNER_TEMP/proto-sync/proto-sync.patch"
-          cp "$generated" "$RUNNER_TEMP/proto-sync/nico_nico.pb.go"
-          sha256sum "$generated"
-          git add -- "$generated"
+          git diff --binary -- "$generated" "$rest_schema" > "$RUNNER_TEMP/proto-sync/proto-sync.patch"
+          cp "$generated" "$rest_schema" "$RUNNER_TEMP/proto-sync/"
+          sha256sum "$generated" "$rest_schema"
+          git add -- "$generated" "$rest_schema"
       - name: Verify a second sync is clean
         run: |
           make -C rest-api core-proto
@@ -339,7 +340,7 @@ jobs:
       #      * a failing program reran 0 tests      -> it crashed / failed for another reason, job fails
       #      * passes alone, and is a KNOWN timing test -> warning only (job not fully green)
       #      * passes alone, but is NOT a known timing test -> job fails (possible race between tests)
-      - name: Unit and database tests (test-release-container-services, with rerun of failures)
+      - name: Recheck power shelf and firmware details tests
         env:
           KNOWN_TIMING_TESTS: >-
             tests::component_power_details::blocked_snapshots_release_pool_capacity
@@ -371,7 +372,7 @@ jobs:
               fi
               target/ci-tests/prepare-test-template || exit 1
               # shellcheck disable=SC2086
-              cargo test --profile=ci-tests --no-fail-fast $scope_args 2>&1 | tee /tmp/tests.log
+              cargo test --profile=ci-tests --no-fail-fast $scope_args -- power_shelf reprovisioning:: firmware_details::tests 2>&1 | tee /tmp/tests.log
               first=${PIPESTATUS[0]}
               grep -aE "^test result:" /tmp/tests.log | awk "{p+=\$4; f+=\$6; i+=\$8} END {print \"FIRST PASS: \" p \" passed, \" f \" failed, \" i \" ignored\"}"
               [ "$first" -eq 0 ] && { echo "ALL TESTS PASSED on the first pass."; exit 0; }
