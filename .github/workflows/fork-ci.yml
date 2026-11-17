@@ -7,6 +7,7 @@
 #   - test   : test-release-container-services (`cargo make test-release-container-services`)
 #   - docs   : AGENTS.md documentation checks (rumdl on AGENTS.md + changed Markdown,
 #              `fern docs md check`, `fern check`), which cannot run on the Windows laptop
+#   - helm-prereqs : the helm-prereqs shell tests (`bash helm-prereqs/tests/*_test.sh`) with real jq
 # lint and test run inside the project's own build container, built from
 # dev/docker/Dockerfile.build-container-x86_64 (public base image), with the
 # same PostgreSQL setup as upstream CI. Upstream-only jobs (image builds,
@@ -79,6 +80,37 @@ jobs:
       - name: Fern check
         if: success() || failure()
         run: fern check
+
+  # The `bash helm-prereqs/tests/<name>_test.sh` steps of upstream's
+  # build-validate-helm-prereqs-chart job. The tests fake kubectl, helm and
+  # helmfile themselves; jq is the real one.
+  helm-prereqs:
+    if: github.repository != 'dsx-ai-factory/infra-controller'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install jq
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null || { sudo apt-get update; sudo apt-get install -y --no-install-recommends jq; }
+          jq --version
+      - name: Run every helm-prereqs/tests/*_test.sh
+        run: |
+          set -uo pipefail
+          failed=()
+          for t in helm-prereqs/tests/*_test.sh; do
+            echo "::group::${t}"
+            if bash "${t}"; then echo "PASS ${t}"; else echo "FAIL ${t}"; failed+=("${t}"); fi
+            echo "::endgroup::"
+          done
+          if (( ${#failed[@]} > 0 )); then
+            printf 'FAILED: %s\n' "${failed[@]}"
+            exit 1
+          fi
+          echo "ALL helm-prereqs shell tests passed"
 
   lint:
     if: github.repository != 'dsx-ai-factory/infra-controller'
