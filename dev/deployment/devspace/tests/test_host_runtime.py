@@ -321,6 +321,7 @@ configure_hashicorp_apt_source
                 sources_dir.mkdir(parents=True)
                 keyring_file = keyrings_dir / "hashicorp-archive-keyring.gpg"
                 keyring_file.write_text(init_key)
+                keyring_file.chmod(0o644)
                 sources_file = sources_dir / "hashicorp.sources"
 
                 call_log = root / "calls"
@@ -462,6 +463,7 @@ install_vault
                 keyring_file = keyrings_dir / "hashicorp-archive-keyring.gpg"
                 if init_key is not None:
                     keyring_file.write_text(init_key)
+                    keyring_file.chmod(0o644)
                 sources_file = sources_dir / "hashicorp.sources"
 
                 call_log = root / "calls"
