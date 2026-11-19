@@ -1,0 +1,33 @@
+name: umask-8527
+on:
+  push:
+    branches: ['ci/8527-umask-20261119']
+permissions:
+  contents: read
+jobs:
+  umask:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Run test_host_runtime under umask 0022 and 0002, before and after the fix
+        run: |
+          set -u
+          t=dev/deployment/devspace/tests/test_host_runtime.py
+          cp "$t" /tmp/fixed.py
+          git show d14d297c9:"$t" > /tmp/old.py
+          fail=0
+          for version in old fixed; do
+            cp "/tmp/$version.py" "$t"
+            for mask in 0022 0002; do
+              if (umask "$mask"; PYTHONDONTWRITEBYTECODE=1 python3 -m unittest "$t" > "/tmp/$version-$mask.log" 2>&1); then r=PASS; else r=FAIL; fi
+              echo "RESULT $version umask=$mask: $r"
+              grep -E "^(FAIL|ERROR):|AssertionError|^Ran |^OK|^FAILED" "/tmp/$version-$mask.log" | head -20
+            done
+          done
+          cp /tmp/fixed.py "$t"
+          for mask in 0022 0002; do grep -q "^OK" /tmp/fixed-$mask.log || fail=1; done
+          exit $fail
