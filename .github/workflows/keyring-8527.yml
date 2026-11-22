@@ -1,0 +1,35 @@
+name: keyring-8527
+on:
+  push:
+    branches: ['ci/8527-keyring-20261123']
+permissions:
+  contents: read
+jobs:
+  keyring:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: New tests against old and fixed script, under umask 0022 and 0002
+        run: |
+          set -u
+          s=dev/deployment/devspace/prepare-ubuntu-host-for-dev.sh
+          t=dev/deployment/devspace/tests/test_host_runtime.py
+          cp "$s" /tmp/fixed.sh
+          git show 51ccde368:"$s" > /tmp/old.sh
+          fail=0
+          for version in old fixed; do
+            cp "/tmp/$version.sh" "$s"
+            for mask in 0022 0002; do
+              if (umask "$mask"; PYTHONDONTWRITEBYTECODE=1 python3 -m unittest "$t" > "/tmp/$version-$mask.log" 2>&1); then r=PASS; else r=FAIL; fi
+              echo "RESULT $version-script umask=$mask: $r"
+              grep -E "^(FAIL|ERROR):|AssertionError|^Ran |^OK|^FAILED" "/tmp/$version-$mask.log" | head -10
+            done
+          done
+          cp /tmp/fixed.sh "$s"
+          for mask in 0022 0002; do grep -q "^OK" /tmp/fixed-$mask.log || fail=1; done
+          grep -q "extra-primary-key" /tmp/old-0022.log || { echo "old script did not fail on extra-primary-key"; fail=1; }
+          exit $fail
