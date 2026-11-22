@@ -39,6 +39,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Use the nightly upstream pins in Makefile.toml
+        run: |
+          pinned=$(sed -n 's/^RUST_NIGHTLY *= *"\(nightly-[0-9-]*\)".*/\1/p' Makefile.toml | head -n 1)
+          echo "RUST_NIGHTLY=${pinned:-$RUST_NIGHTLY}" >> "$GITHUB_ENV"
+          echo "Using ${pinned:-$RUST_NIGHTLY}"
       - name: Install pinned nightly rustfmt
         run: rustup toolchain install "$RUST_NIGHTLY" --profile minimal -c rustfmt
       - name: Check Rust formatting (nightly, as upstream)
