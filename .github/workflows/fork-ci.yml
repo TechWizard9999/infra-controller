@@ -352,6 +352,12 @@ jobs:
                 cargo build --profile=ci-tests -p carbide-sqlx-testing --bin prepare-test-template || exit 1
               fi
               target/ci-tests/prepare-test-template || exit 1
+              # NIC firmware tests (Scout, libmlx, Core) run this helper from the test profile
+              # directory (upstream: cargo make build-nic-firmware-test-helper, for the debug
+              # profile). A focused run does not build it, so build it with the same profile.
+              if [ ! -x target/ci-tests/mlx-firmware-supervisor ]; then
+                cargo build --profile=ci-tests -p carbide-libmlx --bin mlx-firmware-supervisor || exit 1
+              fi
               # shellcheck disable=SC2086
               cargo test --profile=ci-tests --no-fail-fast $scope_args 2>&1 | tee /tmp/tests.log
               first=${PIPESTATUS[0]}
